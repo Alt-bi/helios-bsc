@@ -1,0 +1,15 @@
+[package]
+name = "helios-bsc-execution"
+description = "Verified execution reads via eth_getProof against consensus stateRoot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+helios-bsc-types = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }

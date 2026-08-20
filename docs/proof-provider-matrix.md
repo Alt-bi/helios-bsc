@@ -1,0 +1,57 @@
+# eth_getProof provider matrix (Phase 0 exit gate)
+
+Wallet-mode Safe is the newest block with **≥15 distinct subsequent sealers**, not a hard `tip-120` offset. `15 * turnLength` (=120 @ T=8) is the in-turn **upper** estimate. Live measure (2026-08-18, `scripts/measure_safe_lag.py`): newest-Safe lag **108–112**. Windows of 100 / 110 only see ~13 / ~14 sealers — not Safe. Provider proofs tagged only `latest` / `finalized` **cannot** match Safe `stateRoot`.
+
+## Requirement
+
+Demo Slice / verified reads need:
+
+- `eth_getProof(address, storageKeys, blockNumberOrHash)` where the block is the **Safe** hash or number (**≥ ~120 blocks behind tip**), **or**
+- Alt F: own untrusted full/fast node that retains that window (or archive).
+
+**Tag-only = gate fail. Tip-only hash/number = gate fail.**
+
+## Matrix (2026-08-18)
+
+Probed with `scripts/probe_eth_get_proof.py` plus a lag sweep (0 / 8 / 16 / 32 / 64 / 96 / 128 / 192 / 240). Address: WBNB `0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c`.
+
+| Provider / URL | Auth | by `latest` | by **number** | by **hash** | Historical window | Notes | Pass? |
+|----------------|------|-------------|---------------|-------------|-------------------|-------|-------|
+| `https://bsc-dataseed.binance.org` | none | rate-limit | rate-limit | rate-limit | — | `-32005 limit exceeded` on proofs | no |
+| `https://bsc-dataseed1.binance.org` | none | rate-limit | rate-limit | rate-limit | — | same | no |
+| `https://bsc-dataseed2.defibit.io` | none | rate-limit | rate-limit | rate-limit | — | same | no |
+| `https://bsc-dataseed.bnbchain.org` | none | rate-limit | rate-limit | rate-limit | — | same | no |
+| `https://bsc.publicnode.com` | none | **OK** | fail window | fail window | tag-only | `-32602 distance to target block exceeds maximum proof window` on hash/number even at tip | no |
+| `https://bsc-rpc.publicnode.com` | none | **OK** | fail window | fail window | tag-only | same as publicnode | no |
+| `https://1rpc.io/bnb` | none | missing trie | missing trie | missing trie | 0 | pruned | no |
+| `https://binance.llamarpc.com` | none | — | — | — | — | TLS EOF | no |
+| `https://bsc.drpc.org` | none | — | — | — | — | HTTP 429 | no |
+| `https://bsc.meowrpc.com` | none | — | — | — | — | HTTP 429 after tip | no |
+| `https://bsc.blockpi.network/v1/rpc/public` | none | — | — | — | — | HTTP 521 | no |
+| `https://endpoints.omniatech.io/v1/bsc/mainnet/public` | none | — | — | — | — | HTTP 521 | no |
+| `https://rpc.ankr.com/bsc` | **API key** | auth | auth | auth | ? | `Unauthorized` without key | pending key |
+| Ankr personal (free, 2026-08-19) | **key** | **OK** | **OK ≤~108** | often `not supported` | **~108, jitter** | Number-first proofs. 45s header walk ages Safe out of window unless we catch-up. ~3 proofs/burst then prune. Live: WBNB MPT vs BlastAPI match at Safe. Do not commit the URL. | **partial** (Safe knife-edge) |
+| `https://bsc-mainnet.nodereal.io/v1/64a9df0874fb4a93b9d0a3849de012d3` | public MegaNode demo key | **OK** | **OK ≤96** | — | **~96; FAIL at 120** | Official public key (2000 CU/min). Same window as BlastAPI — **Safe (~120) not covered** | **no** |
+| `https://rpc-bsc.48.club` | none | — | missing trie | — | 0 | even tip-by-number fails | no |
+| `https://bsc.rpc.blxrbdn.com` | none | — | missing trie | — | 0 | even tip-by-number fails | no |
+| `https://bnb.rpc.subquery.network/public` | none | — | — | — | — | TLS EOF | no |
+| **`https://bsc-mainnet.public.blastapi.io`** | none | **OK** | **OK at tip** | **OK at tip** | **~96 blocks; FAIL at 128** | Best public so far. **Safe (~120) is outside the window.** Tip proof saved as `fixtures/mainnet/proof_wbnb_tip.json` (MPT unit tests only) | **no** (window too shallow) |
+| QuickNode personal (free, 2026-08-18) | **key** | **OK** | **OK at tip only** | fail window | **5 blocks** (`-32615 eth_getProof is limited to a 5 range, upgrade`) | Correct BSC HTTPS endpoint. Free plan cannot reach Safe (~120). Do not commit the URL. | **no** |
+| Alt F (self full/fast) | local | | | | full / archive | only if paid matrix fails | not provisioned |
+
+## Gate verdict
+
+**PARTIAL PASS (2026-08-19).** Ankr by-number proved WBNB at live Safe when lag ≤~108 after catch-up (`probe-safe` GATE PASS vs BlastAPI oracle). Soak **10 unique / 0 mismatch** vs BlastAPI (`helios-bsc soak --min-unique 10`). Neighbor-leaf proofs for unused addresses are **exclusion** (empty account), not a walker bug. BlastAPI stays oracle-only (~96). Tag-only still fails the gate.
+
+Next (operator order from design):
+
+1. Probe **one paid** provider with archive or `debug`/`full` state (Ankr / NodeReal / QuickNode / Alchemy / Chainstack).
+2. If that also cannot prove `tip-120` by hash/number → **Alt F is mandatory** for Demo Slice.
+
+## Repro
+
+```bash
+python scripts/probe_eth_get_proof.py --rpc https://bsc-mainnet.public.blastapi.io
+```
+
+Mutated-proof fail case: **covered in CI** (`helios-bsc-execution` + `helios-bsc-mock` + `Node::handle` adversarial tests). Live Safe-lag proofs still depend on the provider window (Ankr ~112).

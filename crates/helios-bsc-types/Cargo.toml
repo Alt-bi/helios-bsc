@@ -1,0 +1,14 @@
+[package]
+name = "helios-bsc-types"
+description = "Shared types for helios-bsc (checkpoints, headers, trust labels)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+tiny-keccak = { workspace = true }

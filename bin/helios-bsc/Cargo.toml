@@ -1,0 +1,31 @@
+[package]
+name = "helios-bsc"
+description = "Trust-minimized Parlia light client / local verified JSON-RPC for BSC"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "helios-bsc"
+path = "src/main.rs"
+
+[dependencies]
+helios-bsc-types = { workspace = true }
+helios-bsc-config = { workspace = true }
+helios-bsc-consensus = { workspace = true }
+helios-bsc-execution = { workspace = true }
+helios-bsc-rpc = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+ureq = { workspace = true }
+hex = { workspace = true }
+tiny_http = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+helios-bsc-mock = { workspace = true }

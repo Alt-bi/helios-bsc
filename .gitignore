@@ -1,0 +1,16 @@
+/target/
+**/*.rs.bk
+.idea/
+.vscode/
+*.swp
+.DS_Store
+.env
+.env.*
+!.env.example
+*.pdb
+checkpoint.json
+last-verified.json
+**/__pycache__/
+*.pyc
+# local grant drafts with private emails (optional)
+docs/grant/PRIVATE*

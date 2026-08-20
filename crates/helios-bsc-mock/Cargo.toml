@@ -1,0 +1,17 @@
+[package]
+name = "helios-bsc-mock"
+description = "In-process adversarial upstream mock (lying headers and proofs)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+helios-bsc-types = { workspace = true }
+helios-bsc-config = { workspace = true }
+helios-bsc-consensus = { workspace = true }
+helios-bsc-execution = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+anyhow = { workspace = true }

@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/helios-bsc-types",
+    "crates/helios-bsc-config",
+    "crates/helios-bsc-consensus",
+    "crates/helios-bsc-execution",
+    "crates/helios-bsc-rpc",
+    "crates/helios-bsc-mock",
+    "bin/helios-bsc",
+]
+default-members = ["bin/helios-bsc"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ConnectionServers/helios-bsc"
+authors = ["ConnectionServers"]
+rust-version = "1.80"
+
+[workspace.dependencies]
+helios-bsc-types = { path = "crates/helios-bsc-types" }
+helios-bsc-config = { path = "crates/helios-bsc-config" }
+helios-bsc-consensus = { path = "crates/helios-bsc-consensus" }
+helios-bsc-execution = { path = "crates/helios-bsc-execution" }
+helios-bsc-rpc = { path = "crates/helios-bsc-rpc" }
+helios-bsc-mock = { path = "crates/helios-bsc-mock" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+thiserror = "2"
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+tiny-keccak = { version = "2", features = ["keccak"] }
+secp256k1 = { version = "0.30", features = ["recovery", "global-context"] }
+ureq = { version = "2", features = ["json"] }
+tiny_http = "0.12"
+
+[profile.release]
+lto = true
+codegen-units = 1

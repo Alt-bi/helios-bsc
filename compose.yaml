@@ -1,0 +1,25 @@
+# helios-bsc on loopback. No RPC auth in the binary — host port is 127.0.0.1 only.
+# Copy .env.example → .env and set HELIOS_BSC_UPSTREAM (never commit the key).
+# Optional: --checkpoint /data/checkpoint.json --require-checkpoint
+# Disk: this process is ~0 chain storage. Do not use /mnt/big.
+
+services:
+  helios-bsc:
+    build: .
+    env_file: .env
+    environment:
+      HELIOS_BSC_UPSTREAM: ${HELIOS_BSC_UPSTREAM:?set HELIOS_BSC_UPSTREAM in .env}
+    ports:
+      - "127.0.0.1:8545:8545"
+    # Uncomment for a sealing-set checkpoint (read-write so last-verified can persist):
+    # volumes:
+    #   - ./checkpoint.json:/data/checkpoint.json
+    # command:
+    #   - run
+    #   - --listen
+    #   - 0.0.0.0:8545
+    #   - --allow-non-loopback
+    #   - --checkpoint
+    #   - /data/checkpoint.json
+    #   - --require-checkpoint
+    restart: unless-stopped

@@ -1,0 +1,18 @@
+[package]
+name = "helios-bsc-consensus"
+description = "Parlia light-client consensus (seals, epochs, confirmation-depth)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+helios-bsc-types = { workspace = true }
+helios-bsc-config = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+hex = { workspace = true }
+secp256k1 = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

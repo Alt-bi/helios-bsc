@@ -1,0 +1,13 @@
+/target
+.git
+.github
+.env
+.env.*
+!.env.example
+checkpoint.json
+last-verified.json
+**/*.pdb
+**/__pycache__
+*.pyc
+docs/grant
+scripts/__pycache__

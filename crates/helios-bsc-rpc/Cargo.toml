@@ -1,0 +1,16 @@
+[package]
+name = "helios-bsc-rpc"
+description = "Local fail-closed JSON-RPC surface for helios-bsc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+helios-bsc-types = { workspace = true }
+helios-bsc-consensus = { workspace = true }
+helios-bsc-execution = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
