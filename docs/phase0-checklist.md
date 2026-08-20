@@ -17,7 +17,7 @@ See also: [design.md](./design.md), [hardfork-table.md](./hardfork-table.md), [p
 
 1. Measure **public/paid** providers first.
 2. Alt F only if matrix fails.
-3. Never put BSC full node data on `/mnt/big` (BTC SMART disk).
+3. Never put a BSC full/archive datadir on a failing or overloaded disk shared with other full nodes.
 
 ## Commands
 

@@ -1,5 +1,5 @@
 # helios-bsc — verified local JSON-RPC. Do not bake API keys into the image.
-# Host publish must stay loopback (see compose.yaml). Never put chain data on /mnt/big.
+# Host publish must stay loopback (see compose.yaml). Optional checkpoint file only — no chain archive.
 
 FROM rust:1-bookworm AS build
 WORKDIR /src

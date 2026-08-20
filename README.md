@@ -46,7 +46,7 @@ cargo run -p helios-bsc -- info
 cargo run -p helios-bsc -- doctor   # env hosts only, never API keys; Pasteur countdown
 
 # Walk recent headers, compute newest Safe, fetch eth_getProof
-# Windows: set HELIOS_BSC_UPSTREAM=https://rpc.ankr.com/bsc/YOUR_KEY
+# Windows: set HELIOS_BSC_UPSTREAM to your BSC HTTPS JSON-RPC (see .env.example)
 cargo run -p helios-bsc -- probe-safe --upstream %HELIOS_BSC_UPSTREAM% --oracle https://bsc-mainnet.public.blastapi.io
 cargo run -p helios-bsc -- run --listen 127.0.0.1:8545
 # Optional transport failover (still untrusted): --backup $HELIOS_BSC_BACKUP
@@ -76,9 +76,9 @@ cp .env.example .env
 docker compose up --build -d    # http://127.0.0.1:8545
 ```
 
-See [docs/deploy.md](docs/deploy.md). Do not publish `0.0.0.0:8545` without a proxy. Do not use `/mnt/big`.
+See [docs/deploy.md](docs/deploy.md). Do not publish `0.0.0.0:8545` without a reverse proxy and auth. This client stores almost no chain data — do **not** co-locate a BSC full/archive node on a disk you already use for other heavy node datadirs.
 
-Wallet mode: `eth_blockNumber` and proof-backed `latest` map to **Safe**. Verified: `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt`, header-only `eth_getBlockByNumber` / `eth_getBlockByHash` (at or below Safe). `eth_sendRawTransaction` is **unverified broadcast**. Proof window **112** blocks (Ankr free). Fail-closed if the upstream cannot prove Safe — swap the key.
+Wallet mode: `eth_blockNumber` and proof-backed `latest` map to **Safe**. Verified: `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt`, header-only `eth_getBlockByNumber` / `eth_getBlockByHash` (at or below Safe). `eth_sendRawTransaction` is **unverified broadcast**. Many free RPC providers prune `eth_getProof` state before Safe lag (~110 blocks) — fail-closed if the upstream cannot prove Safe; use a deeper provider or self-hosted full/fast node as the untrusted data plane.
 
 `--checkpoint FILE` enables sealing-set membership (unauthorized sealers rejected). Without it, lookback only checks ECDSA coinbase + parent links. Checkpoint age default **24h** (`--allow-stale-checkpoint` to override). The sealing set is operator-supplied — never inferred from miners in the lookback window.
 
@@ -102,9 +102,9 @@ python scripts/soak_vs_oracle.py --once
 
 Honest calendar: **months** of part-time work, not a weekend. See design doc.
 
-## ConnectionServers note
+## Deploy note
 
-Developed under `ConnectionServers/helios-bsc`. Does **not** touch Bitcoin CT201 or `/mnt/big`. Optional later deploy: small process on LAN/NetBird only.
+Default bind is loopback (`127.0.0.1:8545`). For LAN/VPN exposure use a reverse proxy with authentication — the binary itself has no RPC auth.
 
 ## Prior art
 
@@ -118,4 +118,3 @@ Developed under `ConnectionServers/helios-bsc`. Does **not** touch Bitcoin CT201
 
 Independent open-source track (MIT OR Apache-2.0). Optional discussion with Helios maintainers only **after** a solid public Demo Slice.
 
-Grant prep drafts (not required to run the client): [`docs/grant/`](docs/grant/).

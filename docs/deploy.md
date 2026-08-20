@@ -12,7 +12,7 @@ Compose maps `127.0.0.1:8545:8545`. Changing that to `8545:8545` exposes the pro
 
 Inside the container the process listens on `0.0.0.0` because Docker NAT is not loopback. That is not a host bind.
 
-No chain archive. Do not put anything on `/mnt/big`. Optional later: small volume on `/mnt/fast` for `checkpoint.json` only.
+No chain archive is required. Optional: persist only `checkpoint.json` on a small local volume. Do **not** place a multi-TB BSC full/archive node datadir next to unrelated heavy node storage without planning disk and I/O separately.
 
 ```bash
 docker compose run --rm helios-bsc doctor

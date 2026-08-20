@@ -3,13 +3,13 @@
 | Field | Value |
 |-------|-------|
 | **Document** | BSC Verified Local JSON-RPC (Parlia Light Client) |
-| **Author** | ConnectionServers / bigdaddy ops (placeholder) |
+| **Author** | helios-bsc maintainers |
 | **Date** | 2026-08-18 |
-| **Status** | **Active development** — Phase 0 / scaffold in `ConnectionServers/helios-bsc` (rev 5 design + PR1 scaffold) |
-| **Working name** | **helios-bsc** (crate/binary: `helios-bsc`; product name TBD) |
+| **Status** | **Active development** — Demo Slice in this repository |
+| **Working name** | **helios-bsc** (crate/binary: `helios-bsc`) |
 | **License** | Dual Apache-2.0 OR MIT |
-| **Repo home (decided)** | Independent public repo `helios-bsc` (not inside a16z/helios); developed under `ConnectionServers/helios-bsc/` |
-| **Canonical docs** | This tree: `helios-bsc/docs/` (stubs in `agent-workspace/` point here) |
+| **Repo** | https://github.com/Alt-bi/helios-bsc |
+| **Canonical docs** | `docs/` in this repository |
 
 ---
 
@@ -23,21 +23,17 @@ This document proposes an open-source Rust binary that (1) maintains a minimal v
 
 **MVP split:** **MVP-1** = seals + epochs + confirmation-depth + verified state reads (no FF dependency). **MVP-2** = Fast Finality when Phase 0 proves public RPC vote data is verifiable. **Demo Slice** = thinnest vertical (checkpoint → seals → epoch delay → confirmation-depth → verified `eth_getBalance`) as the first staffing reality check.
 
-This is a **long R&D / open-source track** (~**9–18 months** at 1–2 engineers part-time unless closer to 1 FTE), not a weekend deploy on `pxmx_main`.
+This is a **long R&D / open-source track** (months of part-time work), not a weekend drop-in for every wallet.
 
 ---
 
 ## Background & Motivation
 
-### Operator / infra context
+### Why “~0 disk” matters
 
-ConnectionServers runs **bigdaddy** (`pxmx_main`): Proxmox host with AI stack on `/mnt/usbssd` and Bitcoin full node **CT201** on SMART-degraded `/mnt/big` (~2 TB HDD, IBD in progress). Per `inventory/hosts.md` storage table: `/mnt/fast` (WD 1TB) is a free spare and is the **preferred optional deploy disk** for helios-bsc if/when packaged—avoid contending with AI on usbssd and **never** use `/mnt/big`. Disk pressure makes a second multi-TB chain incompatible with the “weighs nothing / share host with BTC” goal.
+BSC **full/fast** nodes typically need **≥2–3 TB SSD**; **archive** is larger still. Many operators already run other full nodes or constrained lab hosts. A Helios-like client must therefore avoid a second multi-TB chain datadir while still offering wallet-useful verified reads.
 
-BSC storage reality (motivation, not a deploy plan): **full/fast** nodes typically need **≥2–3 TB SSD**; **archive** is much larger (multi-TB beyond that). Either way unfit for `/mnt/big` beside CT201.
-
-**Operator conversation context (not inventory-evidenced):** BCH full node deferred to a future disk. Desired capability is **ETH / BNB / SOL wallet-like ops** with minimized RPC trust; **BNB Helios-like is phase 1 (this doc)**; SOL is phase 2 (Tinydancer reportedly stalled ~May 2026) and out of MVP scope.
-
-Operator crypto workflows already live under `agent-workspace/crypto-reports/` (risk stubs, balance probes). A future copy of this design may live under `agent-workspace/designs/` or `crypto-reports/`; **this deliverable does not require changing production BTC or AI stacks**.
+**Product scope for this document:** BNB Smart Chain (Parlia) first. Ethereum already has Helios. Other L1 light clients (e.g. Solana) are explicitly out of MVP.
 
 ### Current state / pain points
 
@@ -83,7 +79,7 @@ Honest conclusion: **execution-proof reuse is high; consensus path is a new Parl
 1. Sync a **Parlia light consensus view** (headers, sealing validator set, confirmation-depth finality) with **minimal durable disk**.
 2. Verified: `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt`, `eth_chainId`, `eth_blockNumber`; unverified broadcast `eth_sendRawTransaction`.
 3. Explicit **verified | unverified | unsupported** policy; default fail-closed (hard RPC errors for MetaMask-compatible clients).
-4. Run on commodity hardware / small LXC alongside BTC **without** using `/mnt/big`.
+4. Run on commodity hardware / small LXC without a multi-TB BSC archive datadir.
 5. Open-source Rust; Apache-2.0 OR MIT; documented threat model and checkpoint UX.
 6. Depend on ≥1 upstream for headers/proofs but **detect lies** that break seal / proof rules.
 
@@ -102,7 +98,7 @@ Honest conclusion: **execution-proof reuse is high; consensus path is a new Parl
 | Replacing full nodes for explorers, subgraphs, or compliance archives | Light client ≠ archive |
 | Trustless P2P Portal Network for BSC | Does not exist as ETH Portal equivalent; future research |
 | opBNB as substitute for BSC L1 verification | opBNB is OP-Stack L2; Helios `opstack` path verifies L2 *relative to L1*—does not give BSC L1 Parlia light sync |
-| Changing Bitcoin CT201 or AI stack layout | Infra note only; optional later deploy |
+| Changing unrelated host node layouts | Out of scope |
 | WASM wallet embed in MVP | Nice-to-have post-MVP; design for library-friendly crates |
 | Shipping FF as a blocker for first verified balances | MVP-1 uses confirmation-depth only |
 
@@ -365,11 +361,11 @@ Confirmation-depth **Safe** lags tip by ~**O(min_distinct×turnLength)** (~240 b
 - Optionally require one paid hash/number provider known-good for GA.
 - **Do not merge PR 9** until that hash/number-or-Alt-F path is in fixtures.
 
-**Operator order (settled):** measure **public/paid** hash/number providers **first**; stand up **Alt F only if that matrix fails**. If the matrix fails, Alt F then becomes **mandatory** for Demo Slice—not optional polish. Local verification remains mandatory either way. Do **not** provision Alt F or start Phase 0 coding until the operator resumes (design parked).
+**Operator order (settled):** measure **public/paid** hash/number providers **first**; stand up **Alt F only if that matrix fails**. If the matrix fails, Alt F then becomes **mandatory** for Demo Slice—not optional polish. Local verification remains mandatory either way. Prefer public/paid proof providers first; Alt F only if that matrix fails.
 
 ### Local JSON-RPC behavior & TrustClass on the wire
 
-- Bind default `127.0.0.1:8545` (LAN/NetBird bind **lab-only** unless auth checklist satisfied—see Security).
+- Bind default `127.0.0.1:8545` (LAN/VPN bind **lab-only** unless auth checklist satisfied—see Security).
 - **MetaMask / cast / standard wallets:** consume ordinary `eth_*` results. They **will ignore** meta methods and any non-standard result wrappers. Therefore:
   - **Compatibility = method subset + hard errors on verify failure / unsupported methods.**
   - There is **no** reliable in-band `TrustClass` field inside standard `eth_getBalance` responses for MetaMask.
@@ -454,7 +450,7 @@ helios-bsc/
   .github/workflows/ci.yml
 ```
 
-Optional later: mirror design copy into ConnectionServers `agent-workspace/designs/helios-bsc/`.
+Canonical design lives in `docs/design.md` in this repository.
 
 ### MVP RPC method matrix
 
@@ -480,7 +476,7 @@ Default: **refuse** unsupported methods. Opt-in `--allow-unverified-passthrough`
 
 ## API / Interface Changes
 
-No existing ConnectionServers production API is changed.
+This project does not require changes to unrelated production APIs.
 
 ### CLI (sketch)
 
@@ -553,10 +549,10 @@ Local `:8545` that forwards to public BSC RPC with API key rotation.
 - **Cons:** Zero integrity improvement; fails the stated trust goal.
 - **Verdict:** Useful interim for Hermes scripting; **not** this project’s MVP success criterion.
 
-### B. Run BSC full/fast node on `pxmx_main`
+### B. Run BSC full/fast node on the same host
 
 - **Pros:** Correctness max; native Parlia; full `eth_getProof` control.
-- **Cons:** ≥2–3 TB SSD (archive ≫); competes with BTC on degraded `/mnt/big`; violates “weighs nothing.”
+- **Cons:** ≥2–3 TB SSD (archive ≫); competes for disk/I/O with other full nodes; violates “weighs nothing.”
 - **Verdict:** Rejected for this host.
 
 ### C. Wait for Portal-like / decentralized proof network on BSC
@@ -579,11 +575,11 @@ Local `:8545` that forwards to public BSC RPC with API key rotation.
 
 ### F. Dedicated remote full/fast node as untrusted data plane / fixture generator
 
-Run a pruned/fast BSC node on a **separate cheap VPS** or on **`pxmx_child` spare disk** (not `/mnt/big` on main)—**not** as the wallet trust root.
+Run a pruned/fast BSC node on a **separate cheap VPS** or spare disk—**not** as the wallet trust root.
 
 - **Pros:** Provides **hash/number `eth_getProof`** when public RPCs are tag-only—**required for Demo Slice wallet mode** if no public hash/number provider works; also FF capture, fixtures, and **one side** of differential soak.
 - **Cons:** Ops cost; disk on another machine; must never be mistaken for “trusted RPC” (integrity still from seals + proofs). **Cannot be both sole upstream and sole soak oracle** — soak requires a second independent source.
-- **Verdict:** **Accepted as fallback.** Operator order: public/paid matrix **first**; Alt F **only if matrix fails**—then mandatory for Demo Slice. Hosting (VPS vs `pxmx_child`) deferred until that contingency. Does not replace local verification; no multi-TB chain on bigdaddy’s `/mnt/big`. **Not started while design is parked.**
+- **Verdict:** **Accepted as fallback.** Operator order: public/paid matrix **first**; Alt F **only if matrix fails**—then mandatory for Demo Slice. Hosting (VPS vs spare disk) deferred until needed. Does not replace local verification.
 
 ---
 
@@ -608,7 +604,7 @@ Run a pruned/fast BSC node on a **separate cheap VPS** or on **`pxmx_child` spar
 ### Auth / exposure checklist
 
 - Default bind **loopback only**.
-- **Any non-lab LAN/NetBird bind requires:** firewall allowlist **and** auth (e.g. reverse proxy basic/mTLS or RPC JWT)—otherwise **forbidden** for Phase 5 “optional deploy.”
+- **Any non-lab LAN/VPN bind requires:** firewall allowlist **and** auth (e.g. reverse proxy basic/mTLS or RPC JWT)—otherwise **forbidden** for Phase 5 “optional deploy.”
 - No private keys in helios-bsc; signing stays in wallet/Hermes.
 
 ### Data handling
@@ -653,7 +649,7 @@ Run a pruned/fast BSC node on a **separate cheap VPS** or on **`pxmx_child` spar
 | **Demo Slice** | **~3–4 months** cumulative | PRs through confirmation-depth sync + verified balance; staffing reality check |
 | **MVP-1** | **~9–12 months** cumulative typical | Full verified state reads + broadcast + soak + docs |
 | **MVP-2** | +3–6 months | FF (if gated open) + constrained `eth_call` |
-| **Optional deploy** | 1–2 weeks | LXC/Docker on `/mnt/fast`, loopback or auth’d LAN/NetBird |
+| **Optional deploy** | 1–2 weeks | LXC/Docker, loopback or auth’d LAN/VPN |
 
 **Calendar honesty:** **~9–18 months** part-time to solid MVP-1/GA-quality unless staffing approaches **1 FTE**. Prior “6–12+ months” was optimistic given Parlia reverse-engineering, proof-provider risk, and `eth_call` complexity. **Phase 0 alone is publishable research** if staffing slips. **Demo Slice** is the first go/no-go for continuing.
 
@@ -673,7 +669,7 @@ Run a pruned/fast BSC node on a **separate cheap VPS** or on **`pxmx_child` spar
 
 ### Optional infra (post-MVP)
 
-Prefer **`/mnt/fast`** on `pxmx_main` (per `inventory/hosts.md`) or a small VPS / `pxmx_child` disk for Alt F. **Never** `/mnt/big`. Bind loopback or satisfy auth checklist. Out of scope for design acceptance.
+Prefer a dedicated spare volume or small VPS for any Alt F full/fast node. Avoid overloaded shared archive disks. Bind loopback or satisfy the auth checklist.
 
 ---
 
@@ -701,7 +697,7 @@ Prefer **`/mnt/fast`** on `pxmx_main` (per `inventory/hosts.md`) or a small VPS 
 | Validator collusion | **High (inherent)** | Document ≤ BSC security |
 | Scope creep (`eth_call`, FF, SOL) | **Medium** | Demo Slice first; Non-goals |
 | Part-time staffing drift | **Medium** | Demo Slice go/no-go; Phase 0 publishable alone |
-| Mistaken deploy on degraded disk | **Medium** | Prefer `/mnt/fast`; never `/mnt/big` |
+| Mistaken deploy on overloaded shared disks | **Medium** | Prefer a dedicated spare volume or VPS |
 
 ---
 
@@ -716,12 +712,12 @@ Prefer **`/mnt/fast`** on `pxmx_main` (per `inventory/hosts.md`) or a small VPS 
 7. **~0 durable storage** — Checkpoint + `last_safe` + ephemeral cache; compatible with BTC IBD host sharing.
 8. **Apache-2.0 OR MIT dual license** — Community/wallet adoption.
 9. **SOL / opBNB / Portal deferred** — Keep MVP coherent.
-10. **Optional `pxmx_main` deploy later only** — Prefer `/mnt/fast`; never `/mnt/big`; no mid-task AI/BTC disruption.
+10. **Optional host deploy later only** — Prefer a spare volume or VPS; do not disrupt unrelated workloads.
 11. **Demo Slice before `eth_call` / FF polish** — First staffing reality check: checkpoint → seals → epoch delay → confirmation-depth → verified `eth_getBalance`.
 12. **Max checkpoint age driven by header-walk cost** — Default ≤24h strict; not Helios’s week-scale window.
 13. **Required upstream proof capability for Demo Slice / GA** — At least one reproducible **`eth_getProof` by block hash or number**. **Order (operator-decided):** measure **public/paid RPC provider matrix first**; stand up **Alt F only if that matrix fails**. Tag-only degraded mode does not satisfy wallet-mode Safe proofs.
 14. **Independent public repo `helios-bsc`** (dual MIT/Apache) — not starting inside a16z/helios workspace; optional upstream discussion only after Demo Slice.
-15. **~~Design parked~~ → development resumed (2026-08-18)** — scaffold + Phase 0 docs/scripts live under `ConnectionServers/helios-bsc/`. Consensus seal/sync still gated on Phase 0 checklist.
+15. **~~Design parked~~ → development resumed (2026-08-18)** — scaffold + Phase 0 docs/scripts live under `this repository/`. Consensus seal/sync still gated on Phase 0 checklist.
 
 ### Operator decisions (2026-08-18)
 
@@ -731,9 +727,9 @@ Settled by operator; treat as final (not open for re-debate in this doc):
 |---|----------|
 | A | **OSS home:** independent public repo **`helios-bsc`**, dual MIT/Apache. No initial a16z/helios workspace membership; optional upstream chat **only after Demo Slice**. |
 | B | **`eth_getProof` path:** **first** fill/measure the public/paid provider matrix for hash/number proofs; **Alt F only if the matrix fails**. |
-| C | **Near-term work:** **save design only** — do **not** start Phase 0 coding, fixtures automation, or binary implementation until the operator explicitly resumes. |
+| C | **Near-term work:** **save design only** — development has resumed in this repository; keep milestones honest. |
 
-Copies of this design also live under ConnectionServers `agent-workspace/designs/helios-bsc-design-20260818.md` and `agent-workspace/crypto-reports/helios-bsc-design-20260818.md` for browsing; they are documentation only.
+This file is the canonical design document for the public repository.
 
 ---
 
@@ -742,12 +738,12 @@ Copies of this design also live under ConnectionServers `agent-workspace/designs
 1. **Freeze hardfork table** from a pinned `bnb-chain/bsc` commit (epochLength, turnLength, `extraData` versions for Maxwell/Fermi/…). *Partial answer in-doc: normative epoch **1000** post-Maxwell; Phase 0 still must pin commit SHA when coding resumes.*
 2. **Fast Finality wire format** on public JSON-RPC vs full-node-only — **MVP-2 gate**, not MVP-1 blocker. Record BEP-126 fields in Phase 0 (when resumed).
 3. **`eth_getProof` provider matrix — DECIDED (process):** On resume, Phase 0 **first measures public/paid hash/number support**; tag-only is recorded for awareness but does not unlock Demo Slice. **Alt F is provisioned only if that matrix fails** (see Operator decision B / KD13–14). Remaining work is executing the matrix, not choosing the strategy.
-4. **Checkpoint distribution:** own signed feed for ConnectionServers vs manual + explorers?
+4. **Checkpoint distribution:** own signed checkpoint feed vs manual + explorers?
 5. **Upstream / repo home — DECIDED:** Independent public **`helios-bsc`** repo (dual MIT/Apache). Not inside a16z/helios; optional upstream discussion only after Demo Slice (Operator decision A / KD14).
 6. **Receipt verification priority** vs `eth_call` after Demo Slice?
 7. **Governance changes** to Cabinet/Candidate counts or N_seal — config-driven thresholds assumed; confirm if FF vote N can diverge from seal N.
 8. **Hermes integration:** separate `bsc-verified` endpoint vs detect `helios_bsc_syncStatus`?
-9. **Alt F hosting — DECIDED (conditional):** Alt F is **not** the default first step; only if public/paid hash/number matrix fails (Operator decision B). Exact host (cheap VPS vs `pxmx_child` spare disk) remains a **deferred ops choice** if/when Alt F is required—do not provision now (Operator decision C).
+9. **Alt F hosting — DECIDED (conditional):** Alt F is **not** the default first step; only if public/paid hash/number matrix fails (Operator decision B). Exact host (cheap VPS vs spare disk) remains a **deferred ops choice** if/when Alt F is required.
 
 ---
 
@@ -763,7 +759,7 @@ Copies of this design also live under ConnectionServers `agent-workspace/designs
 - `bnb-chain/bsc` `consensus/parlia` — implementation source of truth  
 - EIP-1186 `eth_getProof` — https://eips.ethereum.org/EIPS/eip-1186  
 - Chainstack / client notes on BSC `eth_getProof` tag limitations  
-- ConnectionServers — `inventory/hosts.md` (storage: `/mnt/fast` spare, `/mnt/big` degraded + CT201); `bitcoin-node/README.md`; `agent-workspace/crypto-reports/`  
+- Operator constraints: avoid multi-TB co-location with other full-node archives; prefer loopback RPC bind  
 
 ---
 
@@ -888,7 +884,7 @@ Incremental, independently reviewable PRs. Rough **engineer-days** assume one pr
 
 ### PR 16 — (Optional) Docker/LXC packaging (~2–4 d)
 
-- **Title:** `chore(deploy): Dockerfile/LXC sample on /mnt/fast, loopback or auth’d bind`
+- **Title:** `chore(deploy): Dockerfile/LXC sample, loopback or auth’d bind`
 - **Dependencies:** PR 13
 - **Description:** Auth checklist enforced in compose comments; no BTC/AI changes.
 
