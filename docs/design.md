@@ -173,7 +173,7 @@ flowchart LR
 | Committee size / churn | 512 random, ~27h | **45 elected** / **21 seal per epoch**; epoch length **1000** blocks post-Maxwell; N_seal/2 activation delay |
 | Consensus data API | Beacon light-client REST | Standard `eth_getBlockByNumber/Hash` (+ FF fields when available — MVP-2) |
 | Execution proofs | `eth_getProof` vs verified `stateRoot` | Same pattern; **Demo Slice requires hash/number proofs or Alt F** (tag-only insufficient for Safe lag) |
-| Finality | Beacon finalized checkpoints | **MVP-1:** confirmation-depth **`floor(2×N_seal/3)+1`** distinct sealers (=15 for 21; ~1–2 min lag @ turnLength≈16). **MVP-2:** FF when verifiable |
+| Finality | Beacon finalized checkpoints | **MVP-1:** confirmation-depth **`floor(2×N_seal/3)+1`** distinct sealers (=15 for 21). **Live:** turnLength=**8**, Safe lag **~106–112** / proof window **112** (`STATUS.md`; ~50s @ 0.45s). **Historical example:** ~1–2 min @ turnLength≈16 / lag ~240. **MVP-2:** FF when verifiable |
 | Sync time target | Seconds (committee skip) | **After a fresh checkpoint (hours–≤24h default):** minutes–tens of minutes with batched fetch. **Not** “seconds from a week-old checkpoint” |
 | Durable storage | Latest checkpoint (~32 B+) | Checkpoint + last headers / validator snapshot (KB–few MB) |
 
@@ -185,9 +185,11 @@ flowchart LR
 |----------------|--------------|---------------------|----------------|------------------------|
 | Historical (early Parlia / Coinskite-era docs) | **200** | — | ~3–5s class | **Legacy only** — fixtures may include for codec tests |
 | Pre-Maxwell intermediate | **500** | 8 | shorter intervals | Legacy |
-| **Maxwell+ (current baseline)** | **1000** | 16 | pre-Fermi interval | **Normative epoch length for mainnet design** |
-| **Fermi (Jan 2026)** | 1000 (confirm) | confirm | **0.45s** | Dominates sync-cost math |
+| **Maxwell+ (current baseline)** | **1000** | 16 (source comment) | pre-Fermi interval | **Normative epoch length for mainnet design.** Live extraData `turnLength` is **8**, not 16. |
+| **Fermi (Jan 2026)** | 1000 | **8** (live extraData) | **0.45s** | Dominates sync-cost math |
 | Luban / Plato / Bohr / Lorentz / … | per release | per release | per release | `extraData` / vote-key / FF field layout versions |
+
+**Live pins (this tree — `STATUS.md`, not the historical T=16 example):** epochLength=**1000**, turnLength=**8**, N_seal=**21**, Safe=**15**, proof window **112**, live Safe lag **~106–112** (in-turn upper 120). `turnLength≈16` / lag ~240 in older prose below are **historical / geth source-comment examples**, not live.
 
 **Implementation rule:** Do **not** hard-code 200 in consensus logic. Read `epochLength` / `turnLength` / `extraDataVersion` from config at the block height being verified.
 
@@ -215,14 +217,17 @@ min_distinct_sealers := floor(2 * N_seal / 3) + 1
 
 Unit-test this table in consensus tests (config-driven N; OQ7). CLI derives `min_distinct_sealers` from the active sealing snapshot; do **not** ship a hardcoded 31 as if N were the elected pool of 45.
 
-**Expected Safe confirmation latency (operator UX):** with Maxwell-era **`turnLength≈16`**, a new distinct in-turn sealer appears only about every `turnLength` blocks in the happy path. Wall-clock Safe lag is therefore on the order of:
+**Expected Safe confirmation latency (operator UX):** a new distinct in-turn sealer appears only about every `turnLength` blocks in the happy path. Wall-clock Safe lag is therefore on the order of:
 
 ```text
-safe_lag_blocks ≈ O(min_distinct_sealers × turnLength)   # ~15 × 16 ≈ 240 blocks
-safe_lag_seconds ≈ safe_lag_blocks × blockInterval         # ~240 × 0.45s ≈ ~108s → ~1–2 minutes
+safe_lag_blocks ≈ O(min_distinct_sealers × turnLength)
+# Live pins (STATUS.md): T=8 → ~15 × 8 = 120 in-turn upper; measured lag ~106–112
+# Historical / source-comment example: T≈16 → ~15 × 16 ≈ 240 blocks
+safe_lag_seconds ≈ safe_lag_blocks × blockInterval
+# Live: ~106–112 × 0.45s ≈ ~48–50s. Historical T=16: ~240 × 0.45s ≈ ~108s → ~1–2 minutes
 ```
 
-This is **not** “15 blocks” and **not** Fast Finality’s ~1s. Expose `safe_lag_blocks` / `safe_lag_seconds` on `helios_bsc_syncStatus`. Default “stale head” alerts must sit **above** this floor (e.g. warn if tip lag ≫ Safe lag, not if Safe is 90s behind tip). Hermes / wallet timeouts should allow ≥2–3 minutes for first Safe after cold sync catch-up.
+This is **not** “15 blocks” and **not** Fast Finality’s ~1s. Expose `safe_lag_blocks` / `safe_lag_seconds` on `helios_bsc_syncStatus`. Default “stale head” alerts must sit **above** this floor (e.g. warn if tip lag ≫ Safe lag, not if Safe is ~50s behind tip). Hermes / wallet timeouts should allow ≥2–3 minutes for first Safe after cold sync catch-up.
 
 ### Consensus verification path (Parlia light client)
 
@@ -286,7 +291,7 @@ sequenceDiagram
   Op->>LC: eth_getBalance(addr, "latest") / eth_blockNumber
   Note over Op,LC: wallet mode maps both to Safe
   LC->>RPC: eth_getProof(addr, [], Safe blockHash or number)
-  Note over LC,RPC: Tag-only latest/finalized ≠ Safe (~240 blk lag); need hash/number or Alt F
+  Note over LC,RPC: Tag-only latest/finalized ≠ Safe (live lag ~106–112 / proof window 112; historical ~240 @ T=16); need hash/number or Alt F
   LC->>LC: Reject if proof stateRoot ≠ local Safe stateRoot
   LC->>LC: Verify MPT proof
   LC-->>Op: balance + Safe height OR hard error
@@ -356,10 +361,10 @@ Before starting verified-read RPC work, record a living table in `docs/proof-pro
 
 **Hard requirement for Demo Slice / wallet mode (normative):**
 
-Confirmation-depth **Safe** lags tip by ~**O(min_distinct×turnLength)** (~240 blocks / ~1–2 min). Provider tags `latest` / `finalized` (FF ~tip−2) / RPC `safe` **will not** equal local Safe’s `stateRoot`. Therefore:
+Confirmation-depth **Safe** lags tip by ~**O(min_distinct×turnLength)**. **Live (`STATUS.md`):** ~**106–112** blocks / proof window **112** (~50s @ 0.45s, T=8). **Historical example:** ~240 blocks / ~1–2 min @ turnLength≈16. Provider tags `latest` / `finalized` (FF ~tip−2) / RPC `safe` **will not** equal local Safe’s `stateRoot`. Therefore:
 
 - **Demo Slice and default wallet-mode verified reads require `eth_getProof` by block hash or number** for the local Safe header—via a public/paid provider that supports hash/number **or** via **Alternative F** (dedicated untrusted full/fast node).
-- **Tag-aligned degraded mode is insufficient for wallet-mode Safe proofs.** Do not present it as the Demo Slice fallback. It is an optional niche only if local Safe root *coincidentally* equals a proveable tag (do **not** expect this under confirmation-depth lag). It may still be useful for labs that deliberately map reads to tip/`finalized` under `--allow-unsafe-head-reads`, not for MetaMask DoD.
+- **Tag-aligned degraded mode is insufficient for wallet-mode Safe proofs.** Do not present it as the Demo Slice fallback. It is an optional niche only if local Safe root *coincidentally* equals a proveable tag (do **not** expect this under confirmation-depth lag). Mapping reads to tip/`finalized` under `--allow-unsafe-head-reads` is **not implemented** in this tree (see BlockTag mapping); not for MetaMask DoD.
 - **Verified reads only when** local Safe (or requested height) `stateRoot` **equals** the proof response `stateRoot`.
 - **Phase 0 / Demo Slice exit gate:** matrix must record ≥1 reproducible **hash/number or Alt F** path (+ mutated fail case). **Tag-only rows do not satisfy the gate.**
 - Optionally require one paid hash/number provider known-good for GA.
@@ -387,19 +392,19 @@ Confirmation-depth **Safe** lags tip by ~**O(min_distinct×turnLength)** (~240 b
 
 Standard wallets (MetaMask, many cast/SDK defaults) call `eth_getBalance(addr, "latest")` and do **not** send `safe`/`finalized`. A default that hard-refuses `latest` for proof-backed reads would break drop-in local RPC UX.
 
-| Tag / method | Default wallet mode (MVP-1) | `--allow-unsafe-head-reads` |
-|--------------|----------------------------|-----------------------------|
-| `latest` (proof-backed reads) | **Map to local Safe**; fetch `eth_getProof` by **Safe hash/number**. MetaMask gets Safe semantics under the name `latest`. If no Safe yet → `-32003` `not_synced`. | `latest` may mean seal-verified **tip**; still fail-closed on proof/root mismatch |
-| **`eth_blockNumber`** | Returns **Safe** block height (same view as proof-backed `latest`) | Returns **tip** height |
-| `safe` | Confirmation-depth head (`min_distinct_sealers = floor(2N/3)+1`) | Same |
-| `finalized` | MVP-1: alias of `safe` unless FF enabled and verified | Same |
+| Tag / method | Default wallet mode (MVP-1) — **this tree** | `--allow-unsafe-head-reads` / `BlockTagMode::AllowUnsafeHead` |
+|--------------|---------------------------------------------|--------------------------------------------------------------|
+| `latest` (proof-backed reads) | **Map to local Safe**; fetch `eth_getProof` by **Safe hash/number**. MetaMask gets Safe semantics under the name `latest`. If no Safe yet → `-32003` `not_synced`. | **Not implemented.** Enum variant only in `helios-bsc-rpc`; no CLI flag; server always uses wallet Safe. Do not ship as if tip reads were wired. |
+| **`eth_blockNumber`** | Returns **Safe** block height (same view as proof-backed `latest`) | **Not implemented** (would return tip). This tree always returns Safe. |
+| `safe` | Confirmation-depth head (`min_distinct_sealers = floor(2N/3)+1`) | Same (unimplemented mode) |
+| `finalized` | MVP-1: alias of `safe` unless FF enabled and verified | Same (unimplemented mode) |
 | hex number / hash | Verified header at height **and** hash/number proof against that root; else error | Same |
 
 **Modes (document clearly):**
 
-1. **Wallet mode (default):** `latest` → Safe for proof-backed reads; **`eth_blockNumber` → Safe height** so MetaMask’s height and balances stay consistent (~1–2 min behind tip). Requires hash/number (or Alt F) proofs—see above.
-2. **Unsafe-head mode (`--allow-unsafe-head-reads`):** `latest` and `eth_blockNumber` → tip; weaker confirmation, lower latency.
-3. `helios_bsc_syncStatus` always exposes **both** `tip_block` and `safe_block` (and lag fields) regardless of mode.
+1. **Wallet mode (default, and the only implemented mode):** `latest` → Safe for proof-backed reads; **`eth_blockNumber` → Safe height** so MetaMask’s height and balances stay consistent (live lag ~106–112 blocks / ~50s; historical ~1–2 min @ T=16). Requires hash/number (or Alt F) proofs—see above.
+2. **Unsafe-head mode (`--allow-unsafe-head-reads` / `BlockTagMode::AllowUnsafeHead`):** **Not implemented in this tree.** The CLI flag does not exist. `AllowUnsafeHead` is an unused enum variant. Default remains wallet `latest`→Safe. Do not document or invoke the flag as a live option.
+3. `helios_bsc_syncStatus` always exposes **both** `tip_block` and `safe_block` (and lag fields).
 4. Hard errors remain for root mismatch / unsynced / unsupported methods (never silent passthrough).
 
 ### Upstream dependency & trust minimization
@@ -425,7 +430,7 @@ Standard wallets (MetaMask, many cast/SDK defaults) call `eth_getBalance(addr, "
 | Go (reuse `bnb-chain/bsc` Parlia) | Faster consensus fidelity via copy, worse for “light” product & WASM; higher coupling to full node. Use as **spec oracle**. |
 | TypeScript | Faster prototype, weaker crypto/performance story for long-term OSS. |
 
-**Reuse plan:** Helios patterns (`core` execution proof flow, RPC surface, checkpoint UX); crates `alloy-*`, `revm`, `tokio`, `jsonrpsee`; BLS only when MVP-2 FF is unlocked. **Do not** vendor Helios beacon light client.
+**Reuse plan:** Helios patterns (`core` execution proof flow, RPC surface, checkpoint UX); crates `alloy-*`, `revm`, `tokio`. Live JSON-RPC server is **`tiny_http`** in `bin/helios-bsc/src/rpc_server.rs` — **not** jsonrpsee (do not claim jsonrpsee is the server). BLS only when MVP-2 FF is unlocked. **Do not** vendor Helios beacon light client.
 
 ### Repo layout (proposed)
 
@@ -461,7 +466,7 @@ Canonical design lives in `docs/design.md` in this repository.
 | Method | Demo Slice | MVP-1 | MVP-2 | Notes |
 |--------|------------|-------|-------|-------|
 | `eth_chainId` | Verified | Verified | | Config + header cross-check |
-| `eth_blockNumber` | Verified | Verified | | **Wallet mode → Safe height**; unsafe-head mode → tip; syncStatus exposes both |
+| `eth_blockNumber` | Verified | Verified | | **Wallet mode → Safe height** (only implemented mapping); `--allow-unsafe-head-reads` tip mapping is **not implemented**; syncStatus exposes both |
 | `eth_getBalance` | **Verified** | Verified | | Core Demo Slice |
 | `eth_getTransactionCount` | Stretch | Verified | | |
 | `eth_getCode` | — | Verified | | |
@@ -496,8 +501,8 @@ helios-bsc \
   --finality confirmation-depth \
   # --finality fast-finality   # MVP-2 only, after Phase 0 FF gate
   # min_distinct_sealers derived: floor(2*N_seal/3)+1  (e.g. 15 when N_seal=21)
-  # default: proof-backed "latest" maps to Safe (wallet mode)
-  # --allow-unsafe-head-reads   # optional: latest = tip before confirmation-depth
+  # default (this tree): proof-backed "latest" maps to Safe (wallet mode)
+  # --allow-unsafe-head-reads   # NOT IMPLEMENTED — unused BlockTagMode::AllowUnsafeHead only; do not pass
   --strict-checkpoint-age
 ```
 
@@ -630,12 +635,12 @@ Run a pruned/fast BSC node on a **separate cheap VPS** or spare disk—**not** a
 | `helios_bsc_proof_success_total` | counter | Verified reads |
 | `helios_bsc_checkpoint_age_seconds` | gauge | Freshness SLO |
 | `helios_bsc_sync_lag_blocks` | gauge | Tip vs network (if known) |
-| `helios_bsc_safe_lag_blocks` | gauge | Tip − Safe (expect ~O(min_distinct×turnLength), ~240 @ current pins) |
-| `helios_bsc_safe_lag_seconds` | gauge | Wall-clock Safe lag (~1–2 min typical) |
+| `helios_bsc_safe_lag_blocks` | gauge | Tip − Safe (expect ~O(min_distinct×turnLength); **live ~106–112** / 120 in-turn upper @ T=8; historical ~240 @ T=16) |
+| `helios_bsc_safe_lag_seconds` | gauge | Wall-clock Safe lag (**live ~50s** @ 0.45s / T=8; historical ~1–2 min @ T=16) |
 | `helios_bsc_finality_mode` | gauge/enum | 0=conf-depth, 1=FF |
 | `helios_bsc_upstream_errors_total` | counter | Provider health |
 
-**Alerting:** tip stale ≫ expected Safe lag floor (do **not** alert merely because Safe is ~1–2 min behind tip); `proof_fail` storm; checkpoint_age &gt; policy; validator-set mismatch vs contract prove-read.
+**Alerting:** tip stale ≫ expected Safe lag floor (do **not** alert merely because Safe is ~50s behind tip at live T=8; historical T=16 was ~1–2 min); `proof_fail` storm; checkpoint_age &gt; policy; validator-set mismatch vs contract prove-read.
 
 **Incident stub (docs PR):** `docs/runbooks/proof-fail-storm.md` — check upstream root drift, disable passthrough (should already be off), switch provider / Alt F node, freeze wallet ops if sync stale.
 
@@ -662,7 +667,7 @@ Run a pruned/fast BSC node on a **separate cheap VPS** or spare disk—**not** a
 - `finality=confirmation-depth` (default MVP-1) / `fast-finality` (MVP-2)
 - `allow_unverified_passthrough`
 - `strict_checkpoint_age` / `max_checkpoint_age`
-- `allow_unsafe_head_reads` (default **off** → wallet mode: proof-backed `latest`→Safe)
+- `allow_unsafe_head_reads` — **not implemented** (no CLI flag; unused `BlockTagMode::AllowUnsafeHead`). Default remains wallet mode: proof-backed `latest`→Safe.
 - `contract_validator_set_crosscheck`
 
 ### Rollback
@@ -712,7 +717,7 @@ Prefer a dedicated spare volume or small VPS for any Alt F full/fast node. Avoid
 3. **Execution trust via `eth_getProof` + verified `stateRoot`** — Same Helios execution thesis; provider matrix is a **GA/Phase 0 gate**.
 4. **Weak subjectivity checkpoints with multisource UX** — Unavoidable without Portal.
 5. **Default fail-closed RPC** — MetaMask-compatible via hard errors; TrustClass via meta APIs only.
-6. **Finality (amended):** **MVP-1 default = confirmation-depth over sealing set** with `min_distinct_sealers = floor(2×N_seal/3)+1` (=**15** for N_seal=**21**; expected Safe lag ~1–2 min @ turnLength≈16 / 0.45s). Fast Finality is **MVP-2 / feature-flagged** (`ceil(2×N_vote/3)` / BEP-126), enabled only when Phase 0 proves verifiable vote data on RPC (or Alt F capture). **Default wallet mode:** proof-backed `latest` maps to Safe.
+6. **Finality (amended):** **MVP-1 default = confirmation-depth over sealing set** with `min_distinct_sealers = floor(2×N_seal/3)+1` (=**15** for N_seal=**21**). **Live pins (`STATUS.md`):** turnLength=**8**, proof window **112**, Safe lag **~106–112** (~50s @ 0.45s). Historical example: ~1–2 min @ turnLength≈16. Fast Finality is **MVP-2 / feature-flagged** (`ceil(2×N_vote/3)` / BEP-126), enabled only when Phase 0 proves verifiable vote data on RPC (or Alt F capture). **Default wallet mode:** proof-backed `latest` maps to Safe. `--allow-unsafe-head-reads` is **not implemented**.
 7. **~0 durable storage** — Checkpoint + `last_safe` + ephemeral cache; compatible with BTC IBD host sharing.
 8. **Apache-2.0 OR MIT dual license** — Community/wallet adoption.
 9. **SOL / opBNB / Portal deferred** — Keep MVP coherent.
@@ -721,7 +726,7 @@ Prefer a dedicated spare volume or small VPS for any Alt F full/fast node. Avoid
 12. **Max checkpoint age driven by header-walk cost** — Default ≤24h strict; not Helios’s week-scale window.
 13. **Required upstream proof capability for Demo Slice / GA** — At least one reproducible **`eth_getProof` by block hash or number**. **Order (operator-decided):** measure **public/paid RPC provider matrix first**; stand up **Alt F only if that matrix fails**. Tag-only degraded mode does not satisfy wallet-mode Safe proofs.
 14. **Independent public repo `helios-bsc`** (dual MIT/Apache) — not starting inside a16z/helios workspace; optional upstream discussion only after Demo Slice.
-15. **Development in this repo (2026-08-21)** — Demo Slice closed; MVP-1 verified reads + unverified `sendRaw` + operator docs in tree. **24h soak remains the GA live gate.** MVP-2: constrained Safe-only `eth_call` + best-effort proof-backed `eth_estimateGas`. **FF not implemented.** Out-of-turn backoff, Maxwell FF recents prune, and EIP-1559 parent `baseFee` formulas are **not implemented**. Pasteur 2026-08-25 is scheduled, not live.
+15. **Development in this repo (2026-08-21)** — Demo Slice closed; MVP-1 verified reads + unverified `sendRaw` + operator docs in tree. **24h soak remains the GA live gate.** MVP-2: constrained Safe-only `eth_call` + best-effort proof-backed `eth_estimateGas` (DoD ticked). **FF not implemented.** **BLOCKHASH not implemented** (may land separately; not in `STATUS.md` at 70f5aed). `--allow-unsafe-head-reads` **not implemented**. Out-of-turn backoff, Maxwell FF recents prune, and EIP-1559 parent `baseFee` formulas are **not implemented**. Pasteur 2026-08-25 is scheduled, not live.
 
 ### Operator decisions (2026-08-18)
 
@@ -731,7 +736,7 @@ Settled by operator; treat as final (not open for re-debate in this doc):
 |---|----------|
 | A | **OSS home:** independent public repo **`helios-bsc`**, dual MIT/Apache. No initial a16z/helios workspace membership; optional upstream chat **only after Demo Slice**. |
 | B | **`eth_getProof` path:** **first** fill/measure the public/paid provider matrix for hash/number proofs; **Alt F only if the matrix fails**. |
-| C | **Near-term work:** keep milestones honest — Demo Slice closed; 24h soak still blocks MVP-1 GA; Pasteur 2026-08-25 is scheduled, not live. MVP-2 `eth_call` / `eth_estimateGas` in tree; FF not started. |
+| C | **Near-term work:** keep milestones honest — Demo Slice closed; 24h soak still blocks MVP-1 GA; Pasteur 2026-08-25 is scheduled, not live. MVP-2 `eth_call` / `eth_estimateGas` in tree; FF not started. Live Parlia pins: T=**8**, Safe lag ~106–112, proof window 112. `--allow-unsafe-head-reads` not implemented. BLOCKHASH not done. |
 
 This file is the canonical design document for the public repository.
 
@@ -827,7 +832,7 @@ Incremental, independently reviewable PRs. Rough **engineer-days** assume one pr
 - **Title:** `feat(consensus): JSON-RPC batch/parallel header sync + floor(2N/3)+1 distinct sealer safety`
 - **Files/components:** sync loop, batch/parallel fetcher (no range RPC), reorg bound = N_seal
 - **Dependencies:** PR 5
-- **Description:** **MVP-1 finality path.** Threshold `floor(2N/3)+1` (=15 for N=21); unit-test table for other N. Expose `safe_lag_*` metrics. Document ~1–2 min Safe lag @ turnLength≈16.
+- **Description:** **MVP-1 finality path.** Threshold `floor(2N/3)+1` (=15 for N=21); unit-test table for other N. Expose `safe_lag_*` metrics. Live Safe lag ~106–112 @ turnLength=**8** / proof window 112 (`STATUS.md`). Historical example ~1–2 min @ turnLength≈16.
 
 ### PR 7 — Fast Finality verification (**optional / non-blocking**) (~8–20 d if unlocked)
 
@@ -848,7 +853,7 @@ Incremental, independently reviewable PRs. Rough **engineer-days** assume one pr
 - **Title:** `feat(rpc): eth_getBalance + eth_blockNumber wallet mode (latest/height→Safe)`
 - **Files/components:** `helios-bsc-rpc`
 - **Dependencies:** PR 6, PR 8; **hash/number or Alt F proof gate**
-- **Description:** Verified methods; **`latest` and `eth_blockNumber` → Safe** by default; proofs via Safe **hash/number**; `--allow-unsafe-head-reads` for tip; syncStatus exposes tip+safe; TrustClass via meta; **no FF dependency**; tag-only upstream insufficient.
+- **Description:** Verified methods; **`latest` and `eth_blockNumber` → Safe** by default; proofs via Safe **hash/number**; `--allow-unsafe-head-reads` for tip is **not implemented** (unused enum only); syncStatus exposes tip+safe; TrustClass via meta; **no FF dependency**; tag-only upstream insufficient.
 
 ### PR 10 — Adversarial upstream mock (~3–5 d)
 
@@ -909,3 +914,5 @@ _Rev 6 (2026-08-20): Honest close-out — Demo Slice closed; tick MVP-1 DoD for 
 _Rev 7 (2026-08-20): MVP-2 slice 1 — constrained verified `eth_call` (Safe-only revm + iterative proofs; gas cap 50_000_000; max 8 proof rounds; unproven SLOAD/account fail-closed). Combined MVP-2 `eth_call`/estimateGas DoD remains open; `eth_estimateGas` still `-32601`. FF not started. 24h soak still the GA live gate. Pasteur 2026-08-25 is not live._
 
 _Rev 8 (2026-08-21): MVP-2 slice 2 — proof-backed best-effort `eth_estimateGas` (geth/reth binary search; MethodPolicy Verified; never proxied). Tick MVP-2 `eth_call`/estimateGas DoD; leave FF unchecked. 24h soak still the GA live gate. Pasteur 2026-08-25 is not live._
+
+_Rev 9 (2026-08-21): Docs honesty — `--allow-unsafe-head-reads` / `BlockTagMode::AllowUnsafeHead` are **not implemented** (unused enum; no CLI flag; default remains wallet `latest`→Safe). Live JSON-RPC server is **tiny_http** (`bin/helios-bsc/src/rpc_server.rs`), not jsonrpsee. Qualify turnLength≈16 / Safe lag ~240 as historical; live pins (`STATUS.md`): epochLength=1000, turnLength=**8**, N_seal=21, Safe=15, proof window 112, Safe lag ~106–112. MVP-2 DoD: `eth_call` + `eth_estimateGas` ticked; FF still unchecked. **BLOCKHASH not done** (may land separately; do not claim it at 70f5aed)._
