@@ -53,6 +53,12 @@ Next (operator order from design):
 Two traps that cost time when re-running this matrix — neither is a client bug:
 
 - **Send a `User-Agent`.** BlastAPI, publicnode and meowrpc now answer **403** to a bare `Python-urllib` / default-`curl` request, and **200** to the same request with any UA set. This reads exactly like an IP ban or a new key requirement and is neither. Every `scripts/*.py` sets one, and the client sends `helios-bsc` (`bin/helios-bsc/src/upstream.rs`), so only ad-hoc one-liners are affected. Re-confirmed working from the client UA against all four hosts.
+- **A non-batching upstream cannot keep up with 0.45 s blocks.** Measured 2026-08-21: with
+  `bsc-dataseed.bnbchain.org` the sync poller holds the chain lock almost continuously
+  (one round-trip per header, ~4 new blocks per 1.8 s poll), and `helios_bsc_syncStatus`
+  then blocks for **90 s+**. The same build against `bsc-rpc.publicnode.com`, which does
+  batch, answers in **0.8–1.8 s**. This is an upstream property, not a client defect —
+  but it is a second, independent reason not to pick a non-batching endpoint for the soak.
 - **`bsc-dataseed.bnbchain.org` serves headers but rejects batching.** Both the parallel fetch and the JSON-RPC batch array fail, so the client falls back to one request per header — a cold 130-header walk becomes 130 sequential round-trips. Fine as a header source for fixture capture; **do not pick it as a soak upstream**. (Its `eth_getProof` is still `-32005 limit exceeded`, as the matrix already records.)
 
 ## Repro
