@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use helios_bsc_config::mainnet_n_seal;
 use helios_bsc_consensus::{header_hash, VerifiedBlock};
-use helios_bsc_execution::EthAccountProof;
+use helios_bsc_execution::{EthAccountProof, EMPTY_TRIE_ROOT};
 use helios_bsc_types::{
     decode_hex, decode_hex_fixed, decode_u64, format_address, Checkpoint, RpcBlockHeader,
     BSC_MAINNET_CHAIN_ID,
@@ -411,8 +411,8 @@ fn dummy_header(number: u64, parent: [u8; 32], miner: [u8; 20]) -> RpcBlockHeade
         sha3_uncles: format!("0x{}", hex::encode([0u8; 32])),
         miner: format_address(&miner),
         state_root: format!("0x{}", hex::encode([0u8; 32])),
-        transactions_root: format!("0x{}", hex::encode([4u8; 32])),
-        receipts_root: format!("0x{}", hex::encode([5u8; 32])),
+        transactions_root: format!("0x{}", hex::encode(EMPTY_TRIE_ROOT)),
+        receipts_root: format!("0x{}", hex::encode(EMPTY_TRIE_ROOT)),
         logs_bloom: format!("0x{}", hex::encode([0u8; 256])),
         difficulty: "0x2".into(),
         number: qty(number),
