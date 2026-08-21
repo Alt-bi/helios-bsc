@@ -9,7 +9,7 @@ Inspired by [a16z/helios](https://github.com/a16z/helios) for Ethereum. BSC has 
 | **Status** | **Demo Slice closed.** 1h re-diff soak GATE PASS (2026-08-19). **24h soak** is still the MVP-1 GA live gate. |
 | **Repo** | https://github.com/Alt-bi/helios-bsc |
 | **License** | MIT OR Apache-2.0 |
-| **Design** | [docs/design.md](docs/design.md) · [RPC matrix](docs/rpc-matrix.md) · [wallet guide](docs/wallet-guide.md) · [checkpoints](docs/checkpointing.md) · [SLOs](docs/slo.md) · [threat model](docs/threat-model.md) |
+| **Design** | [docs/design.md](docs/design.md) · [RPC matrix](docs/rpc-matrix.md) · [wallet guide](docs/wallet-guide.md) · [checkpoints](docs/checkpointing.md) · [fast finality](docs/fast-finality.md) · [SLOs](docs/slo.md) · [threat model](docs/threat-model.md) |
 | **Chain** | BSC mainnet (`chainId` 56) |
 
 ## Why
@@ -100,7 +100,7 @@ python scripts/soak_vs_oracle.py --once
 1. **Phase 0** — **done** (hardfork pin, epoch fixtures, proof provider matrix)
 2. **Demo Slice** — **closed** (checkpoint → seals → Safe → verified `eth_getBalance`; 1h re-diff soak GATE PASS 2026-08-19: unique=19, compared=214, match=214, mismatch=0, skip=38)
 3. **MVP-1** — verified nonce/code/storageAt + unverified `eth_sendRawTransaction` **in tree**; **≥24h soak still the GA live gate**. Not implemented (no fixtures): out-of-turn backoff, Maxwell FF recents prune, EIP-1559 parent `baseFee` formulas.
-4. **MVP-2** — constrained `eth_call` + best-effort `eth_estimateGas` (proof-backed revm; never proxied). Fast Finality BLS **not started**.
+4. **MVP-2** — constrained `eth_call` + best-effort `eth_estimateGas` (proof-backed revm; never proxied). **Fast Finality (BLS) implemented** — vote attestations decoded and their aggregate BLS signature verified against the epoch vote keys; live mainnet finalized lag **2 blocks** vs 106–112 for confirmation depth ([docs/fast-finality.md](docs/fast-finality.md)). The `finalized` tag still resolves to the confirmation-depth Safe head — moving it wants its own soak.
 
 Honest calendar: **months** of part-time work, not a weekend. See design doc. Pasteur (2026-08-25) is scheduled, not live.
 
