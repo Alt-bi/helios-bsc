@@ -1,34 +1,11 @@
-<<<<<<< HEAD
-//! Consensus receipt RLP (geth `types.Receipt` London+ / yellow paper).
-//!
-//! Body is RLP([status, cumulativeGasUsed, logsBloom, logs]). Typed receipts
-//! (tx type 1..=4) prefix `type_byte`; legacy type 0 is the body alone.
-//! Pre-Byzantium `postState` receipts are not encoded.
-=======
 //! Consensus receipt RLP (geth `Receipts.EncodeIndex` / DeriveSha values).
 //!
 //! Legacy (type 0): `RLP([status, cumulativeGasUsed, logsBloom, logs])`.
 //! Typed 0x01–0x04: `type || RLP([...])` (not an extra RLP string wrap).
->>>>>>> 37a7cbc (feat: receiptsRoot-bound receipts and single-block eth_getLogs)
 
 use crate::rlp::{encode_bytes, encode_list, encode_uint};
 use thiserror::Error;
 
-<<<<<<< HEAD
-/// DoS cap; not a protocol constant.
-const MAX_LOGS: usize = 1024;
-
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum ReceiptRlpError {
-    #[error("receipt status must be 0 or 1")]
-    InvalidStatus,
-    #[error("receipt tx type exceeds 4")]
-    InvalidTxType,
-    #[error("too many receipt logs")]
-    TooManyLogs,
-}
-
-=======
 /// Same cap as header-bound receipt `logs[]`.
 pub const MAX_RECEIPT_LOGS: usize = 1024;
 /// EIP-778 log topics.
@@ -47,7 +24,6 @@ pub enum ReceiptRlpError {
 }
 
 /// One consensus log (`address`, `topics`, `data`).
->>>>>>> 37a7cbc (feat: receiptsRoot-bound receipts and single-block eth_getLogs)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsensusLog {
     pub address: [u8; 20],
@@ -55,53 +31,13 @@ pub struct ConsensusLog {
     pub data: Vec<u8>,
 }
 
-<<<<<<< HEAD
-=======
 /// Fields hashed into `receiptsRoot` (status post-Byzantium).
->>>>>>> 37a7cbc (feat: receiptsRoot-bound receipts and single-block eth_getLogs)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsensusReceipt {
     pub status: u64,
     pub cumulative_gas_used: u64,
     pub logs_bloom: [u8; 256],
     pub logs: Vec<ConsensusLog>,
-<<<<<<< HEAD
-    pub tx_type: u8,
-}
-
-/// Encode a London+ consensus receipt for the receipts trie (`receiptsRoot`).
-pub fn encode_consensus_receipt(r: &ConsensusReceipt) -> Result<Vec<u8>, ReceiptRlpError> {
-    if r.status > 1 {
-        return Err(ReceiptRlpError::InvalidStatus);
-    }
-    if r.tx_type > 4 {
-        return Err(ReceiptRlpError::InvalidTxType);
-    }
-    if r.logs.len() > MAX_LOGS {
-        return Err(ReceiptRlpError::TooManyLogs);
-    }
-
-    let logs: Vec<Vec<u8>> = r.logs.iter().map(encode_log).collect();
-    let body = encode_list(&[
-        encode_uint(r.status),
-        encode_uint(r.cumulative_gas_used),
-        encode_bytes(&r.logs_bloom),
-        encode_list(&logs),
-    ]);
-
-    if r.tx_type == 0 {
-        Ok(body)
-    } else {
-        let mut out = Vec::with_capacity(1 + body.len());
-        out.push(r.tx_type);
-        out.extend_from_slice(&body);
-        Ok(out)
-    }
-}
-
-fn encode_log(log: &ConsensusLog) -> Vec<u8> {
-    let topics: Vec<Vec<u8>> = log.topics.iter().map(|t| encode_bytes(t)).collect();
-=======
     /// `0` = legacy (no prefix); `1..=4` = EIP-2718 type byte.
     pub tx_type: u8,
 }
@@ -144,7 +80,6 @@ fn encode_log(log: &ConsensusLog) -> Vec<u8> {
         .iter()
         .map(|t| encode_bytes(t.as_slice()))
         .collect();
->>>>>>> 37a7cbc (feat: receiptsRoot-bound receipts and single-block eth_getLogs)
     encode_list(&[
         encode_bytes(&log.address),
         encode_list(&topics),
@@ -158,21 +93,15 @@ mod tests {
     use crate::mpt::EMPTY_TRIE_ROOT;
     use crate::ordered_trie::ordered_trie_root;
     use crate::receipt_list::verify_receipt_list;
-<<<<<<< HEAD
     use crate::rlp::{decode, Rlp};
 
-    fn sample(status: u64, gas: u64, tx_type: u8) -> ConsensusReceipt {
-=======
-
     fn empty_typed(ty: u8, status: u64, gas: u64) -> ConsensusReceipt {
->>>>>>> 37a7cbc (feat: receiptsRoot-bound receipts and single-block eth_getLogs)
         ConsensusReceipt {
             status,
             cumulative_gas_used: gas,
             logs_bloom: [0u8; 256],
-<<<<<<< HEAD
-            logs: vec![],
-            tx_type,
+            logs: Vec::new(),
+            tx_type: ty,
         }
     }
 
@@ -181,23 +110,18 @@ mod tests {
             encoded
         } else {
             &encoded[1..]
-=======
-            logs: Vec::new(),
-            tx_type: ty,
->>>>>>> 37a7cbc (feat: receiptsRoot-bound receipts and single-block eth_getLogs)
         }
     }
 
     #[test]
-<<<<<<< HEAD
     fn empty_encoded_list_roots_empty_trie() {
         assert_eq!(verify_receipt_list(&[], &EMPTY_TRIE_ROOT), Ok(()));
     }
 
     #[test]
     fn two_receipts_differ() {
-        let a = encode_consensus_receipt(&sample(1, 21_000, 0)).unwrap();
-        let b = encode_consensus_receipt(&sample(0, 21_000, 2)).unwrap();
+        let a = encode_consensus_receipt(&empty_typed(0, 1, 21_000)).unwrap();
+        let b = encode_consensus_receipt(&empty_typed(2, 0, 21_000)).unwrap();
         assert_ne!(a, b);
         let list_a = [a];
         let list_b = [b];
@@ -217,7 +141,7 @@ mod tests {
 
     #[test]
     fn legacy_is_rlp_list_of_four() {
-        let enc = encode_consensus_receipt(&sample(1, 21_000, 0)).unwrap();
+        let enc = encode_consensus_receipt(&empty_typed(0, 1, 21_000)).unwrap();
         let Rlp::List(items) = decode(&enc).unwrap() else {
             panic!("legacy receipt must be an RLP list");
         };
@@ -231,14 +155,17 @@ mod tests {
     #[test]
     fn typed_prefixes_type_byte() {
         for ty in 1u8..=4 {
-            let enc = encode_consensus_receipt(&sample(1, 42, ty)).unwrap();
+            let enc = encode_consensus_receipt(&empty_typed(ty, 1, 42)).unwrap();
             assert_eq!(enc[0], ty);
             let Rlp::List(items) = decode(body(&enc, ty)).unwrap() else {
                 panic!("typed body must be an RLP list");
             };
             assert_eq!(items.len(), 4);
             assert_eq!(items[0].as_bytes().unwrap(), &[1]);
-=======
+        }
+    }
+
+    #[test]
     fn typed_prefix_is_raw_type_byte() {
         let enc = encode_consensus_receipt(&empty_typed(2, 1, 21_000)).unwrap();
         assert_eq!(enc[0], 0x02);
@@ -252,18 +179,8 @@ mod tests {
     }
 
     #[test]
-    fn types_1_through_4_prefix() {
-        for ty in 1u8..=4 {
-            let enc = encode_consensus_receipt(&empty_typed(ty, 0, 1)).unwrap();
-            assert_eq!(enc[0], ty);
->>>>>>> 37a7cbc (feat: receiptsRoot-bound receipts and single-block eth_getLogs)
-        }
-    }
-
-    #[test]
-<<<<<<< HEAD
     fn failed_status_is_empty_rlp_uint() {
-        let enc = encode_consensus_receipt(&sample(0, 0, 0)).unwrap();
+        let enc = encode_consensus_receipt(&empty_typed(0, 0, 0)).unwrap();
         let Rlp::List(items) = decode(&enc).unwrap() else {
             panic!("expected list");
         };
@@ -302,27 +219,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_status_type_and_log_cap() {
-        let mut r = sample(2, 1, 0);
-        assert_eq!(
-            encode_consensus_receipt(&r).unwrap_err(),
-            ReceiptRlpError::InvalidStatus
-        );
-        r.status = 1;
-        r.tx_type = 5;
-        assert_eq!(
-            encode_consensus_receipt(&r).unwrap_err(),
-            ReceiptRlpError::InvalidTxType
-        );
-        r.tx_type = 0;
-        r.logs = vec![
-            ConsensusLog {
-                address: [0; 20],
-                topics: vec![],
-                data: vec![],
-            };
-            MAX_LOGS + 1
-=======
     fn unknown_type_rejected() {
         assert_eq!(
             encode_consensus_receipt(&empty_typed(5, 1, 0)).unwrap_err(),
@@ -348,15 +244,26 @@ mod tests {
                 data: Vec::new(),
             };
             MAX_RECEIPT_LOGS + 1
->>>>>>> 37a7cbc (feat: receiptsRoot-bound receipts and single-block eth_getLogs)
         ];
         assert_eq!(
             encode_consensus_receipt(&r).unwrap_err(),
             ReceiptRlpError::TooManyLogs
         );
     }
-<<<<<<< HEAD
-=======
+
+    #[test]
+    fn too_many_topics_rejected() {
+        let mut r = empty_typed(0, 1, 0);
+        r.logs = vec![ConsensusLog {
+            address: [0u8; 20],
+            topics: vec![[0u8; 32]; MAX_LOG_TOPICS + 1],
+            data: Vec::new(),
+        }];
+        assert_eq!(
+            encode_consensus_receipt(&r).unwrap_err(),
+            ReceiptRlpError::TooManyTopics
+        );
+    }
 
     #[test]
     fn encoded_list_matches_receipts_root() {
@@ -389,5 +296,4 @@ mod tests {
         };
         assert_eq!(enc[skip], 0x80);
     }
->>>>>>> 37a7cbc (feat: receiptsRoot-bound receipts and single-block eth_getLogs)
 }
