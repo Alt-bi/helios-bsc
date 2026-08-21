@@ -1,5 +1,6 @@
 //! Verified execution-layer reads (`eth_getProof` vs consensus `stateRoot`).
 
+mod call;
 mod mpt;
 mod proof;
 mod raw_tx;
@@ -8,6 +9,11 @@ mod rlp;
 use helios_bsc_types::{HexAddress, HexHash, TrustClass};
 use thiserror::Error;
 
+pub use call::{
+    eth_call_verified, eth_call_with_db, load_proven_account, CallBlock, CallError, CallTx, Miss,
+    ProofDb, ProveAtSafe, CALL_GAS_CAP, MAX_CALL_ACCOUNTS, MAX_CALL_DATA, MAX_PROOF_ROUNDS,
+    MAX_PROOF_STORAGE_KEYS,
+};
 pub use mpt::{EMPTY_CODE_HASH, EMPTY_TRIE_ROOT};
 pub use proof::{
     encode_data32, encode_qty, pad32, qty_equal, retain_requested_storage, verify_account_code,

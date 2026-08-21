@@ -13,3 +13,4 @@ tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
+revm = { version = "19.7", default-features = false, features = ["std", "optional_block_gas_limit", "optional_eip3607", "optional_no_base_fee"] }

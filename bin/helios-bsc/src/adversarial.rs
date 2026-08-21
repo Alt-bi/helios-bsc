@@ -7,7 +7,7 @@ use crate::sync::{
 use crate::{Node, RpcUpstream};
 use anyhow::{anyhow, Result};
 use helios_bsc_consensus::{header_hash, newest_safe, Snapshot, VerifiedBlock};
-use helios_bsc_execution::{encode_qty, MAX_RAW_TX};
+use helios_bsc_execution::{encode_data32, encode_qty, MAX_RAW_TX};
 use helios_bsc_mock::{
     cycling_sealer_chain, distinct_sealer_chain, headers_from_chain, relink_dummy_chain, MockRpc,
     Scenario, WBNB_ADDRESS, WRONG_STATE_ROOT,
@@ -186,6 +186,14 @@ fn load_wbnb_code() -> Vec<u8> {
     helios_bsc_types::decode_hex(s.trim()).unwrap()
 }
 
+/// MockUpstream serves one proof; set Safe miner = WBNB so revm coinbase is already proven.
+fn node_wbnb_eth_call(mut chain: Vec<VerifiedBlock>, proof: Value) -> Node {
+    chain[0].miner = decode_hex_fixed::<20>(WBNB_ADDRESS).unwrap();
+    let mut up = MockUpstream::for_chain(&chain, proof);
+    up.code = load_wbnb_code();
+    Node::from_parts(Box::new(up), 130, chain)
+}
+
 #[test]
 fn bootstrap_mutated_seal_err() {
     let err = bootstrap_err(Scenario::MutatedSeal);
@@ -292,7 +300,7 @@ fn jsonrpc_invalid_and_batch() {
     let arr = batch.as_array().expect("batch array");
     assert_eq!(arr.len(), 3);
     assert_eq!(arr[0]["result"], json!("0x38"));
-    assert_eq!(arr[1]["error"]["code"], json!(ERR_METHOD));
+    assert_eq!(arr[1]["error"]["code"], json!(ERR_PARAMS));
     assert_eq!(arr[2]["error"]["code"], json!(ERR_INVALID));
     let note = node.dispatch(&json!({"jsonrpc":"2.0","method":"eth_chainId","params":[]}));
     assert!(note.is_null(), "{note}");
@@ -588,9 +596,70 @@ fn honest_mock_eth_block_number_equals_safe_not_tip() {
 #[test]
 fn eth_call_still_method_unsupported() {
     let (chain, rpc) = safe_chain_with_fixture_root();
-    let node = node_from_chain(chain, rpc.proof_json());
+    let mut up = MockUpstream::for_chain(&chain, rpc.proof_json());
+    up.unverified = json!("0xdeadbeef");
+    let mut node = Node::from_parts(Box::new(up), 130, chain);
+    node.set_allow_unverified_passthrough(true);
+    let est = node.handle(&req(
+        "eth_estimateGas",
+        json!([{"to": WBNB_ADDRESS}, "latest"]),
+    ));
+    assert_eq!(err_code(&est), ERR_METHOD, "{est}");
     let v = node.handle(&req("eth_call", json!([{"to": WBNB_ADDRESS}, "latest"])));
-    assert_eq!(err_code(&v), ERR_METHOD);
+    assert_ne!(v.get("result"), Some(&json!("0xdeadbeef")), "{v}");
+    assert_eq!(err_code(&v), ERR_PROOF_FAILED, "{v}");
+}
+
+#[test]
+fn eth_call_wbnb_totalsupply_ok() {
+    let (chain, rpc) = safe_chain_with_fixture_root();
+    let proof = rpc.proof_json();
+    let want = encode_data32(&{
+        let bal = proof["balance"].as_str().unwrap();
+        let raw = bal.trim_start_matches("0x").trim_start_matches("0X");
+        let even = if raw.len() % 2 == 1 {
+            format!("0{raw}")
+        } else {
+            raw.to_string()
+        };
+        hex::decode(even).unwrap()
+    });
+    let node = node_wbnb_eth_call(chain, proof);
+    let v = node.handle(&req(
+        "eth_call",
+        json!([
+            {"to": WBNB_ADDRESS, "from": WBNB_ADDRESS, "data": "0x18160ddd"},
+            "latest"
+        ]),
+    ));
+    let got = v["result"].as_str().map(|s| s.to_ascii_lowercase());
+    assert_eq!(got.as_deref(), Some(want.as_str()), "{v}");
+}
+
+#[test]
+fn eth_call_unproven_sload_fail_closed() {
+    let (chain, rpc) = safe_chain_with_fixture_root();
+    let node = node_wbnb_eth_call(chain, rpc.proof_json());
+    let v = node.handle(&req(
+        "eth_call",
+        json!([
+            {"to": WBNB_ADDRESS, "from": WBNB_ADDRESS, "data": "0x06fdde03"},
+            "latest"
+        ]),
+    ));
+    assert_eq!(err_code(&v), ERR_PROOF_FAILED, "{v}");
+}
+
+#[test]
+fn eth_call_pending_rejected() {
+    let (chain, rpc) = safe_chain_with_fixture_root();
+    let node = node_from_chain(chain, rpc.proof_json());
+    let pending = node.handle(&req("eth_call", json!([{"to": WBNB_ADDRESS}, "pending"])));
+    assert_eq!(err_code(&pending), ERR_NOT_SYNCED, "{pending}");
+    let earliest = node.handle(&req("eth_call", json!([{"to": WBNB_ADDRESS}, "earliest"])));
+    assert_eq!(err_code(&earliest), ERR_NOT_SYNCED, "{earliest}");
+    let missing_to = node.handle(&req("eth_call", json!([{}, "latest"])));
+    assert_eq!(err_code(&missing_to), ERR_PARAMS, "{missing_to}");
 }
 
 #[test]
@@ -1182,7 +1251,7 @@ fn receipt_header_bound_with_flag() {
     let bad = node_bad.handle(&req("eth_getTransactionReceipt", json!([txh])));
     assert_eq!(err_code(&bad), ERR_NOT_SYNCED);
     let call = node.handle(&req("eth_call", json!([{}, "latest"])));
-    assert_eq!(err_code(&call), ERR_METHOD);
+    assert_eq!(err_code(&call), ERR_PARAMS);
 }
 
 #[test]

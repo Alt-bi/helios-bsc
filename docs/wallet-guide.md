@@ -21,13 +21,13 @@ Safe lag on mainnet is ~106–112 blocks (~50s), not “the last mined block”.
 
 ## Methods
 
-**Verified** (MPT vs Safe `stateRoot`, or local header): `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt`, `eth_getProof` (Safe only; ≤64 storage keys; 20-byte address), `eth_chainId`, `eth_blockNumber`, `eth_getBlockByNumber` / `ByHash` (header only; `fullTx=true` → `-32601`; hash is geth `Header.Hash()`). Uncle RPCs are `0x0` / `null` (Parlia). Local (no upstream): `web3_sha3`, `eth_mining`=`false`, `eth_hashrate`=`0x0`, `eth_coinbase`=`0x000…0`. JSON-RPC over HTTP is POST-only (1 MiB body cap). Loopback binds also require a loopback `Host` header (no CORS `*`).
+**Verified** (MPT vs Safe `stateRoot`, or local header): `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt`, `eth_getProof` (Safe only; ≤64 storage keys; 20-byte address), constrained `eth_call` (Safe only; `to` + optional `data`; revm + iterative `eth_getProof` at Safe hash/number; unproven SLOAD/account → `-32001`; gas cap 50_000_000; max 8 proof rounds; no state overrides; no create), `eth_chainId`, `eth_blockNumber`, `eth_getBlockByNumber` / `ByHash` (header only; `fullTx=true` → `-32601`; hash is geth `Header.Hash()`). Uncle RPCs are `0x0` / `null` (Parlia). Local (no upstream): `web3_sha3`, `eth_mining`=`false`, `eth_hashrate`=`0x0`, `eth_coinbase`=`0x000…0`. JSON-RPC over HTTP is POST-only (1 MiB body cap). Loopback binds also require a loopback `Host` header (no CORS `*`).
 
 **Unverified broadcast (always on):** `eth_sendRawTransaction`. Local checks: hex, empty/512 KiB cap, **chainId 56** (typed 0x01–0x04 or EIP-155; no unprotected txs). The returned hash is local `keccak256(raw)`, not the upstream’s word.
 
 **Unverified opt-in** (`run --allow-unverified-passthrough`): receipts / tx-by-hash **header-bound to Safe** and to the requested 32-byte hash; `eth_gasPrice` / `eth_maxPriorityFeePerGas` / `eth_blobBaseFee` hex quantities; `eth_feeHistory` object. Default is `-32601`.
 
-**Unsupported (MVP-2 / no index / no keys):** `eth_call`, `eth_estimateGas`, `eth_getLogs`, filters, `eth_subscribe`, `eth_sendTransaction`, `eth_sign*`, `personal_*`, `debug_*`, `txpool_*`.
+**Unsupported (no index / no keys / later):** `eth_estimateGas` (still `-32601`; not this slice), `eth_getLogs`, filters, `eth_subscribe`, `eth_sendTransaction`, `eth_sign*`, `personal_*`, `debug_*`, `txpool_*`. Fast Finality is **not** implemented.
 
 There is **no silent passthrough**. Unsupported or unverified-without-flag methods hard-error.
 

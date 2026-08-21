@@ -21,6 +21,7 @@ Default bind: `127.0.0.1:8545` (`--allow-non-loopback` required for LAN; no RPC 
 | `eth_getCode` | Verified | Bytecode keccak vs proof `codeHash`; ≤24576 bytes (`MaxCodeSize`) |
 | `eth_getStorageAt` | Verified | Storage trie vs account `storageHash` |
 | `eth_getProof` | Verified | EIP-1186 at Safe only; MPT vs `stateRoot` (account + requested slots). At most **64** storage keys, **32** nodes per account/storage proof, **16 KiB** per node. Keys are hex quantities ≤32 bytes, validated **before** the upstream fetch (junk / non-string / oversize → `-32602`). Response `storageProof` is clipped to the requested keys (empty request → empty array). |
+| `eth_call` | Verified (constrained) | Safe only (`latest`→Safe). Requires `to` + optional `data`; **no create**, **no state overrides**. Proofs via `eth_getProof` at Safe **hash/number**; execute in **revm**. Unproven SLOAD/account → `-32001` (fail-closed, not zero). Gas cap **50_000_000**; max **8** proof rounds. Never proxied to upstream `eth_call`. |
 | `eth_getBlockByNumber` | Header-verified | At or below Safe; `fullTx=true` → `-32601`; txs always `[]`. Served from the locally stored sealed header when present (no re-fetch); otherwise re-fetch must `Header.Hash()` to the local verified hash |
 | `eth_getBlockByHash` | Header-verified | Hash in local chain and `number ≤ Safe`. Same stored-header / Hash() bind |
 | `eth_getUncleCountByBlockNumber` / `ByHash` | Verified | `0x0` at or below Safe (Parlia forbids uncles; checked on every header) |
@@ -36,7 +37,7 @@ Default bind: `127.0.0.1:8545` (`--allow-non-loopback` required for LAN; no RPC 
 | `eth_blobBaseFee` | Unverified opt-in | Same flag. Hex quantity. |
 | `helios_bsc_syncStatus` | Verified | tip, safe, `lag` / `safeLagBlocks` / `safeLagSeconds`, `safeLagWithinBound`, `unverifiedPassthrough`, `backupTransport`, sealers, proof window, `finality=confirmation-depth`, `sealingSetEnforced`, `proofOk` / `proofFail` / `headersVerified` |
 | `helios_bsc_getVerificationStatus` | Verified | same status body (`trustClass`, `finality`, lag fields) |
-| `eth_call` / `eth_estimateGas` | Unsupported | MVP-2 (`-32601`) |
+| `eth_estimateGas` | Unsupported | `-32601` (best-effort later; not this slice) |
 | `eth_getLogs` / filters / `eth_subscribe` | Unsupported | `-32601` (no log index, no pub/sub) |
 | `eth_getBlockTransactionCount*` / `eth_getTransactionByBlock*AndIndex` | Unsupported | `-32601` (no tx index; `fullTx` already refused) |
 

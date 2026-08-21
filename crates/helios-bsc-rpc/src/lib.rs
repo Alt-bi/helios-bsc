@@ -65,7 +65,8 @@ pub fn method_policy(method: &str) -> MethodPolicy {
         | "eth_getTransactionCount"
         | "eth_getCode"
         | "eth_getStorageAt"
-        | "eth_getProof" => MethodPolicy::Verified,
+        | "eth_getProof"
+        | "eth_call" => MethodPolicy::Verified,
         "eth_getBlockByNumber" | "eth_getBlockByHash" => MethodPolicy::Verified,
         "eth_getUncleCountByBlockNumber"
         | "eth_getUncleCountByBlockHash"
@@ -80,7 +81,7 @@ pub fn method_policy(method: &str) -> MethodPolicy {
         | "eth_feeHistory"
         | "eth_blobBaseFee" => MethodPolicy::Unverified,
         "helios_bsc_syncStatus" | "helios_bsc_getVerificationStatus" => MethodPolicy::Verified,
-        "eth_call" | "eth_estimateGas" => MethodPolicy::Unsupported, // MVP-2
+        "eth_estimateGas" => MethodPolicy::Unsupported,
         "eth_getLogs"
         | "eth_newFilter"
         | "eth_newBlockFilter"
@@ -138,7 +139,8 @@ mod tests {
 
     #[test]
     fn call_unsupported_in_mvp1() {
-        assert_eq!(method_policy("eth_call"), MethodPolicy::Unsupported);
+        assert_eq!(method_policy("eth_call"), MethodPolicy::Verified);
+        assert_eq!(method_policy("eth_estimateGas"), MethodPolicy::Unsupported);
     }
 
     #[test]
@@ -186,7 +188,8 @@ mod tests {
     #[test]
     fn get_logs_still_unsupported() {
         assert_eq!(method_policy("eth_getLogs"), MethodPolicy::Unsupported);
-        assert_eq!(method_policy("eth_call"), MethodPolicy::Unsupported);
+        assert_eq!(method_policy("eth_call"), MethodPolicy::Verified);
+        assert_eq!(method_policy("eth_estimateGas"), MethodPolicy::Unsupported);
         assert_eq!(method_policy("eth_newFilter"), MethodPolicy::Unsupported);
         assert_eq!(method_policy("eth_subscribe"), MethodPolicy::Unsupported);
         assert_eq!(

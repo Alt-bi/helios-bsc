@@ -21,6 +21,6 @@ CI runs the same (`cargo fmt --all -- --check`). Toolchain is stable (`rust-tool
 
 - No silent RPC passthrough. Unsupported methods stay `-32601`.
 - Do not weaken Safe = **15** distinct subsequent sealers (`floor(2N/3)+1`). A shallow `eth_getProof` window is a provider issue — swap the RPC, do not change consensus.
-- `eth_call` is **MVP-2**. Do not add it in drive-by PRs.
+- `eth_call` must stay **proof-backed revm** (Safe-only iterative `eth_getProof`; unproven SLOAD/account → `-32001`). Never proxy upstream `eth_call`. `eth_estimateGas` stays unsupported (`-32601`) unless labeled best-effort.
 
 See [`docs/design.md`](docs/design.md), [`docs/rpc-matrix.md`](docs/rpc-matrix.md), [`docs/threat-model.md`](docs/threat-model.md).
