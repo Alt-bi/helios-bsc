@@ -1,8 +1,10 @@
 //! Constrained verified `eth_call` / best-effort `eth_estimateGas`.
 //!
 //! Unproven accounts/slots are `CallError::Missing`, never a fake empty account
-//! or zero slot. Does not proxy upstream `eth_call` or `eth_estimateGas`.
-//! Estimate is a geth/reth-style binary search (not a single `gas_used`).
+//! or zero slot. `BLOCKHASH` uses locally verified headers only: in-window
+//! unknown is `Missing`, never a fake zero. Does not proxy upstream `eth_call`
+//! or `eth_estimateGas`. Estimate is a geth/reth-style binary search (not a
+//! single `gas_used`).
 
 use crate::mpt::EMPTY_CODE_HASH;
 use crate::proof::{
@@ -33,6 +35,8 @@ pub const MAX_PROOF_STORAGE_KEYS: usize = 64;
 pub const TX_GAS: u64 = 21_000;
 /// Binary-search iteration cap for [`eth_estimate_gas_verified`].
 pub const MAX_ESTIMATE_ITERS: u32 = 64;
+/// Yellow-paper / geth `BLOCKHASH` lookback.
+const BLOCKHASH_WINDOW: u64 = 256;
 
 #[derive(Debug, Clone)]
 pub struct CallTx {
@@ -54,6 +58,8 @@ pub struct CallBlock {
     pub difficulty: [u8; 32],
     pub prevrandao: [u8; 32],
     pub basefee: u64,
+    /// Locally verified header hashes at `number` (cap 256). Never invent zeros.
+    pub historical_hashes: Vec<(u64, [u8; 32])>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,11 +114,26 @@ struct ProvenAccount {
 pub struct ProofDb {
     accounts: HashMap<Address, ProvenAccount>,
     codes: HashMap<B256, Bytecode>,
+    block_hashes: HashMap<u64, B256>,
+    /// Executing block number (`BLOCKHASH` protocol window).
+    block_number: u64,
 }
 
 impl ProofDb {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn seed_block_hashes(&mut self, block: &CallBlock) {
+        self.block_number = block.number;
+        self.block_hashes.clear();
+        for (n, hash) in block
+            .historical_hashes
+            .iter()
+            .take(BLOCKHASH_WINDOW as usize)
+        {
+            self.block_hashes.insert(*n, B256::from(*hash));
+        }
     }
 
     /// Insert a fully known account (tests / already-verified state). Does not MPT-check.
@@ -259,7 +280,16 @@ impl Database for ProofDb {
     }
 
     fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
-        Err(CallError::Missing(Miss::BlockHash(number)))
+        // Yellow-paper / geth: current and older-than-256 are protocol zeros.
+        if number >= self.block_number
+            || number.saturating_add(BLOCKHASH_WINDOW) < self.block_number
+        {
+            return Ok(B256::ZERO);
+        }
+        match self.block_hashes.get(&number) {
+            Some(h) => Ok(*h),
+            None => Err(CallError::Missing(Miss::BlockHash(number))),
+        }
     }
 }
 
@@ -355,6 +385,7 @@ fn transact_call(
     tx: &CallTx,
     gas: u64,
 ) -> Result<ExecutionResult, CallError> {
+    db.seed_block_hashes(block);
     let mut evm = Evm::builder()
         .with_db(&mut *db)
         .with_spec_id(SpecId::CANCUN)
@@ -483,6 +514,7 @@ pub fn eth_call_with_db(
     if tx.data.len() > MAX_CALL_DATA {
         return Err(CallError::Invalid("calldata too large"));
     }
+    db.seed_block_hashes(block);
     execution_output(transact_call(db, block, tx, call_gas(tx, block))?)
 }
 
@@ -497,6 +529,7 @@ pub fn eth_call_verified<P: ProveAtSafe>(
     }
 
     let mut db = ProofDb::new();
+    db.seed_block_hashes(block);
     let mut rounds = 0u32;
     seed_call_accounts(prover, &mut db, block, tx, &mut rounds)?;
     execution_output(transact_call_proven(
@@ -569,6 +602,7 @@ pub fn eth_estimate_gas_verified<P: ProveAtSafe>(
     }
 
     let mut db = ProofDb::new();
+    db.seed_block_hashes(block);
     let mut rounds = 0u32;
     seed_call_accounts(prover, &mut db, block, tx, &mut rounds)?;
     estimate_gas_search(prover, &mut db, block, tx, &mut rounds)
@@ -632,7 +666,24 @@ mod tests {
             difficulty: [0u8; 32],
             prevrandao: [0u8; 32],
             basefee: 0,
+            historical_hashes: Vec::new(),
         }
+    }
+
+    // PUSH1 n; BLOCKHASH; PUSH1 0; MSTORE; PUSH1 32; PUSH1 0; RETURN
+    fn blockhash_return(n: u8) -> [u8; 11] {
+        [
+            0x60, n, 0x40, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+        ]
+    }
+
+    fn call_blockhash(db: &mut ProofDb, block: &CallBlock, n: u8) -> Result<Vec<u8>, CallError> {
+        let from = [0x11u8; 20];
+        let to = [0x22u8; 20];
+        insert_eoa(db, from);
+        insert_eoa(db, [0u8; 20]);
+        db.insert_account(to, 1, [0u8; 32], EMPTY_TRIE_ROOT, &blockhash_return(n));
+        eth_call_with_db(db, block, &call_tx(from, to, vec![]))
     }
 
     fn call_tx(from: [u8; 20], to: [u8; 20], data: Vec<u8>) -> CallTx {
@@ -726,6 +777,15 @@ mod tests {
         let mut funded = tx.clone();
         funded.gas = Some(gas);
         eth_call_with_db(&mut db, &block, &funded).expect("call at estimate");
+        if gas > TX_GAS {
+            let mut under = tx.clone();
+            under.gas = Some(gas - 1);
+            let err = eth_call_with_db(&mut db, &block, &under).unwrap_err();
+            match err {
+                CallError::Halt(_) | CallError::Revert(_) | CallError::Invalid(_) => {}
+                other => panic!("expected Halt/Revert/Invalid at estimate-1, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -790,6 +850,52 @@ mod tests {
             CallError::Revert(_) => {}
             other => panic!("expected Revert, not a gas qty, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn blockhash_parent_with_inserted_hash() {
+        let parent = [0xabu8; 32];
+        let mut block = sample_block([0u8; 32]);
+        block.number = 10;
+        block.historical_hashes = vec![(9, parent)];
+        let mut db = ProofDb::new();
+        let out = call_blockhash(&mut db, &block, 9).expect("blockhash");
+        assert_eq!(out, parent);
+    }
+
+    #[test]
+    fn blockhash_in_window_absent_is_missing_not_zero() {
+        let mut block = sample_block([0u8; 32]);
+        block.number = 10;
+        let mut db = ProofDb::new();
+        let err = call_blockhash(&mut db, &block, 9).unwrap_err();
+        match err {
+            CallError::Missing(Miss::BlockHash(n)) => assert_eq!(n, 9),
+            other => panic!("expected Missing(BlockHash(9)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blockhash_current_or_future_is_protocol_zero() {
+        let mut block = sample_block([0u8; 32]);
+        block.number = 10;
+        block.historical_hashes = vec![(10, [0xffu8; 32])];
+        let mut db = ProofDb::new();
+        let out = call_blockhash(&mut db, &block, 10).expect("current");
+        assert_eq!(out, vec![0u8; 32]);
+        let mut db = ProofDb::new();
+        let out = call_blockhash(&mut db, &block, 11).expect("future");
+        assert_eq!(out, vec![0u8; 32]);
+    }
+
+    #[test]
+    fn blockhash_older_than_256_is_protocol_zero() {
+        let mut block = sample_block([0u8; 32]);
+        block.number = 300;
+        block.historical_hashes = vec![(0, [0xcd; 32])];
+        let mut db = ProofDb::new();
+        let out = call_blockhash(&mut db, &block, 0).expect("old");
+        assert_eq!(out, vec![0u8; 32]);
     }
 
     #[derive(Deserialize)]

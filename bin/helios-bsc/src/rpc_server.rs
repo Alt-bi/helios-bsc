@@ -684,18 +684,21 @@ impl Node {
                 &format!("proof window exceeded: lag {lag} > {PROVIDER_PROOF_LOOKBACK}"),
             ));
         }
-        let local = {
+        let block = {
             let chain = self.chain.lock().expect("chain lock");
-            chain.iter().find(|b| b.number == safe.number).cloned()
+            chain
+                .iter()
+                .find(|b| b.number == safe.number)
+                .map(|local| call_block_from_verified(local, &chain))
         };
-        let Some(local) = local else {
+        let Some(block) = block else {
             return Err(rpc_err(
                 id,
                 ERR_NOT_SYNCED,
                 "wallet mode only serves the local Safe head (latest→Safe)",
             ));
         };
-        Ok((tx, call_block_from_verified(&local)))
+        Ok((tx, block))
     }
 
     fn eth_call(&self, id: Value, req: &Value) -> Value {
@@ -1225,7 +1228,25 @@ impl ProveAtSafe for UpstreamProve<'_> {
     }
 }
 
-fn call_block_from_verified(local: &VerifiedBlock) -> CallBlock {
+/// Verified header hashes for BLOCKHASH: `n <= Safe` in the 256-window, cap 256.
+fn historical_hashes_at_safe(chain: &[VerifiedBlock], safe_number: u64) -> Vec<(u64, [u8; 32])> {
+    let mut out: Vec<(u64, [u8; 32])> = Vec::new();
+    for b in chain {
+        if b.number > safe_number {
+            continue;
+        }
+        if b.number.saturating_add(256) < safe_number {
+            continue;
+        }
+        out.push((b.number, b.hash));
+        if out.len() >= 256 {
+            break;
+        }
+    }
+    out
+}
+
+fn call_block_from_verified(local: &VerifiedBlock, chain: &[VerifiedBlock]) -> CallBlock {
     let mut block = CallBlock {
         number: local.number,
         hash: local.hash,
@@ -1236,6 +1257,7 @@ fn call_block_from_verified(local: &VerifiedBlock) -> CallBlock {
         difficulty: [0u8; 32],
         prevrandao: [0u8; 32],
         basefee: 0,
+        historical_hashes: historical_hashes_at_safe(chain, local.number),
     };
     if let Some(h) = &local.header {
         if let Ok(ts) = decode_u64(&h.timestamp) {

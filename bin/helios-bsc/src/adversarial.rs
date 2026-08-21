@@ -7,7 +7,7 @@ use crate::sync::{
 use crate::{Node, RpcUpstream};
 use anyhow::{anyhow, Result};
 use helios_bsc_consensus::{header_hash, newest_safe, Snapshot, VerifiedBlock};
-use helios_bsc_execution::{encode_data32, encode_qty, MAX_RAW_TX, TX_GAS};
+use helios_bsc_execution::{encode_data32, encode_qty, EMPTY_TRIE_ROOT, MAX_RAW_TX, TX_GAS};
 use helios_bsc_mock::{
     cycling_sealer_chain, distinct_sealer_chain, headers_from_chain, relink_dummy_chain, MockRpc,
     Scenario, WBNB_ADDRESS, WRONG_STATE_ROOT,
@@ -1532,4 +1532,143 @@ fn eth_call_object_block_id_rejected() {
         json!([{"to": WBNB_ADDRESS}, {"blockHash": "0x00"}]),
     ));
     assert_eq!(err_code(&est), ERR_PARAMS, "{est}");
+}
+
+fn rlp_len_be(len: usize) -> Vec<u8> {
+    let be = (len as u64).to_be_bytes();
+    let start = be.iter().position(|&b| b != 0).unwrap_or(be.len() - 1);
+    be[start..].to_vec()
+}
+
+fn rlp_bytes(data: &[u8]) -> Vec<u8> {
+    if data.len() == 1 && data[0] < 0x80 {
+        return data.to_vec();
+    }
+    if data.len() <= 55 {
+        let mut o = Vec::with_capacity(1 + data.len());
+        o.push(0x80 + data.len() as u8);
+        o.extend_from_slice(data);
+        o
+    } else {
+        let lenb = rlp_len_be(data.len());
+        let mut o = Vec::with_capacity(1 + lenb.len() + data.len());
+        o.push(0xb7 + lenb.len() as u8);
+        o.extend_from_slice(&lenb);
+        o.extend_from_slice(data);
+        o
+    }
+}
+
+fn rlp_list(items: &[Vec<u8>]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    for i in items {
+        payload.extend_from_slice(i);
+    }
+    if payload.len() <= 55 {
+        let mut o = vec![0xc0 + payload.len() as u8];
+        o.extend_from_slice(&payload);
+        o
+    } else {
+        let lenb = rlp_len_be(payload.len());
+        let mut o = Vec::with_capacity(1 + lenb.len() + payload.len());
+        o.push(0xf7 + lenb.len() as u8);
+        o.extend_from_slice(&lenb);
+        o.extend_from_slice(&payload);
+        o
+    }
+}
+
+/// Single-leaf account trie so `eth_call` can run custom bytecode at Safe.
+fn single_leaf_account_proof(address: [u8; 20], code: &[u8]) -> ([u8; 32], Value) {
+    let code_hash = keccak256(code);
+    let account = rlp_list(&[
+        rlp_bytes(&[1]),
+        rlp_bytes(&[]),
+        rlp_bytes(&EMPTY_TRIE_ROOT),
+        rlp_bytes(&code_hash),
+    ]);
+    let mut hp = vec![0x20];
+    hp.extend_from_slice(&keccak256(&address));
+    let leaf = rlp_list(&[rlp_bytes(&hp), rlp_bytes(&account)]);
+    let state_root = keccak256(&leaf);
+    let addr_hex = format!("0x{}", hex::encode(address));
+    let proof = json!({
+        "address": addr_hex,
+        "accountProof": [format!("0x{}", hex::encode(leaf))],
+        "balance": "0x0",
+        "codeHash": format!("0x{}", hex::encode(code_hash)),
+        "nonce": "0x1",
+        "storageHash": format!("0x{}", hex::encode(EMPTY_TRIE_ROOT)),
+        "storageProof": []
+    });
+    (state_root, proof)
+}
+
+#[test]
+fn eth_call_blockhash_of_safe_parent() {
+    // Safe = chain[2] (number 2); parent number 1 is in-chain (15 subsequent sealers).
+    let mut chain = distinct_sealer_chain(17);
+    let safe = newest_safe(&chain, 21).expect("safe");
+    let safe_n = safe.number;
+    assert!(
+        safe_n >= 1,
+        "need Safe number N with parent N-1 in the dummy chain"
+    );
+    let parent_n = safe_n - 1;
+    assert!(parent_n <= u64::from(u8::MAX), "PUSH1 BLOCKHASH argument");
+    assert!(
+        chain.iter().any(|b| b.number == parent_n),
+        "parent of Safe must be in the dummy chain (too short otherwise)"
+    );
+
+    let addr = [0x22u8; 20];
+    // PUSH1 parent_n; BLOCKHASH; PUSH1 0; MSTORE; PUSH1 32; PUSH1 0; RETURN
+    let code = vec![
+        0x60,
+        parent_n as u8,
+        0x40,
+        0x60,
+        0x00,
+        0x52,
+        0x60,
+        0x20,
+        0x60,
+        0x00,
+        0xf3,
+    ];
+    let (root, proof) = single_leaf_account_proof(addr, &code);
+    for b in &mut chain {
+        if b.number == safe_n {
+            b.state_root = root;
+            b.miner = addr;
+        }
+    }
+    relink_dummy_chain(&mut chain);
+    let parent_hash = chain
+        .iter()
+        .find(|b| b.number == parent_n)
+        .expect("parent")
+        .hash;
+    let mut up = MockUpstream::for_chain(&chain, proof);
+    up.code = code;
+    let node = Node::from_parts(Box::new(up), 130, chain);
+    let addr_hex = format!("0x{}", hex::encode(addr));
+    let v = node.handle(&req(
+        "eth_call",
+        json!([{"to": addr_hex, "from": addr_hex, "data": "0x"}, "latest"]),
+    ));
+    let got = v["result"].as_str().unwrap_or("");
+    let zeros = format!("0x{}", hex::encode([0u8; 32]));
+    assert_ne!(
+        got.to_ascii_lowercase(),
+        zeros,
+        "in-window BLOCKHASH must not be Missing-as-zero: {v}"
+    );
+    let want = format!("0x{}", hex::encode(parent_hash));
+    assert_eq!(
+        got.to_ascii_lowercase(),
+        want.to_ascii_lowercase(),
+        "BLOCKHASH(Safe-1) must match the locally verified parent hash: {v}"
+    );
+    assert_eq!(got.len(), 2 + 64, "{v}");
 }
