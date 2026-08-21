@@ -163,6 +163,7 @@ impl MockRpc {
             timestamp: decode_u64(&h.timestamp)?,
             fork_id: "fermi".into(),
             sealing_set: sealing_set_for(&self.headers),
+            vote_keys: None,
             attestation: Some("mock".into()),
         })
     }

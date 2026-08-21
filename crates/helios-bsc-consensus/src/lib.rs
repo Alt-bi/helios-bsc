@@ -4,6 +4,7 @@ pub mod finality;
 mod rlp_util;
 pub mod seal;
 pub mod snapshot;
+pub mod vote;
 
 use helios_bsc_config::{
     expected_safe_lag_blocks, mainnet_min_distinct_sealers, miner_history_check_len, params_at,
@@ -22,6 +23,11 @@ pub use seal::{
     verify_unsealed_fields, SealError, MAX_FUTURE_SKEW_SECS,
 };
 pub use snapshot::{Snapshot, SnapshotError};
+pub use vote::{
+    decode_vote_attestation, min_votes_for_finality, verify_attestation_signature,
+    voted_validators, VoteAttestation, VoteData, VoteError, BLS_PUBLIC_KEY_LEN, BLS_SIGNATURE_LEN,
+    MAX_ATTESTATION_EXTRA_LEN,
+};
 
 pub const CHECKPOINT_WARN_AGE_SECS: u64 = 6 * 3600;
 pub const DEFAULT_MAX_CHECKPOINT_AGE_SECS: u64 = 24 * 3600;
@@ -108,6 +114,35 @@ pub fn sealing_set_from_activated_epoch(
     epoch_header: &RpcBlockHeader,
     checkpoint_number: u64,
 ) -> Result<Vec<String>, ConsensusError> {
+    Ok(
+        validators_from_activated_epoch(epoch_header, checkpoint_number)?
+            .iter()
+            .map(|v| format_address(&v.address))
+            .collect(),
+    )
+}
+
+/// BLS vote keys from the same activated epoch, in the **same order** as
+/// [`sealing_set_from_activated_epoch`].
+///
+/// Both read one `extraData`, so the two lists stay positionally aligned; deriving them
+/// from separate parses would risk pairing an address with another validator's key.
+pub fn vote_keys_from_activated_epoch(
+    epoch_header: &RpcBlockHeader,
+    checkpoint_number: u64,
+) -> Result<Vec<String>, ConsensusError> {
+    Ok(
+        validators_from_activated_epoch(epoch_header, checkpoint_number)?
+            .iter()
+            .map(|v| format!("0x{}", hex::encode(v.vote_key)))
+            .collect(),
+    )
+}
+
+fn validators_from_activated_epoch(
+    epoch_header: &RpcBlockHeader,
+    checkpoint_number: u64,
+) -> Result<Vec<helios_bsc_config::SealingValidator>, ConsensusError> {
     let number = decode_u64(&epoch_header.number)?;
     let timestamp = decode_u64(&epoch_header.timestamp)?;
     let fork = params_at(number, timestamp);
@@ -135,11 +170,7 @@ pub fn sealing_set_from_activated_epoch(
             checkpoint: checkpoint_number,
         });
     }
-    Ok(parsed
-        .validators
-        .iter()
-        .map(|v| format_address(&v.address))
-        .collect())
+    Ok(parsed.validators)
 }
 
 /// Build a checkpoint from the header that matches `snapshot` tip + current sealing set.
@@ -159,12 +190,14 @@ pub fn checkpoint_at_snapshot(
     }
     let mut header = header.clone();
     header.hash = format!("0x{}", hex::encode(got));
-    Ok(Checkpoint::from_rpc_header(
-        &header,
-        snapshot.sealing_set_hex(),
-        fork_id,
-        attestation,
-    )?)
+    let cp =
+        Checkpoint::from_rpc_header(&header, snapshot.sealing_set_hex(), fork_id, attestation)?;
+    // Carry the BLS keys across a restart when the snapshot has them: without this a
+    // restart would silently drop to confirmation-depth until the next epoch activates.
+    Ok(match snapshot.vote_keys_hex() {
+        Some(keys) => cp.with_vote_keys(keys),
+        None => cp,
+    })
 }
 
 fn hex_eq(a: &str, b: &str) -> bool {
@@ -384,6 +417,7 @@ mod tests {
             timestamp: 1_768_357_801,
             fork_id: "fermi".into(),
             sealing_set: (0..21).map(|i| format!("0x{:040x}", i + 1)).collect(),
+            vote_keys: None,
             attestation: Some("test-only".into()),
         }
     }
@@ -573,6 +607,121 @@ mod tests {
         eng.apply_headers(&headers[1..]).unwrap();
         assert_eq!(eng.tip_number(), 116_664_002);
         assert_eq!(eng.n_seal(), 21);
+
+        // No vote keys in this checkpoint, so fast finality must stay unavailable
+        // rather than fall back to something weaker.
+        assert!(!eng.snapshot.fast_finality_available());
+        assert_eq!(eng.snapshot.finalized(), None);
+    }
+
+    /// Vote keys turn the same walk into real BLS finality: every fixture header's
+    /// attestation is checked against the live 21-key set, and the finalized head ends
+    /// up 2 blocks behind the tip — the lag `scripts/verify_attestations.py` measures
+    /// on mainnet, against 106–112 for confirmation depth.
+    #[test]
+    fn live_epoch_vote_keys_produce_bls_finality() {
+        let epoch = load_header("header_116663000.json");
+        let headers = fixture_headers();
+        let first = decode_u64(&headers[0].number).unwrap();
+
+        let set = sealing_set_from_activated_epoch(&epoch, first).unwrap();
+        let keys = vote_keys_from_activated_epoch(&epoch, first).unwrap();
+        assert_eq!(keys.len(), set.len(), "one BLS key per validator");
+
+        let cp = Checkpoint::from_rpc_header(&headers[0], set, "fermi", Some("live epoch".into()))
+            .unwrap()
+            .with_vote_keys(keys);
+        cp.validate_basic().expect("21 unique 48-byte vote keys");
+
+        let mut eng = LightEngine::from_checkpoint_and_header(cp, &headers[0]).unwrap();
+        assert!(eng.snapshot.fast_finality_available());
+
+        eng.apply_headers(&headers[1..]).unwrap();
+        assert_eq!(eng.tip_number(), 116_664_002);
+
+        let (justified, justified_hash) = eng.snapshot.justified().expect("justified block");
+        let (finalized, finalized_hash) = eng.snapshot.finalized().expect("finalized block");
+        assert_eq!(justified, 116_664_001, "target is the direct parent");
+        assert_eq!(finalized, 116_664_000, "source trails the target by one");
+
+        // Both must name blocks this client verified itself, not just hashes an
+        // upstream asserted.
+        let in_chain = |n: u64, h: [u8; 32]| eng.chain.iter().any(|b| b.number == n && b.hash == h);
+        assert!(
+            in_chain(justified, justified_hash),
+            "justified block is local"
+        );
+        assert!(
+            in_chain(finalized, finalized_hash),
+            "finalized block is local"
+        );
+
+        assert_eq!(
+            eng.tip_number() - finalized,
+            2,
+            "BLS finality lag on live mainnet data"
+        );
+
+        // A restart must not silently drop to confirmation depth: the checkpoint written
+        // back at the current tip has to carry the keys, still paired with the right
+        // addresses. Re-derive the pairing from the epoch header to check the alignment
+        // rather than trusting the order the snapshot happened to emit.
+        let restart = eng.last_verified_checkpoint(&headers[4]).unwrap();
+        restart.validate_basic().unwrap();
+        let carried = restart
+            .vote_keys
+            .as_ref()
+            .expect("vote keys survive restart");
+        assert_eq!(carried.len(), 21);
+
+        let epoch_addrs = sealing_set_from_activated_epoch(&epoch, first).unwrap();
+        let epoch_keys = vote_keys_from_activated_epoch(&epoch, first).unwrap();
+        for (addr, key) in restart.sealing_set.iter().zip(carried) {
+            let i = epoch_addrs
+                .iter()
+                .position(|a| a.eq_ignore_ascii_case(addr))
+                .expect("checkpoint address is one of the epoch validators");
+            assert!(
+                epoch_keys[i].eq_ignore_ascii_case(key),
+                "restart checkpoint paired {addr} with the wrong BLS key"
+            );
+        }
+
+        // And the restarted client really does start in fast-finality mode.
+        let resumed = Snapshot::from_checkpoint(&restart).unwrap();
+        assert!(resumed.fast_finality_available());
+    }
+
+    /// A forged attestation must reject the header rather than quietly downgrade the
+    /// client to confirmation depth — otherwise an upstream could feed fake finality.
+    #[test]
+    fn tampered_attestation_rejects_the_header() {
+        let epoch = load_header("header_116663000.json");
+        let headers = fixture_headers();
+        let first = decode_u64(&headers[0].number).unwrap();
+        let set = sealing_set_from_activated_epoch(&epoch, first).unwrap();
+        let keys = vote_keys_from_activated_epoch(&epoch, first).unwrap();
+
+        let cp = Checkpoint::from_rpc_header(&headers[0], set, "fermi", None)
+            .unwrap()
+            .with_vote_keys(keys);
+        let mut eng = LightEngine::from_checkpoint_and_header(cp, &headers[0]).unwrap();
+
+        // Flip one bit inside the attestation region of the next header's extraData —
+        // far enough from the 32-byte vanity and the trailing 65-byte seal that only the
+        // BLS check can catch it.
+        let mut forged = headers[1].clone();
+        let mut extra = decode_hex(&forged.extra_data).unwrap();
+        let flip = extra.len() - 65 - 40;
+        extra[flip] ^= 0x01;
+        forged.extra_data = format!("0x{}", hex::encode(&extra));
+
+        let err = eng.apply_header(&forged).unwrap_err();
+        assert!(
+            matches!(err, ConsensusError::Snapshot(_)),
+            "forged attestation must be fatal, got {err}"
+        );
+        assert_eq!(eng.snapshot.finalized(), None, "no finality was adopted");
     }
 
     /// `difficulty` is inside the sealed header, so an upstream cannot restate it: the

@@ -1,9 +1,10 @@
 //! Sealing-set snapshot + epoch activation (`minerHistoryCheckLen`).
 
 use crate::seal::{verify_seal_coinbase, SealError};
+use crate::vote::{decode_vote_attestation, verify_attestation_signature, VoteData, VoteError};
 use helios_bsc_config::{
-    miner_history_check_len, params_at, parse_extra, ExtraDataVersion, ExtraError, DIFF_IN_TURN,
-    DIFF_NO_TURN, MAXWELL_EPOCH_LENGTH,
+    miner_history_check_len, params_at, parse_extra, ExtraDataVersion, ExtraError,
+    SealingValidator, DIFF_IN_TURN, DIFF_NO_TURN, MAXWELL_EPOCH_LENGTH,
 };
 use helios_bsc_types::{
     decode_hex, decode_hex_fixed, decode_u64, format_address, Checkpoint, RpcBlockHeader,
@@ -37,6 +38,16 @@ pub enum SnapshotError {
     DifficultyMismatch { got: u64, want: u64 },
     #[error("signer {0} signed too recently (seenTimes >= turnLength)")]
     RecentlySigned(String),
+    #[error(transparent)]
+    Vote(#[from] VoteError),
+    #[error("attestation targets block {got} but the parent is {want}")]
+    AttestationTarget { want: u64, got: u64 },
+    #[error("attestation target hash does not match the parent hash")]
+    AttestationTargetHash,
+    #[error("attestation source {got} is not the justified block {want}")]
+    AttestationSource { want: u64, got: u64 },
+    #[error("attestation source hash does not match the justified block")]
+    AttestationSourceHash,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +55,9 @@ pub struct PendingEpoch {
     pub epoch_block: u64,
     pub activate_at: u64,
     pub validators: Vec<[u8; 20]>,
+    /// BLS vote keys, positionally aligned with `validators`. Empty when the epoch
+    /// layout carries none (pre-Luban), which leaves fast finality unavailable.
+    pub vote_keys: Vec<[u8; 48]>,
     pub turn_length: u64,
 }
 
@@ -59,6 +73,23 @@ pub struct Snapshot {
     pub enforce_inturn: bool,
     /// Block number → sealer. Bohr `SignRecently`: count in `minerHistoryCheckLen` window.
     pub recents: HashMap<u64, [u8; 20]>,
+    /// Address + BLS vote key for the active set, in the same sorted order as
+    /// `validators`. Empty means the vote keys are simply not known yet — fast finality
+    /// is then unavailable, but nothing else changes.
+    vote_set: Vec<SealingValidator>,
+    /// The set as it stood before the most recent epoch activation.
+    ///
+    /// geth checks an attestation's bitset against the snapshot at `TargetNumber - 1`,
+    /// two blocks below the header being applied. That differs from the current set in
+    /// exactly one block per epoch — the activation block — so keeping one generation of
+    /// history is enough, and getting it wrong would fail a signature once every 1000
+    /// blocks: rare enough to pass a short test run and break in production.
+    prev_vote_set: Vec<SealingValidator>,
+    /// Block at which `vote_set` last replaced `prev_vote_set`.
+    set_changed_at: u64,
+    /// Newest attestation accepted so far: its target is the justified block and its
+    /// source is the finalized one (`GetJustifiedNumberAndHash` / `GetFinalizedHeader`).
+    pub attestation: Option<VoteData>,
 }
 
 impl Snapshot {
@@ -67,7 +98,27 @@ impl Snapshot {
         for a in &cp.sealing_set {
             validators.push(decode_hex_fixed::<20>(a)?);
         }
+
+        // The checkpoint lists addresses and keys in operator order; sorting the two
+        // independently would pair each address with the wrong key. Sort the pairs.
+        let vote_set = match &cp.vote_keys {
+            Some(keys) if keys.len() == validators.len() => {
+                let mut pairs = Vec::with_capacity(keys.len());
+                for (addr, key) in validators.iter().zip(keys) {
+                    pairs.push(SealingValidator {
+                        address: *addr,
+                        vote_key: decode_hex_fixed::<48>(key)?,
+                    });
+                }
+                pairs.sort_by_key(|v| v.address);
+                pairs
+            }
+            // A mismatched length is rejected by `Checkpoint::validate_basic`; treating
+            // it as "no keys" here keeps this constructor total for callers that skip it.
+            _ => Vec::new(),
+        };
         validators.sort();
+
         let fork = params_at(cp.number, cp.timestamp);
         Ok(Self {
             number: cp.number,
@@ -78,7 +129,104 @@ impl Snapshot {
             pending: None,
             enforce_inturn: true,
             recents: HashMap::new(),
+            vote_set,
+            prev_vote_set: Vec::new(),
+            // The checkpoint set is the set at the checkpoint, so nothing is "recent".
+            set_changed_at: 0,
+            attestation: None,
         })
+    }
+
+    /// Vote keys in `validators` order, hex-encoded — `None` when they are not known.
+    pub fn vote_keys_hex(&self) -> Option<Vec<String>> {
+        if self.vote_set.is_empty() {
+            return None;
+        }
+        Some(
+            self.vote_set
+                .iter()
+                .map(|v| format!("0x{}", hex::encode(v.vote_key)))
+                .collect(),
+        )
+    }
+
+    /// True once the snapshot can actually check a BLS attestation.
+    pub fn fast_finality_available(&self) -> bool {
+        !self.vote_set.is_empty()
+    }
+
+    /// Justified block (`GetJustifiedNumberAndHash`): the newest attestation's target.
+    pub fn justified(&self) -> Option<(u64, [u8; 32])> {
+        self.attestation.map(|a| (a.target_number, a.target_hash))
+    }
+
+    /// Finalized block (`GetFinalizedHeader`): the newest attestation's **source**.
+    /// Finality therefore trails justification by one justified block.
+    pub fn finalized(&self) -> Option<(u64, [u8; 32])> {
+        self.attestation.map(|a| (a.source_number, a.source_hash))
+    }
+
+    /// Validator set an attestation in header `number` must be checked against.
+    ///
+    /// geth uses the snapshot at `TargetNumber - 1` = `number - 2`, so the previous
+    /// generation applies while an activation is still that recent.
+    fn attestation_set(&self, number: u64) -> &[SealingValidator] {
+        if self.set_changed_at > number.saturating_sub(2) {
+            &self.prev_vote_set
+        } else {
+            &self.vote_set
+        }
+    }
+
+    /// Chain-state half of `verifyVoteAttestation`, then the signature half.
+    ///
+    /// `Ok(None)` means "nothing to adopt": either the header carries no attestation —
+    /// normal, and never a reason to reject a header — or the vote keys are not known
+    /// yet. `Err` means the header carries an attestation that is actually wrong, which
+    /// is fatal: accepting it would let an upstream feed a forged finality signal.
+    fn check_attestation(
+        &self,
+        raw: &[u8],
+        number: u64,
+        parent_hash: [u8; 32],
+    ) -> Result<Option<VoteData>, SnapshotError> {
+        let Some(att) = decode_vote_attestation(raw)? else {
+            return Ok(None);
+        };
+        let set = self.attestation_set(number);
+        if set.is_empty() {
+            return Ok(None);
+        }
+
+        // The target must be the direct parent.
+        let want_target = number.saturating_sub(1);
+        if att.data.target_number != want_target {
+            return Err(SnapshotError::AttestationTarget {
+                want: want_target,
+                got: att.data.target_number,
+            });
+        }
+        if att.data.target_hash != parent_hash {
+            return Err(SnapshotError::AttestationTargetHash);
+        }
+
+        // The source must be the block this client already considers justified. On the
+        // first attestation after a bootstrap there is nothing to compare against — the
+        // signature itself is then the evidence, since ≥⅔ of the set signed that source.
+        if let Some(justified) = self.attestation {
+            if att.data.source_number != justified.target_number {
+                return Err(SnapshotError::AttestationSource {
+                    want: justified.target_number,
+                    got: att.data.source_number,
+                });
+            }
+            if att.data.source_hash != justified.target_hash {
+                return Err(SnapshotError::AttestationSourceHash);
+            }
+        }
+
+        verify_attestation_signature(&att, set)?;
+        Ok(Some(att.data))
     }
 
     pub fn n_seal(&self) -> u32 {
@@ -184,13 +332,20 @@ impl Snapshot {
 
         let extra = decode_hex(&header.extra_data)?;
         let is_epoch = number % self.epoch_length == 0;
+        let parsed = parse_extra(&extra, ExtraDataVersion::Bohr, is_epoch)?;
+
+        // Before any mutation: the attestation is checked against the set as it stands
+        // for this header, and a bad one rejects the header outright.
+        let adopted = self.check_attestation(&parsed.attestation, number, parent)?;
+
         if is_epoch {
-            let parsed = parse_extra(&extra, ExtraDataVersion::Bohr, true)?;
             if parsed.validators.is_empty() {
                 return Err(SnapshotError::MissingEpochExtra(number));
             }
-            let mut vals: Vec<[u8; 20]> = parsed.validators.iter().map(|v| v.address).collect();
-            vals.sort();
+            // Sort the (address, key) pairs together — sorting the two lists separately
+            // would pair each validator with someone else's BLS key.
+            let mut vals = parsed.validators.clone();
+            vals.sort_by_key(|v| v.address);
             let turn = parsed
                 .turn_length
                 .map(u64::from)
@@ -199,7 +354,8 @@ impl Snapshot {
             self.pending = Some(PendingEpoch {
                 epoch_block: number,
                 activate_at: number + delay,
-                validators: vals,
+                validators: vals.iter().map(|v| v.address).collect(),
+                vote_keys: vals.iter().map(|v| v.vote_key).collect(),
                 turn_length: turn,
             });
         }
@@ -208,6 +364,21 @@ impl Snapshot {
 
         if let Some(pending) = self.pending.clone() {
             if number == pending.activate_at {
+                self.prev_vote_set = std::mem::take(&mut self.vote_set);
+                self.vote_set = if pending.vote_keys.len() == pending.validators.len() {
+                    pending
+                        .validators
+                        .iter()
+                        .zip(&pending.vote_keys)
+                        .map(|(address, vote_key)| SealingValidator {
+                            address: *address,
+                            vote_key: *vote_key,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                self.set_changed_at = number;
                 self.validators = pending.validators;
                 self.turn_length = pending.turn_length;
                 self.pending = None;
@@ -218,6 +389,10 @@ impl Snapshot {
                     self.recents.insert(epoch_key, RECENT_EPOCH_SENTINEL);
                 }
             }
+        }
+
+        if let Some(data) = adopted {
+            self.attestation = Some(data);
         }
 
         self.number = number;
@@ -294,6 +469,7 @@ mod tests {
             sealing_set: (1..=21)
                 .map(|i| format!("0x{}", hex::encode(addr(i))))
                 .collect(),
+            vote_keys: None,
             attestation: None,
         }
     }
@@ -310,6 +486,8 @@ mod tests {
             epoch_block: 1000,
             activate_at: 1000 + 87,
             validators: (30..=50).map(addr).collect(),
+            // Synthetic set: no BLS keys, so fast finality stays off for this walk.
+            vote_keys: Vec::new(),
             turn_length: 8,
         });
 

@@ -702,6 +702,7 @@ mod tests {
             timestamp: 1_000,
             fork_id: "fermi".into(),
             sealing_set: vec![secret_addr.into()],
+            vote_keys: None,
             attestation: Some("do-not-print".into()),
         };
         std::fs::write(&path, serde_json::to_string(&cp).unwrap()).unwrap();
@@ -737,6 +738,7 @@ mod tests {
             timestamp: 1,
             fork_id: "fermi".into(),
             sealing_set: vec![format!("0x{}", "11".repeat(20))],
+            vote_keys: None,
             attestation: None,
         };
         write_checkpoint_file(&path, &cp).unwrap();

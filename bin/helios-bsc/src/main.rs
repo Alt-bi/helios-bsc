@@ -22,7 +22,7 @@ use helios_bsc_config::{
 };
 use helios_bsc_consensus::{
     assert_checkpoint_age, checkpoint_at_snapshot, proof_lag, sealing_set_from_activated_epoch,
-    within_proof_window, CHECKPOINT_WARN_AGE_SECS,
+    vote_keys_from_activated_epoch, within_proof_window, CHECKPOINT_WARN_AGE_SECS,
 };
 use helios_bsc_execution::{verify_eth_get_proof, EthAccountProof};
 use helios_bsc_types::{decode_hex_fixed, decode_u64, Checkpoint, RpcBlockHeader};
@@ -600,10 +600,15 @@ fn write_checkpoint(
     let header = fetch_header(&up, block)?;
     let number = decode_u64(&header.number)?;
     let timestamp = decode_u64(&header.timestamp)?;
+    // Vote keys only ever come from an activated epoch's extraData, never from an
+    // operator-supplied address list — so `--sealing-set` yields a checkpoint that runs
+    // confirmation-depth until the client sees an epoch header for itself.
+    let mut vote_keys: Option<Vec<String>> = None;
     let set = match (sealing_set, sealing_set_from_epoch) {
         (Some(s), None) => parse_sealing_set(s)?,
         (None, Some(epoch_id)) => {
             let epoch_header = fetch_header(&up, epoch_id)?;
+            vote_keys = Some(vote_keys_from_activated_epoch(&epoch_header, number)?);
             sealing_set_from_activated_epoch(&epoch_header, number)?
         }
         (Some(_), Some(_)) => {
@@ -620,14 +625,19 @@ fn write_checkpoint(
         Some("helios-bsc write-checkpoint".into())
     };
     let cp = Checkpoint::from_rpc_header(&header, set, fork.name, attestation)?;
+    let cp = match vote_keys {
+        Some(keys) => cp.with_vote_keys(keys),
+        None => cp,
+    };
     cp.validate_basic()?;
     write_checkpoint_file(out, &cp)?;
     println!(
-        "wrote checkpoint {} hash={} n_seal={} fork={}",
+        "wrote checkpoint {} hash={} n_seal={} fork={} fastFinality={}",
         cp.number,
         cp.hash,
         cp.sealing_set.len(),
-        cp.fork_id
+        cp.fork_id,
+        if cp.vote_keys.is_some() { "yes" } else { "no" }
     );
     Ok(())
 }
@@ -1135,6 +1145,13 @@ fn verify_checkpoint(
     println!("hash:         {}", cp.hash);
     println!("stateRoot:    {}", cp.state_root);
     println!("n_seal:       {}", cp.sealing_set.len());
+    println!(
+        "fastFinality: {}",
+        match &cp.vote_keys {
+            Some(k) => format!("yes ({} BLS vote keys)", k.len()),
+            None => "no (confirmation-depth until an epoch activates)".into(),
+        }
+    );
     println!("age_s:        {age}");
     println!("upstream:     {}", rpc_host(upstream));
     if let Some(url) = oracle_url.filter(|u| !u.trim().is_empty()) {

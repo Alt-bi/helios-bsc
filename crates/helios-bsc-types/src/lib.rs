@@ -28,6 +28,9 @@ pub type HexHash = String;
 /// Hex-encoded 20-byte address.
 pub type HexAddress = String;
 
+/// Hex-encoded 48-byte BLS12-381 vote key (Parlia Fast Finality).
+pub type HexBlsKey = String;
+
 /// Weak-subjectivity style checkpoint — root of trust for light sync.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,6 +46,15 @@ pub struct Checkpoint {
     pub fork_id: String,
     /// Sealing validator set active at this checkpoint (N_seal addresses).
     pub sealing_set: Vec<HexAddress>,
+    /// BLS vote keys for `sealing_set`, **positionally aligned** with it.
+    ///
+    /// Optional on purpose: a checkpoint written from `--sealing-set` (operator
+    /// addresses) carries none, and neither does any checkpoint written before Fast
+    /// Finality existed. Without them the client runs confirmation-depth only until it
+    /// ingests and activates an epoch header that carries the keys — it never guesses a
+    /// key, and never infers one from an attestation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vote_keys: Option<Vec<HexBlsKey>>,
     /// Optional human / multi-source attestation notes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attestation: Option<String>,
@@ -75,7 +87,35 @@ impl Checkpoint {
         ] {
             decode_hex_fixed::<32>(v).map_err(|_| TypesError::BadCheckpointHash { field })?;
         }
+        if let Some(keys) = &self.vote_keys {
+            // Positional alignment is the whole contract: a short, long, or reordered
+            // list silently pairs an address with someone else's BLS key, and the only
+            // symptom is an aggregate signature that fails for the wrong reason.
+            if keys.len() != self.sealing_set.len() {
+                return Err(TypesError::VoteKeyCountMismatch {
+                    keys: keys.len(),
+                    validators: self.sealing_set.len(),
+                });
+            }
+            let mut seen_keys = std::collections::HashSet::with_capacity(keys.len());
+            for k in keys {
+                let key = decode_hex_fixed::<48>(k).map_err(|_| TypesError::BadVoteKey)?;
+                if !seen_keys.insert(key) {
+                    return Err(TypesError::DuplicateVoteKey);
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Attach BLS vote keys, positionally aligned with `sealing_set`.
+    ///
+    /// Separate from [`Self::from_rpc_header`] because the two inputs have different
+    /// provenance: the addresses may be operator-supplied, while the keys only ever come
+    /// from an **activated** epoch header's `extraData`.
+    pub fn with_vote_keys(mut self, vote_keys: Vec<HexBlsKey>) -> Self {
+        self.vote_keys = Some(vote_keys);
+        self
     }
 
     /// Build a checkpoint from a trusted header + operator-supplied sealing set.
@@ -95,6 +135,7 @@ impl Checkpoint {
             timestamp: decode_u64(&header.timestamp)?,
             fork_id: fork_id.into(),
             sealing_set,
+            vote_keys: None,
             attestation,
         })
     }
@@ -161,6 +202,7 @@ mod tests {
             timestamp: 0,
             fork_id: "test".into(),
             sealing_set: vec!["0xabc".into()],
+            vote_keys: None,
             attestation: None,
         };
         assert!(matches!(
@@ -184,6 +226,7 @@ mod tests {
             timestamp: 0,
             fork_id: "fermi".into(),
             sealing_set: vec!["0xabc".into()],
+            vote_keys: None,
             attestation: None,
         };
         assert!(matches!(
@@ -219,6 +262,7 @@ mod tests {
             timestamp: 0,
             fork_id: "fermi".into(),
             sealing_set: sample_set(21),
+            vote_keys: None,
             attestation: None,
         };
         cp.sealing_set[0] = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
