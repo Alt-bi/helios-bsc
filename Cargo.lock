@@ -1261,6 +1261,7 @@ dependencies = [
 name = "helios-bsc-consensus"
 version = "0.1.0"
 dependencies = [
+ "blst",
  "helios-bsc-config",
  "helios-bsc-types",
  "hex",
