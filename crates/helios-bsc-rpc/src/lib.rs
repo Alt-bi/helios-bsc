@@ -1,7 +1,7 @@
 //! Local JSON-RPC policy surface (fail-closed).
 //!
-//! Full jsonrpsee server lands in a later PR. This module documents the MVP
-//! method matrix and wallet-mode tag mapping.
+//! This crate is the fail-closed method matrix + JSON-RPC 2.0 envelope helpers;
+//! the HTTP server is tiny_http in the `helios-bsc` binary.
 
 use helios_bsc_types::TrustClass;
 
@@ -116,15 +116,6 @@ pub fn unverified_passthrough_ok(method: &str) -> bool {
             | "eth_feeHistory"
             | "eth_blobBaseFee"
     )
-}
-
-/// Default wallet mode: proof-backed `latest` maps to Safe head.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlockTagMode {
-    /// `latest` and eth_blockNumber use Safe.
-    WalletSafe,
-    /// Allow tip reads (unsafe).
-    AllowUnsafeHead,
 }
 
 #[cfg(test)]
