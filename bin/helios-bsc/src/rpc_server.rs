@@ -22,10 +22,10 @@ use helios_bsc_execution::{
 };
 use helios_bsc_rpc::{
     jsonrpc_id_ok, jsonrpc_is_v2, jsonrpc_params_len, jsonrpc_params_ok, method_policy, rpc_err,
-    rpc_err_data, rpc_ok, unverified_passthrough_ok, wallet_block_number_allowed, BlockId,
-    MethodPolicy, ERR_EXECUTION, ERR_INVALID, ERR_METHOD, ERR_NOT_SYNCED, ERR_PARAMS, ERR_PARSE,
-    ERR_PROOF_FAILED, ERR_STATE_ROOT, MAX_PROOF_STORAGE_KEYS, MAX_RPC_BATCH, MAX_RPC_METHOD,
-    MAX_RPC_PARAMS,
+    rpc_err_data, rpc_ok, unverified_passthrough_ok, wallet_block_number_allowed,
+    wallet_block_tag_str, BlockId, MethodPolicy, ERR_EXECUTION, ERR_INVALID, ERR_METHOD,
+    ERR_NOT_SYNCED, ERR_PARAMS, ERR_PARSE, ERR_PROOF_FAILED, ERR_STATE_ROOT,
+    MAX_PROOF_STORAGE_KEYS, MAX_RPC_BATCH, MAX_RPC_METHOD, MAX_RPC_PARAMS,
 };
 use helios_bsc_types::{
     decode_hex, decode_hex_fixed, decode_u64, keccak256, Checkpoint, RpcBlockHeader, SafeHead,
@@ -1414,15 +1414,7 @@ fn decode_qty_pad32(s: &str) -> Result<[u8; 32], String> {
 
 /// EIP-1898 object (and any non-string) block id is invalid, not silent Safe.
 fn wallet_block_id_str(id: Value, raw: Option<&Value>) -> Result<Option<&str>, Value> {
-    match raw {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(s)) => Ok(Some(s.as_str())),
-        Some(_) => Err(rpc_err(
-            id,
-            ERR_PARAMS,
-            "block id must be a string tag or hex",
-        )),
-    }
+    wallet_block_tag_str(raw).map_err(|e| rpc_err(id, ERR_PARAMS, e))
 }
 
 /// Wallet-mode `eth_getBlockByNumber`: tag must resolve to a local verified block at or below Safe.

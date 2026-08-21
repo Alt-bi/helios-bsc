@@ -49,7 +49,7 @@
 3. Remaining header-verify items that still lack fixtures: **out-of-turn backoff**, **Maxwell FF recents prune**, **EIP-1559 parent `baseFee` formulas**. Not implemented — do not invent from prose.
 4. `eth_estimateGas` best-effort — **closed** (proof-backed binary search; MethodPolicy Verified; never proxied). Local `BLOCKHASH` — **closed**. Revert/Halt JSON-RPC **code 3** — **closed** (geth; not `-32001`).
 5. Fast Finality BLS — **not implemented**; later. Deeper RPC (≥128) still helps if proofs start failing.
-6. Optional remaining (later; **not done**): historical `n≤Safe` state reads; proof-round seed budget; `receiptsRoot`; `transactionsRoot` hashes.
+6. Optional remaining (later; **not done**): `receiptsRoot` proofs; `transactionsRoot` hashes in `eth_getBlock*`. Historical `n≤Safe` state reads — **closed**. Proof-round seed budget — **closed** (seed does not consume `MAX_PROOF_ROUNDS`). Keep `SpecId::CANCUN` on revm 19.7 (not Mendel).
 
 ## Live pins (do not assume design-doc 16)
 
