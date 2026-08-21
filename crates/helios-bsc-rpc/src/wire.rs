@@ -75,6 +75,19 @@ pub enum BlockId {
     Number(u64),
 }
 
+/// Extract a wallet-mode block tag from JSON-RPC params.
+///
+/// Omitted / JSON null → `Ok(None)` (callers map that to Safe). A string tag or
+/// hex is `Ok(Some(s))`. EIP-1898 objects, numbers, arrays, and bools are
+/// `Err("block id must be a string tag or hex")` — not silently treated as omitted.
+pub fn wallet_block_tag_str(v: Option<&Value>) -> Result<Option<&str>, &'static str> {
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.as_str())),
+        Some(_) => Err("block id must be a string tag or hex"),
+    }
+}
+
 /// Wallet mode: `latest` / `safe` / `finalized` / omitted → local Safe.
 /// Hex number or hash allowed only if it is exactly the local Safe head.
 /// `pending` / `earliest` are never Safe (error, not genesis).
@@ -223,6 +236,58 @@ mod tests {
         assert_eq!(MAX_RPC_PARAMS, 16);
         assert_eq!(MAX_RPC_ID, 128);
         assert!(MAX_RPC_METHOD >= "helios_bsc_getVerificationStatus".len());
+    }
+
+    #[test]
+    fn wallet_block_tag_str_omitted_or_null_is_none() {
+        assert_eq!(wallet_block_tag_str(None), Ok(None));
+        assert_eq!(wallet_block_tag_str(Some(&Value::Null)), Ok(None));
+    }
+
+    #[test]
+    fn wallet_block_tag_str_accepts_string_tags_and_hex() {
+        assert_eq!(
+            wallet_block_tag_str(Some(&json!("latest"))),
+            Ok(Some("latest"))
+        );
+        assert_eq!(wallet_block_tag_str(Some(&json!("safe"))), Ok(Some("safe")));
+        assert_eq!(
+            wallet_block_tag_str(Some(&json!("finalized"))),
+            Ok(Some("finalized"))
+        );
+        assert_eq!(
+            wallet_block_tag_str(Some(&json!("pending"))),
+            Ok(Some("pending"))
+        );
+        assert_eq!(wallet_block_tag_str(Some(&json!("0x1"))), Ok(Some("0x1")));
+        assert_eq!(wallet_block_tag_str(Some(&json!(""))), Ok(Some("")));
+    }
+
+    #[test]
+    fn wallet_block_tag_str_rejects_eip1898_objects_and_other_types() {
+        let err = "block id must be a string tag or hex";
+        assert_eq!(
+            wallet_block_tag_str(Some(&json!({"blockNumber": "latest"}))),
+            Err(err)
+        );
+        assert_eq!(
+            wallet_block_tag_str(Some(&json!({"blockHash": "0x00"}))),
+            Err(err)
+        );
+        assert_eq!(
+            wallet_block_tag_str(Some(
+                &json!({"blockHash": "0x00", "requireCanonical": true})
+            )),
+            Err(err)
+        );
+        assert_eq!(wallet_block_tag_str(Some(&json!(1))), Err(err));
+        assert_eq!(wallet_block_tag_str(Some(&json!(true))), Err(err));
+        assert_eq!(wallet_block_tag_str(Some(&json!([]))), Err(err));
+        // Unlike `.and_then(Value::as_str)`, objects must not remap to omitted/Safe.
+        assert_ne!(
+            wallet_block_tag_str(Some(&json!({"blockNumber": "latest"}))),
+            Ok(None)
+        );
     }
 
     #[test]
