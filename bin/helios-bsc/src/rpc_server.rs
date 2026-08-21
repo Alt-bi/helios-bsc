@@ -463,6 +463,7 @@ impl Node {
             "eth_getTransactionReceipt" | "eth_getTransactionByHash" => {
                 self.unverified_mined(id, req, method)
             }
+            "eth_getRawTransactionByHash" => self.get_raw_tx_by_hash(id, req),
             "eth_gasPrice" | "eth_maxPriorityFeePerGas" | "eth_feeHistory" | "eth_blobBaseFee" => {
                 self.unverified_qty(id, req, method)
             }
@@ -1053,6 +1054,47 @@ impl Node {
             },
             Err(e) => rpc_err(id, -32000, &format!("unverified_upstream: {e}")),
         }
+    }
+
+    fn get_raw_tx_by_hash(&self, id: Value, req: &Value) -> Value {
+        if !self.allow_unverified_passthrough {
+            return rpc_err(id, ERR_METHOD, "unverified_passthrough_disabled");
+        }
+        let want = match query_tx_hash(req) {
+            Ok(h) => h,
+            Err(e) => return rpc_err(id, ERR_PARAMS, &e),
+        };
+        let params = req.get("params").cloned().unwrap_or(json!([]));
+        let raw = match self
+            .up
+            .unverified_call("eth_getRawTransactionByHash", &params)
+        {
+            Ok(v) => v,
+            Err(e) => return rpc_err(id, -32000, &format!("unverified_upstream: {e}")),
+        };
+        if raw.is_null() {
+            return rpc_ok(id, Value::Null);
+        }
+        let Some(hex) = raw.as_str() else {
+            return rpc_err(id, ERR_PROOF_FAILED, "upstream raw tx is not hex");
+        };
+        let bytes = match decode_hex(hex) {
+            Ok(b) => b,
+            Err(e) => return rpc_err(id, ERR_PROOF_FAILED, &format!("upstream raw tx hex: {e}")),
+        };
+        if bytes.len() > MAX_RAW_TX {
+            return rpc_err(id, ERR_PROOF_FAILED, "upstream raw tx too large");
+        }
+        // Prefer validate_bsc_raw_tx (chainId 56). Some valid mainnet txs fail
+        // that check; still require keccak256(raw) == query hash and the size cap.
+        let got = match validate_bsc_raw_tx(&bytes) {
+            Ok(h) => h,
+            Err(_) => keccak256(&bytes),
+        };
+        if got != want {
+            return rpc_err(id, ERR_PROOF_FAILED, "upstream raw tx hash mismatch");
+        }
+        rpc_ok(id, json!(format!("0x{}", hex::encode(bytes))))
     }
 
     fn send_raw(&self, id: Value, req: &Value) -> Value {

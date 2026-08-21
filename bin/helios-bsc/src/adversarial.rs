@@ -1842,3 +1842,34 @@ fn eth_call_access_list_too_large_is_invalid_params() {
         );
     }
 }
+
+#[test]
+fn get_raw_tx_by_hash_disabled_without_flag() {
+    let chain = distinct_sealer_chain(15);
+    let node = node_from_chain(chain, json!({}));
+    let txh = format!("0x{}", "11".repeat(32));
+    let v = node.handle(&req("eth_getRawTransactionByHash", json!([txh])));
+    assert_eq!(err_code(&v), ERR_METHOD, "{v}");
+}
+
+#[test]
+fn get_raw_tx_by_hash_keccak_bind_with_flag() {
+    let chain = distinct_sealer_chain(15);
+    let raw = dummy_eip1559(56);
+    let hex_raw = format!("0x{}", hex::encode(&raw));
+    let txh = format!("0x{}", hex::encode(keccak256(&raw)));
+
+    let mut up = MockUpstream::for_chain(&chain, json!({}));
+    up.unverified = json!(hex_raw.clone());
+    let mut node = Node::from_parts(Box::new(up), 130, chain.clone());
+    node.set_allow_unverified_passthrough(true);
+    let v = node.handle(&req("eth_getRawTransactionByHash", json!([txh.clone()])));
+    assert_eq!(v["result"], json!(hex_raw), "{v}");
+
+    let mut lying = MockUpstream::for_chain(&chain, json!({}));
+    lying.unverified = json!(format!("0x{}", hex::encode(dummy_eip1559(1))));
+    let mut node_bad = Node::from_parts(Box::new(lying), 130, chain);
+    node_bad.set_allow_unverified_passthrough(true);
+    let bad = node_bad.handle(&req("eth_getRawTransactionByHash", json!([txh])));
+    assert_eq!(err_code(&bad), ERR_PROOF_FAILED, "{bad}");
+}

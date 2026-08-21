@@ -78,6 +78,7 @@ pub fn method_policy(method: &str) -> MethodPolicy {
         "eth_sendRawTransaction" => MethodPolicy::Unverified,
         "eth_getTransactionReceipt"
         | "eth_getTransactionByHash"
+        | "eth_getRawTransactionByHash"
         | "eth_gasPrice"
         | "eth_maxPriorityFeePerGas"
         | "eth_feeHistory"
@@ -107,11 +108,13 @@ pub fn method_policy(method: &str) -> MethodPolicy {
 
 /// Opt-in `--allow-unverified-passthrough` allow-list (not sendRaw: that is always on).
 /// Receipts/txs are still header-bound to the local Safe chain at serve time.
+/// `eth_getRawTransactionByHash` is keccak-bound to the 32-byte query hash.
 pub fn unverified_passthrough_ok(method: &str) -> bool {
     matches!(
         method,
         "eth_getTransactionReceipt"
             | "eth_getTransactionByHash"
+            | "eth_getRawTransactionByHash"
             | "eth_gasPrice"
             | "eth_maxPriorityFeePerGas"
             | "eth_feeHistory"
@@ -266,7 +269,13 @@ mod tests {
             method_policy("eth_getTransactionByHash"),
             MethodPolicy::Unverified
         );
+        assert_eq!(
+            method_policy("eth_getRawTransactionByHash"),
+            MethodPolicy::Unverified
+        );
         assert!(unverified_passthrough_ok("eth_getTransactionReceipt"));
+        assert!(unverified_passthrough_ok("eth_getTransactionByHash"));
+        assert!(unverified_passthrough_ok("eth_getRawTransactionByHash"));
         assert!(unverified_passthrough_ok("eth_gasPrice"));
         assert!(unverified_passthrough_ok("eth_feeHistory"));
         assert!(unverified_passthrough_ok("eth_maxPriorityFeePerGas"));
