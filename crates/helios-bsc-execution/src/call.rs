@@ -20,7 +20,7 @@ use thiserror::Error;
 
 /// geth RPC gas cap used for `eth_call`.
 pub const CALL_GAS_CAP: u64 = 50_000_000;
-/// Max prove-and-retry rounds (initial `to` plus misses).
+/// Max prove-and-retry rounds (initial `to`/`from`/coinbase plus misses).
 pub const MAX_PROOF_ROUNDS: u32 = 8;
 /// Max distinct accounts loaded into [`ProofDb`] for one call.
 pub const MAX_CALL_ACCOUNTS: usize = 32;
@@ -410,6 +410,17 @@ pub fn eth_call_verified<P: ProveAtSafe>(
         fetch_and_load(prover, &mut db, block, &tx.to, &[])?;
         rounds += 1;
     }
+    if tx.from != tx.to && !is_precompile(Address::from(tx.from)) {
+        fetch_and_load(prover, &mut db, block, &tx.from, &[])?;
+        rounds += 1;
+    }
+    if block.beneficiary != tx.to
+        && block.beneficiary != tx.from
+        && !is_precompile(Address::from(block.beneficiary))
+    {
+        fetch_and_load(prover, &mut db, block, &block.beneficiary, &[])?;
+        rounds += 1;
+    }
 
     loop {
         match eth_call_with_db(&mut db, block, tx) {
@@ -708,5 +719,50 @@ mod tests {
             "ABI name missing Wrapped BNB: 0x{}",
             hex::encode(&out)
         );
+    }
+
+    #[test]
+    fn missing_from_account_is_not_invented() {
+        let f = load_tip();
+        let root = decode_hex_fixed::<32>(&f.state_root).unwrap();
+        let addr = decode_hex_fixed::<20>(&f.address).unwrap();
+        let prover = StaticProver {
+            address: addr,
+            proof: f.proof,
+            code: load_wbnb_code(),
+            allow_slots: false,
+        };
+        let mut block = sample_block(root);
+        block.beneficiary = addr;
+        let from = [0x11u8; 20];
+        let data = decode_hex("0x18160ddd").unwrap();
+        let err = eth_call_verified(&prover, &block, &call_tx(from, addr, data)).unwrap_err();
+        match err {
+            CallError::Missing(Miss::Account(a)) => assert_eq!(a, from),
+            other => panic!("expected Missing from, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn precompile_to_ecrecover_is_not_missing_account() {
+        let mut ecrecover = [0u8; 20];
+        ecrecover[19] = 0x01;
+        let f = load_tip();
+        let prover = StaticProver {
+            address: decode_hex_fixed::<20>(&f.address).unwrap(),
+            proof: f.proof,
+            code: load_wbnb_code(),
+            allow_slots: false,
+        };
+        let mut block = sample_block(decode_hex_fixed::<32>(&f.state_root).unwrap());
+        block.beneficiary = ecrecover;
+        let res = eth_call_verified(&prover, &block, &call_tx(ecrecover, ecrecover, vec![]));
+        match res {
+            Ok(_) => {}
+            Err(CallError::Missing(Miss::Account(a))) => {
+                assert_ne!(a, ecrecover, "precompile 0x01 must not require a proof");
+            }
+            Err(_) => {}
+        }
     }
 }

@@ -1328,3 +1328,72 @@ fn blob_base_fee_passthrough_with_flag() {
     let bad = bad_node.handle(&req("eth_blobBaseFee", json!([])));
     assert_eq!(err_code(&bad), ERR_PARAMS, "{bad}");
 }
+
+#[test]
+fn eth_call_null_to_is_invalid_params() {
+    let (chain, rpc) = safe_chain_with_fixture_root();
+    let node = node_from_chain(chain, rpc.proof_json());
+    let v = node.handle(&req("eth_call", json!([{"to": Value::Null}, "latest"])));
+    assert_eq!(err_code(&v), ERR_PARAMS, "{v}");
+}
+
+#[test]
+fn eth_call_state_override_rejected() {
+    let (chain, rpc) = safe_chain_with_fixture_root();
+    let node = node_from_chain(chain, rpc.proof_json());
+    let v = node.handle(&req(
+        "eth_call",
+        json!([{"to": WBNB_ADDRESS, "stateOverride": {}}, "latest"]),
+    ));
+    assert_eq!(err_code(&v), ERR_PARAMS, "{v}");
+}
+
+#[test]
+fn eth_call_third_params_element_rejected() {
+    let (chain, rpc) = safe_chain_with_fixture_root();
+    let node = node_from_chain(chain, rpc.proof_json());
+    let v = node.handle(&req(
+        "eth_call",
+        json!([{"to": WBNB_ADDRESS}, "latest", {}]),
+    ));
+    assert_eq!(err_code(&v), ERR_PARAMS, "{v}");
+}
+
+#[test]
+fn eth_call_blob_and_auth_list_rejected() {
+    let (chain, rpc) = safe_chain_with_fixture_root();
+    let node = node_from_chain(chain, rpc.proof_json());
+    let blob = node.handle(&req(
+        "eth_call",
+        json!([
+            {"to": WBNB_ADDRESS, "blobVersionedHashes": []},
+            "latest"
+        ]),
+    ));
+    assert_eq!(err_code(&blob), ERR_PARAMS, "{blob}");
+    let auth = node.handle(&req(
+        "eth_call",
+        json!([
+            {"to": WBNB_ADDRESS, "authorizationList": []},
+            "latest"
+        ]),
+    ));
+    assert_eq!(err_code(&auth), ERR_PARAMS, "{auth}");
+}
+
+#[test]
+fn eth_call_lying_get_code_is_proof_failed() {
+    let (mut chain, rpc) = safe_chain_with_fixture_root();
+    chain[0].miner = decode_hex_fixed::<20>(WBNB_ADDRESS).unwrap();
+    let mut up = MockUpstream::for_chain(&chain, rpc.proof_json());
+    up.code = vec![0x00];
+    let node = Node::from_parts(Box::new(up), 130, chain);
+    let v = node.handle(&req(
+        "eth_call",
+        json!([
+            {"to": WBNB_ADDRESS, "from": WBNB_ADDRESS, "data": "0x18160ddd"},
+            "latest"
+        ]),
+    ));
+    assert_eq!(err_code(&v), ERR_PROOF_FAILED, "{v}");
+}
