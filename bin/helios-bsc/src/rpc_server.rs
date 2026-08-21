@@ -17,9 +17,9 @@ use helios_bsc_consensus::{
 use helios_bsc_execution::{
     encode_data32, encode_qty, eth_call_verified, eth_estimate_gas_verified, pad32,
     retain_requested_storage, validate_bsc_raw_tx, verify_account_code, verify_eth_get_proof,
-    verify_storage_slot, CallBlock, CallError, CallTx, EthAccountProof, ProofError, ProveAtSafe,
-    VerifiedAccount, CALL_GAS_CAP, EMPTY_CODE_HASH, MAX_CALL_ACCOUNTS, MAX_CALL_DATA,
-    MAX_CODE_SIZE, MAX_RAW_TX,
+    verify_storage_slot, verify_tx_list, CallBlock, CallError, CallTx, EthAccountProof, ProofError,
+    ProveAtSafe, VerifiedAccount, CALL_GAS_CAP, EMPTY_CODE_HASH, EMPTY_TRIE_ROOT,
+    MAX_CALL_ACCOUNTS, MAX_CALL_DATA, MAX_CODE_SIZE, MAX_RAW_TX,
 };
 use helios_bsc_rpc::{
     jsonrpc_id_ok, jsonrpc_is_v2, jsonrpc_params_len, jsonrpc_params_ok, method_policy, rpc_err,
@@ -454,6 +454,10 @@ impl Node {
             "eth_getProof" => self.get_eth_proof(id, req),
             "eth_getBlockByNumber" => self.get_block_by_number(id, req),
             "eth_getBlockByHash" => self.get_block_by_hash(id, req),
+            "eth_getBlockTransactionCountByNumber" => self.tx_count_by_number(id, req),
+            "eth_getBlockTransactionCountByHash" => self.tx_count_by_hash(id, req),
+            "eth_getTransactionByBlockNumberAndIndex" => self.tx_by_block_number_and_index(id, req),
+            "eth_getTransactionByBlockHashAndIndex" => self.tx_by_block_hash_and_index(id, req),
             "eth_getUncleCountByBlockNumber" => self.uncle_count_by_number(id, req),
             "eth_getUncleCountByBlockHash" => self.uncle_count_by_hash(id, req),
             "eth_getUncleByBlockNumberAndIndex" => self.uncle_by_number(id, req),
@@ -992,27 +996,117 @@ impl Node {
     }
 
     fn verified_header_json(&self, id: Value, local: &VerifiedBlock) -> Value {
+        match self.bound_block_txs(local) {
+            Ok(bound) => rpc_ok(id, rpc_block_json(&bound.header, &bound.hashes)),
+            Err((code, msg)) => rpc_err(id, code, &msg),
+        }
+    }
+
+    fn load_verified_header(&self, local: &VerifiedBlock) -> Result<RpcBlockHeader, (i64, String)> {
         let hdr = if let Some(h) = local.header.clone() {
             h
         } else {
             let hash = format!("0x{}", hex::encode(local.hash));
-            match self.up.header_by_hash(&hash) {
-                Ok(h) => h,
-                Err(e) => {
-                    return rpc_err(
-                        id,
-                        ERR_PROOF_FAILED,
-                        &format!("proof_verification_failed: {e}"),
-                    )
-                }
-            }
+            self.up
+                .header_by_hash(&hash)
+                .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))?
         };
-        if let Err((code, msg)) = header_matches_local(&hdr, local) {
-            return rpc_err(id, code, &msg);
-        }
+        header_matches_local(&hdr, local)?;
         let mut hdr = hdr;
         hdr.hash = format!("0x{}", hex::encode(local.hash));
-        rpc_ok(id, rpc_block_json(&hdr))
+        Ok(hdr)
+    }
+
+    /// Bind untrusted raw txs to the sealed `transactionsRoot`. Empty root → no fetch.
+    fn bind_tx_hashes(&self, hdr: &RpcBlockHeader) -> Result<Vec<[u8; 32]>, (i64, String)> {
+        let root = decode_hex_fixed::<32>(&hdr.transactions_root).map_err(|e| {
+            (
+                ERR_PROOF_FAILED,
+                format!("proof_verification_failed: transactionsRoot: {e}"),
+            )
+        })?;
+        if root == EMPTY_TRIE_ROOT {
+            return Ok(Vec::new());
+        }
+        let raws = self
+            .up
+            .block_raw_transactions(&hdr.hash)
+            .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))?;
+        verify_tx_list(&raws, &root)
+            .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))
+    }
+
+    fn bound_block_txs(&self, local: &VerifiedBlock) -> Result<BoundTxs, (i64, String)> {
+        let header = self.load_verified_header(local)?;
+        let hashes = self.bind_tx_hashes(&header)?;
+        Ok(BoundTxs { header, hashes })
+    }
+
+    fn tx_count_by_number(&self, id: Value, req: &Value) -> Value {
+        match self.local_block_by_number(req) {
+            Ok(local) => self.verified_tx_count(id, &local),
+            Err(e) => e,
+        }
+    }
+
+    fn tx_count_by_hash(&self, id: Value, req: &Value) -> Value {
+        match self.local_block_by_hash(req) {
+            Ok(local) => self.verified_tx_count(id, &local),
+            Err(e) => e,
+        }
+    }
+
+    fn verified_tx_count(&self, id: Value, local: &VerifiedBlock) -> Value {
+        match self.bound_block_txs(local) {
+            Ok(bound) => rpc_ok(id, json!(format!("0x{:x}", bound.hashes.len()))),
+            Err((code, msg)) => rpc_err(id, code, &msg),
+        }
+    }
+
+    fn tx_by_block_number_and_index(&self, id: Value, req: &Value) -> Value {
+        let local = match self.local_block_by_number(req) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        let index = match parse_tx_index(req) {
+            Ok(i) => i,
+            Err(e) => return rpc_err(id, ERR_PARAMS, &e),
+        };
+        self.tx_at_index(id, &local, index)
+    }
+
+    fn tx_by_block_hash_and_index(&self, id: Value, req: &Value) -> Value {
+        let local = match self.local_block_by_hash(req) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        let index = match parse_tx_index(req) {
+            Ok(i) => i,
+            Err(e) => return rpc_err(id, ERR_PARAMS, &e),
+        };
+        self.tx_at_index(id, &local, index)
+    }
+
+    fn tx_at_index(&self, id: Value, local: &VerifiedBlock, index: u64) -> Value {
+        let bound = match self.bound_block_txs(local) {
+            Ok(v) => v,
+            Err((code, msg)) => return rpc_err(id, code, &msg),
+        };
+        let Ok(i) = usize::try_from(index) else {
+            return rpc_ok(id, Value::Null);
+        };
+        let Some(hash) = bound.hashes.get(i) else {
+            return rpc_ok(id, Value::Null);
+        };
+        rpc_ok(
+            id,
+            json!({
+                "hash": format!("0x{}", hex::encode(hash)),
+                "blockHash": bound.header.hash,
+                "blockNumber": bound.header.number,
+                "transactionIndex": format!("0x{index:x}"),
+            }),
+        )
     }
 
     fn unverified_mined(&self, id: Value, req: &Value, method: &str) -> Value {
@@ -1948,14 +2042,33 @@ fn wants_full_txs(params: Option<&Vec<Value>>) -> bool {
     params.and_then(|p| p.get(1)).and_then(Value::as_bool) == Some(true)
 }
 
-fn rpc_block_json(hdr: &RpcBlockHeader) -> Value {
+struct BoundTxs {
+    header: RpcBlockHeader,
+    hashes: Vec<[u8; 32]>,
+}
+
+fn rpc_block_json(hdr: &RpcBlockHeader, tx_hashes: &[[u8; 32]]) -> Value {
     let mut v = serde_json::to_value(hdr).unwrap_or(Value::Null);
     if let Value::Object(map) = &mut v {
-        map.insert("transactions".into(), json!([]));
+        let txs: Vec<Value> = tx_hashes
+            .iter()
+            .map(|h| json!(format!("0x{}", hex::encode(h))))
+            .collect();
+        map.insert("transactions".into(), Value::Array(txs));
         map.insert("uncles".into(), json!([]));
         map.retain(|_, val| !val.is_null());
     }
     v
+}
+
+fn parse_tx_index(req: &Value) -> Result<u64, String> {
+    let s = req
+        .get("params")
+        .and_then(Value::as_array)
+        .and_then(|p| p.get(1))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "transaction index required".to_string())?;
+    decode_u64(s).map_err(|e| format!("invalid transaction index: {e}"))
 }
 
 fn parse_storage_keys(v: Option<&Value>) -> Result<Vec<String>, String> {

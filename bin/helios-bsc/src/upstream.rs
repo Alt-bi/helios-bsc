@@ -1,7 +1,8 @@
 //! Untrusted JSON-RPC data plane (headers + eth_getProof).
 
 use anyhow::{anyhow, Context, Result};
-use helios_bsc_types::RpcBlockHeader;
+use helios_bsc_execution::{MAX_ORDERED_TRIE_ITEMS, MAX_RAW_TX};
+use helios_bsc_types::{decode_hex, decode_hex_fixed, keccak256, RpcBlockHeader};
 use serde_json::{json, Value};
 
 /// Untrusted header / proof / broadcast source.
@@ -20,6 +21,13 @@ pub trait RpcUpstream: Send + Sync {
     fn send_raw_transaction(&self, raw: &str) -> Result<String>;
     /// Untrusted JSON-RPC call for the opt-in passthrough allow-list.
     fn unverified_call(&self, method: &str, params: &Value) -> Result<Value>;
+
+    /// Raw txs for `eth_getBlockByHash(hash, false)` + `eth_getRawTransactionByHash`.
+    /// Default is empty (mocks / stubs). HTTP implementations must fetch and keccak-bind.
+    fn block_raw_transactions(&self, block_hash: &str) -> Result<Vec<Vec<u8>>> {
+        let _ = block_hash;
+        Ok(vec![])
+    }
 
     fn get_proof(&self, address: &str, block: &str) -> Result<Value> {
         self.get_proof_keys(address, &[], block)
@@ -105,6 +113,9 @@ impl RpcUpstream for Failover {
     }
     fn unverified_call(&self, method: &str, params: &Value) -> Result<Value> {
         self.fallback(|u| u.unverified_call(method, params))
+    }
+    fn block_raw_transactions(&self, block_hash: &str) -> Result<Vec<Vec<u8>>> {
+        self.fallback(|u| u.block_raw_transactions(block_hash))
     }
 }
 
@@ -310,6 +321,48 @@ impl RpcUpstream for Upstream {
 
     fn unverified_call(&self, method: &str, params: &Value) -> Result<Value> {
         self.call(method, params.clone())
+    }
+
+    fn block_raw_transactions(&self, block_hash: &str) -> Result<Vec<Vec<u8>>> {
+        let v = self.call("eth_getBlockByHash", json!([block_hash, false]))?;
+        if v.is_null() {
+            return Err(anyhow!("eth_getBlockByHash: header not found"));
+        }
+        let txs = v
+            .get("transactions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("eth_getBlockByHash: transactions missing"))?;
+        if txs.len() > MAX_ORDERED_TRIE_ITEMS {
+            return Err(anyhow!("too many transactions"));
+        }
+        let mut hashes = Vec::with_capacity(txs.len());
+        for t in txs {
+            let s = t
+                .as_str()
+                .ok_or_else(|| anyhow!("eth_getBlockByHash: tx hash not a string"))?;
+            let h = decode_hex_fixed::<32>(s).map_err(|e| anyhow!("tx hash: {e}"))?;
+            hashes.push(h);
+        }
+        let mut raws = Vec::with_capacity(hashes.len());
+        for h in &hashes {
+            let hx = format!("0x{}", hex::encode(h));
+            let raw_v = self.call("eth_getRawTransactionByHash", json!([hx]))?;
+            if raw_v.is_null() {
+                return Err(anyhow!("eth_getRawTransactionByHash: missing {hx}"));
+            }
+            let s = raw_v
+                .as_str()
+                .ok_or_else(|| anyhow!("eth_getRawTransactionByHash: expected hex"))?;
+            let raw = decode_hex(s).map_err(|e| anyhow!("raw tx hex: {e}"))?;
+            if raw.len() > MAX_RAW_TX {
+                return Err(anyhow!("raw tx too large"));
+            }
+            if keccak256(&raw) != *h {
+                return Err(anyhow!("raw tx keccak mismatch"));
+            }
+            raws.push(raw);
+        }
+        Ok(raws)
     }
 }
 

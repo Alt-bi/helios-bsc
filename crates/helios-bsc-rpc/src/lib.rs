@@ -69,7 +69,12 @@ pub fn method_policy(method: &str) -> MethodPolicy {
         | "eth_getProof"
         | "eth_call"
         | "eth_estimateGas" => MethodPolicy::Verified,
-        "eth_getBlockByNumber" | "eth_getBlockByHash" => MethodPolicy::Verified,
+        "eth_getBlockByNumber"
+        | "eth_getBlockByHash"
+        | "eth_getBlockTransactionCountByNumber"
+        | "eth_getBlockTransactionCountByHash"
+        | "eth_getTransactionByBlockNumberAndIndex"
+        | "eth_getTransactionByBlockHashAndIndex" => MethodPolicy::Verified,
         "eth_getUncleCountByBlockNumber"
         | "eth_getUncleCountByBlockHash"
         | "eth_getUncleByBlockNumberAndIndex"
@@ -93,10 +98,6 @@ pub fn method_policy(method: &str) -> MethodPolicy {
         | "eth_getFilterLogs"
         | "eth_subscribe"
         | "eth_unsubscribe"
-        | "eth_getBlockTransactionCountByNumber"
-        | "eth_getBlockTransactionCountByHash"
-        | "eth_getTransactionByBlockNumberAndIndex"
-        | "eth_getTransactionByBlockHashAndIndex"
         | "eth_sendTransaction"
         | "eth_sign"
         | "eth_signTransaction"
@@ -199,11 +200,19 @@ mod tests {
         assert!(!unverified_passthrough_ok("eth_subscribe"));
         assert_eq!(
             method_policy("eth_getBlockTransactionCountByNumber"),
-            MethodPolicy::Unsupported
+            MethodPolicy::Verified
+        );
+        assert_eq!(
+            method_policy("eth_getBlockTransactionCountByHash"),
+            MethodPolicy::Verified
+        );
+        assert_eq!(
+            method_policy("eth_getTransactionByBlockNumberAndIndex"),
+            MethodPolicy::Verified
         );
         assert_eq!(
             method_policy("eth_getTransactionByBlockHashAndIndex"),
-            MethodPolicy::Unsupported
+            MethodPolicy::Verified
         );
         assert_eq!(
             method_policy("eth_sendTransaction"),

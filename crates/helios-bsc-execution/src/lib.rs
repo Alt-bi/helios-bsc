@@ -7,6 +7,7 @@ mod proof;
 mod raw_tx;
 mod receipt_list;
 mod rlp;
+mod tx_list;
 
 use helios_bsc_types::{HexAddress, HexHash, TrustClass};
 use thiserror::Error;
@@ -25,6 +26,7 @@ pub use proof::{
 };
 pub use raw_tx::{validate_bsc_raw_tx, RawTxError, MAX_RAW_TX};
 pub use receipt_list::{verify_receipt_list, ReceiptListError};
+pub use tx_list::{verify_tx_list, TxListError};
 
 #[derive(Debug, Error)]
 pub enum ExecutionError {

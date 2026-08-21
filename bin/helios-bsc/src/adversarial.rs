@@ -795,6 +795,35 @@ fn get_block_latest_is_safe_header() {
 }
 
 #[test]
+fn get_block_tx_count_and_index_empty_root() {
+    let (chain, rpc) = safe_chain_with_fixture_root();
+    let safe_hash = format!("0x{}", hex::encode(chain[0].hash));
+    let node = node_from_chain(chain, rpc.proof_json());
+    let n = node.handle(&req(
+        "eth_getBlockTransactionCountByNumber",
+        json!(["latest"]),
+    ));
+    assert_eq!(n["result"], json!("0x0"), "{n}");
+    let h = node.handle(&req(
+        "eth_getBlockTransactionCountByHash",
+        json!([safe_hash]),
+    ));
+    assert_eq!(h["result"], json!("0x0"), "{h}");
+    let by_n = node.handle(&req(
+        "eth_getTransactionByBlockNumberAndIndex",
+        json!(["latest", "0x0"]),
+    ));
+    assert!(by_n["result"].is_null(), "{by_n}");
+    let by_h = node.handle(&req(
+        "eth_getTransactionByBlockHashAndIndex",
+        json!([safe_hash, "0x0"]),
+    ));
+    assert!(by_h["result"].is_null(), "{by_h}");
+    let by_hash = node.handle(&req("eth_getBlockByHash", json!([safe_hash, false])));
+    assert_eq!(by_hash["result"]["transactions"], json!([]), "{by_hash}");
+}
+
+#[test]
 fn get_block_above_safe_errors() {
     let (chain, rpc) = safe_chain_with_fixture_root();
     let tip = chain.last().unwrap().number;
@@ -867,13 +896,9 @@ fn get_block_prefers_stored_header_over_lying_refetch() {
     up.lie_state_root = true;
     let node = Node::from_parts(Box::new(up), 130, chain);
     let v = node.handle(&req("eth_getBlockByNumber", json!(["latest", false])));
-    assert!(v.get("result").is_some(), "{v}");
-    assert_eq!(v["result"]["stateRoot"], json!(hdr.state_root));
-    assert_eq!(
-        v["result"]["hash"],
-        json!(format!("0x{}", hex::encode(hash)))
-    );
-    assert_eq!(v["result"]["transactions"], json!([]));
+    // Stored header Hash()/stateRoot match. Lying refetch would be ERR_STATE_ROOT
+    // before tx bind. Fixture transactionsRoot is non-empty and mock has no raws.
+    assert_eq!(err_code(&v), ERR_PROOF_FAILED, "{v}");
 }
 
 #[test]
@@ -886,14 +911,10 @@ fn filters_and_subscribe_unsupported() {
         "eth_subscribe",
         "eth_getFilterChanges",
         "eth_getLogs",
-        "eth_getBlockTransactionCountByNumber",
-        "eth_getTransactionByBlockHashAndIndex",
         "eth_newPendingTransactionFilter",
         "eth_uninstallFilter",
         "eth_getFilterLogs",
         "eth_unsubscribe",
-        "eth_getBlockTransactionCountByHash",
-        "eth_getTransactionByBlockNumberAndIndex",
     ] {
         let v = node.handle(&req(m, json!([])));
         assert_eq!(err_code(&v), ERR_METHOD, "{m}: {v}");
