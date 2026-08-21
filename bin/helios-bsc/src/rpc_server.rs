@@ -650,7 +650,11 @@ impl Node {
             Ok(t) => t,
             Err(e) => return Err(rpc_err(id, ERR_PARAMS, &e)),
         };
-        let tag = match req.get("params").and_then(Value::as_array).and_then(|p| p.get(1)) {
+        let tag = match req
+            .get("params")
+            .and_then(Value::as_array)
+            .and_then(|p| p.get(1))
+        {
             None | Some(Value::Null) => None,
             Some(Value::String(s)) => Some(s.as_str()),
             Some(_) => {
