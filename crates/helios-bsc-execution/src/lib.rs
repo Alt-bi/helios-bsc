@@ -2,6 +2,7 @@
 
 mod call;
 mod mpt;
+mod ordered_trie;
 mod proof;
 mod raw_tx;
 mod rlp;
@@ -15,6 +16,7 @@ pub use call::{
     MAX_ESTIMATE_ITERS, MAX_PROOF_ROUNDS, MAX_PROOF_STORAGE_KEYS, TX_GAS,
 };
 pub use mpt::{EMPTY_CODE_HASH, EMPTY_TRIE_ROOT};
+pub use ordered_trie::{ordered_trie_root, MAX_ORDERED_TRIE_ITEMS};
 pub use proof::{
     encode_data32, encode_qty, pad32, qty_equal, retain_requested_storage, verify_account_code,
     verify_eth_get_proof, verify_storage_slot, EthAccountProof, ProofError, StorageProofEntry,
