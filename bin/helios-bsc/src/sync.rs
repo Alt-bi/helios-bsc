@@ -369,10 +369,17 @@ pub fn write_checkpoint_file(path: &std::path::Path, cp: &Checkpoint) -> Result<
     atomic_write(path, json.as_bytes())
 }
 
-/// Write to `path.tmp` then rename so a crash cannot leave a truncated checkpoint.
+/// Write to a unique sibling temp file then rename, so a crash cannot leave a truncated
+/// checkpoint.
+///
+/// The temp name carries the pid and a per-process counter rather than being a fixed
+/// `path.tmp`: two writers sharing one name can interleave a partial write with the other's
+/// rename, which is exactly the truncated-checkpoint outcome the rename is meant to prevent.
 fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(".tmp");
+    tmp.push(format!(".tmp.{}.{seq}", std::process::id()));
     let tmp = std::path::PathBuf::from(tmp);
     std::fs::write(&tmp, bytes).with_context(|| format!("write {tmp:?}"))?;
     if path.exists() {

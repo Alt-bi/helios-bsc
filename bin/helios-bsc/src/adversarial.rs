@@ -1250,22 +1250,29 @@ fn finality_is_confirmation_depth_until_an_attestation_is_seen() {
 #[test]
 fn published_finality_reaches_metrics_and_sync_status() {
     let node = node_with_snapshot();
-    let tip = node.handle(&req("helios_bsc_syncStatus", json!([])))["result"]["tip"]
+    let st0 = node.handle(&req("helios_bsc_syncStatus", json!([])));
+    let tip = st0["result"]["tip"].as_u64().expect("tip");
+    // The finality lag is measured against the snapshot head, not the upstream tip — the
+    // two are sampled at different instants. See `status_fields`.
+    // `finalityHead` is the verified head the lags are measured against; `refresh`
+    // publishes it together with the heads themselves.
+    let head = st0["result"]["finalityHead"]
         .as_u64()
-        .expect("tip");
+        .expect("finalityHead");
+    assert_eq!(head, tip, "with a settled mock chain the two coincide");
 
-    // Live mainnet lag: justified = tip-1, finalized = tip-2.
+    // Live mainnet lag: justified = head-1, finalized = head-2.
     let justified_hash = [0xa1u8; 32];
     let finalized_hash = [0xb2u8; 32];
-    node.publish_finality_for_test((tip - 1, justified_hash), (tip - 2, finalized_hash));
+    node.publish_finality_for_test((head - 1, justified_hash), (head - 2, finalized_hash));
 
     let m = node.metrics_text();
     assert!(
-        m.contains(&format!("helios_bsc_finalized_block {}", tip - 2)),
+        m.contains(&format!("helios_bsc_finalized_block {}", head - 2)),
         "{m}"
     );
     assert!(
-        m.contains(&format!("helios_bsc_justified_block {}", tip - 1)),
+        m.contains(&format!("helios_bsc_justified_block {}", head - 1)),
         "{m}"
     );
     assert!(m.contains("helios_bsc_finalized_lag_blocks 2"), "{m}");
@@ -1274,9 +1281,10 @@ fn published_finality_reaches_metrics_and_sync_status() {
     let st = node.handle(&req("helios_bsc_syncStatus", json!([])));
     let r = &st["result"];
     assert_eq!(r["finality"], json!("fast-finality"));
-    assert_eq!(r["finalizedBlock"], json!(tip - 2));
-    assert_eq!(r["justifiedBlock"], json!(tip - 1));
+    assert_eq!(r["finalizedBlock"], json!(head - 2));
+    assert_eq!(r["justifiedBlock"], json!(head - 1));
     assert_eq!(r["finalizedLagBlocks"], json!(2));
+    assert_eq!(r["justifiedLagBlocks"], json!(1));
     assert_eq!(
         r["finalizedHash"],
         json!(format!("0x{}", hex::encode(finalized_hash)))

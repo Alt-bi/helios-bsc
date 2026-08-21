@@ -74,6 +74,20 @@ pub struct Node {
     /// [`NO_BLOCK`] means "no attestation seen yet", which is a normal state.
     last_justified: AtomicU64,
     last_finalized: AtomicU64,
+    /// Consistent view of fast finality, published by `refresh` from one read under the
+    /// snapshot lock.
+    ///
+    /// Reading the snapshot again from `status_fields` looked equivalent and was not: the
+    /// background sync can advance it between `refresh` sampling the tip and the status
+    /// read, which reported a justified head *above* the tip and a finality lag of 0 while
+    /// the real lag was 2. Numbers, hashes and the head they are measured against have to
+    /// come from the same instant.
+    finality: Mutex<FinalityView>,
+    /// Serialises checkpoint persistence. The background sync thread and any request
+    /// thread can both reach `persist_verified_tip`, and two writers racing on the same
+    /// file is how a checkpoint ends up truncated — the one outcome tmp+rename exists to
+    /// prevent.
+    persist_lock: Mutex<()>,
     allow_unverified_passthrough: bool,
     backup_transport: bool,
     metrics_enabled: bool,
@@ -81,6 +95,27 @@ pub struct Node {
 
 /// Sentinel for an unpublished `last_tip` / `last_safe` / finality gauge.
 const NO_BLOCK: u64 = u64::MAX;
+
+/// Fast-finality heads and the verified head they were measured against, all sampled at
+/// the same instant. See [`Node::finality`].
+#[derive(Clone, Copy, Default)]
+struct FinalityView {
+    /// Verified head at the time of the read; the lags are relative to this, not to a
+    /// tip sampled elsewhere.
+    head: u64,
+    available: bool,
+    justified: Option<(u64, [u8; 32])>,
+    finalized: Option<(u64, [u8; 32])>,
+}
+
+/// Request threads serving the local JSON-RPC listener.
+///
+/// More than one because the listener must stay answerable while a request is blocked:
+/// `helios_bsc_syncStatus` triggers a sync, and against an upstream that does not support
+/// JSON-RPC batching a cold walk is one round-trip per header — minutes. A single accept
+/// loop would hold `/metrics` behind it for that whole time, which is precisely when a
+/// scrape is worth having. Fixed and small, so this cannot become a thread-spawn amplifier.
+const RPC_WORKER_THREADS: usize = 4;
 
 impl Node {
     pub fn bootstrap(up: Box<dyn RpcUpstream>, lookback: u64) -> Result<Self> {
@@ -112,6 +147,8 @@ impl Node {
             last_finalized: AtomicU64::new(NO_BLOCK),
             allow_unverified_passthrough: false,
             backup_transport: false,
+            finality: Mutex::new(FinalityView::default()),
+            persist_lock: Mutex::new(()),
             metrics_enabled: false,
         })
     }
@@ -158,6 +195,8 @@ impl Node {
             last_finalized: AtomicU64::new(finalized.unwrap_or(NO_BLOCK)),
             allow_unverified_passthrough: false,
             backup_transport: false,
+            finality: Mutex::new(FinalityView::default()),
+            persist_lock: Mutex::new(()),
             metrics_enabled: false,
         })
     }
@@ -186,6 +225,8 @@ impl Node {
             last_finalized: AtomicU64::new(NO_BLOCK),
             allow_unverified_passthrough: false,
             backup_transport: false,
+            finality: Mutex::new(FinalityView::default()),
+            persist_lock: Mutex::new(()),
             metrics_enabled: false,
         }
     }
@@ -219,6 +260,8 @@ impl Node {
             last_finalized: AtomicU64::new(NO_BLOCK),
             allow_unverified_passthrough: false,
             backup_transport: false,
+            finality: Mutex::new(FinalityView::default()),
+            persist_lock: Mutex::new(()),
             metrics_enabled: false,
         }
     }
@@ -277,6 +320,10 @@ impl Node {
         }
         self.last_justified.store(justified.0, Ordering::Relaxed);
         self.last_finalized.store(finalized.0, Ordering::Relaxed);
+        let mut view = self.finality.lock().expect("finality lock");
+        view.available = true;
+        view.justified = Some(justified);
+        view.finalized = Some(finalized);
     }
 
     /// Prometheus text exposition (`docs/slo.md`).
@@ -436,6 +483,9 @@ impl Node {
         let Some(path) = self.checkpoint_store.as_ref() else {
             return;
         };
+        // Held for the whole read-then-write: two writers could otherwise interleave and
+        // leave the newer checkpoint overwritten by the older one's snapshot.
+        let _persist = self.persist_lock.lock().expect("persist lock");
         let (hash, state_root, number, snap, stored) = {
             let chain = self.chain.lock().expect("chain lock");
             let snapshot = self.snapshot.lock().expect("snapshot lock");
@@ -523,11 +573,20 @@ impl Node {
                 return Err(e);
             }
         };
-        // Read the fast-finality heads while the snapshot is still locked; they are
-        // published as plain numbers below so a scrape never needs the lock at all.
-        let (justified, finalized) = match snapshot.as_ref() {
-            Some(s) => (s.justified().map(|(b, _)| b), s.finalized().map(|(b, _)| b)),
-            None => (None, None),
+        // Read the fast-finality heads while the snapshot is still locked, and keep them
+        // together with the head they are measured against. Everything published below
+        // comes from this one sample, so no consumer can mix two instants.
+        let view = match snapshot.as_ref() {
+            Some(s) => FinalityView {
+                head: tip,
+                available: s.fast_finality_available(),
+                justified: s.justified(),
+                finalized: s.finalized(),
+            },
+            None => FinalityView {
+                head: tip,
+                ..FinalityView::default()
+            },
         };
         drop(chain);
         drop(snapshot);
@@ -535,10 +594,15 @@ impl Node {
         // Publish for /metrics so a scrape never contends with this sync.
         self.last_tip.store(tip, Ordering::Relaxed);
         self.last_safe.store(safe.number, Ordering::Relaxed);
-        self.last_justified
-            .store(justified.unwrap_or(NO_BLOCK), Ordering::Relaxed);
-        self.last_finalized
-            .store(finalized.unwrap_or(NO_BLOCK), Ordering::Relaxed);
+        self.last_justified.store(
+            view.justified.map_or(NO_BLOCK, |(b, _)| b),
+            Ordering::Relaxed,
+        );
+        self.last_finalized.store(
+            view.finalized.map_or(NO_BLOCK, |(b, _)| b),
+            Ordering::Relaxed,
+        );
+        *self.finality.lock().expect("finality lock") = view;
         if grew {
             self.persist_verified_tip();
         }
@@ -799,18 +863,13 @@ impl Node {
         // snapshot carries a BEP-126 attestation, the justified/finalized pair.
         // `fast_finality_available` is false until the BLS vote keys are known — a
         // normal state at a checkpoint before the first epoch activation, not an error.
-        let (sealing, fast_available, justified, finalized) = {
-            let snapshot = self.snapshot.lock().expect("snapshot lock");
-            match snapshot.as_ref() {
-                Some(s) => (
-                    true,
-                    s.fast_finality_available(),
-                    s.justified(),
-                    s.finalized(),
-                ),
-                None => (false, false, None, None),
-            }
-        };
+        let sealing = self.snapshot.lock().expect("snapshot lock").is_some();
+        // One consistent sample published by `refresh` — never a fresh snapshot read, see
+        // [`Node::finality`].
+        let view = *self.finality.lock().expect("finality lock");
+        let (fast_available, justified, finalized) =
+            (view.available, view.justified, view.finalized);
+        let finality_head = view.head;
         let lag = proof_lag(tip, safe.number);
         let interval_ms = mainnet_current_fork().block_interval_ms;
         // `safe` / `safeLagBlocks` / `lag` keep meaning confirmation depth; the
@@ -845,7 +904,9 @@ impl Node {
             "justifiedHash": justified.map(|(_, h)| format!("0x{}", hex::encode(h))),
             "finalizedBlock": finalized.map(|(b, _)| b),
             "finalizedHash": finalized.map(|(_, h)| format!("0x{}", hex::encode(h))),
-            "finalizedLagBlocks": finalized.map(|(b, _)| proof_lag(tip, b)),
+            "finalizedLagBlocks": finalized.map(|(b, _)| proof_lag(finality_head, b)),
+            "justifiedLagBlocks": justified.map(|(b, _)| proof_lag(finality_head, b)),
+            "finalityHead": finality_head,
         })
     }
 
@@ -3065,7 +3126,7 @@ enum AccountField {
 }
 
 pub fn serve(node: Arc<Node>, listen: &str) -> Result<()> {
-    let server = Server::http(listen).map_err(|e| anyhow::anyhow!("bind {listen}: {e}"))?;
+    let server = Arc::new(Server::http(listen).map_err(|e| anyhow::anyhow!("bind {listen}: {e}"))?);
     eprintln!("helios-bsc RPC on http://{listen}  (wallet mode: latest→Safe)");
     let loopback_only = listen_is_loopback(listen);
     // Keep Safe inside the proof window while idle (~4 Fermi blocks).
@@ -3078,70 +3139,90 @@ pub fn serve(node: Arc<Node>, listen: &str) -> Result<()> {
                 eprintln!("background sync: {e}");
             }
         });
-    for mut req in server.incoming_requests() {
-        let host = req
-            .headers()
-            .iter()
-            .find(|h| h.field.equiv("Host"))
-            .map(|h| h.value.as_str().to_string());
-        if let Some(code) = rpc_http_host_reject(host.as_deref(), loopback_only) {
-            let _ = req.respond(Response::from_string("forbidden host").with_status_code(code));
-            continue;
-        }
-        // Metrics is the one GET route, and only when explicitly enabled. It sits
-        // after the Host check so DNS-rebinding protection still applies, and it is
-        // never reachable on the default (metrics-off) build.
-        if req.method() == &Method::Get {
-            let path = req.url().split('?').next().unwrap_or("");
-            if node.metrics_enabled() && path == "/metrics" {
-                let body = node.metrics_text();
-                let mut resp = Response::from_string(body);
-                if let Ok(h) = Header::from_bytes(
-                    &b"Content-Type"[..],
-                    &b"text/plain; version=0.0.4; charset=utf-8"[..],
-                ) {
-                    resp.add_header(h);
-                }
-                let _ = req.respond(resp);
-                continue;
-            }
-        }
-        if let Some(code) = rpc_http_reject(req.method() == &Method::Post, 0) {
-            if code == 405 {
-                let _ = req.respond(Response::from_string("POST only").with_status_code(405));
-                continue;
-            }
-        }
-        let content_type = req
-            .headers()
-            .iter()
-            .find(|h| h.field.equiv("Content-Type"))
-            .map(|h| h.value.as_str().to_string());
-        if let Some(code) = rpc_http_content_type_reject(content_type.as_deref()) {
-            let _ =
-                req.respond(Response::from_string("unsupported media type").with_status_code(code));
-            continue;
-        }
-        let mut buf = Vec::new();
-        let mut limited = req.as_reader().take((MAX_RPC_BODY as u64) + 1);
-        limited.read_to_end(&mut buf).ok();
-        if let Some(code) = rpc_http_reject(true, buf.len()) {
-            let _ = req.respond(Response::from_string("payload too large").with_status_code(code));
-            continue;
-        }
-        let out = node.dispatch_bytes(&buf);
-        if out.is_null() {
-            let _ = req.respond(Response::from_string("").with_status_code(204));
-            continue;
-        }
-        let mut resp = Response::from_string(out.to_string());
-        if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]) {
-            resp = resp.with_header(h);
-        }
-        // Never Access-Control-Allow-Origin: * — a page could then call 127.0.0.1:8545.
-        let _ = req.respond(resp);
+
+    let mut workers = Vec::with_capacity(RPC_WORKER_THREADS);
+    for i in 0..RPC_WORKER_THREADS {
+        let server = Arc::clone(&server);
+        let node = Arc::clone(&node);
+        workers.push(
+            std::thread::Builder::new()
+                .name(format!("helios-bsc-rpc-{i}"))
+                .spawn(move || {
+                    // `recv` hands each request to exactly one worker, so the listener
+                    // keeps answering while another worker is blocked in a sync.
+                    while let Ok(req) = server.recv() {
+                        serve_one(&node, req, loopback_only);
+                    }
+                })?,
+        );
+    }
+    for w in workers {
+        let _ = w.join();
     }
     Ok(())
+}
+
+fn serve_one(node: &Node, mut req: tiny_http::Request, loopback_only: bool) {
+    let host = req
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Host"))
+        .map(|h| h.value.as_str().to_string());
+    if let Some(code) = rpc_http_host_reject(host.as_deref(), loopback_only) {
+        let _ = req.respond(Response::from_string("forbidden host").with_status_code(code));
+        return;
+    }
+    // Metrics is the one GET route, and only when explicitly enabled. It sits
+    // after the Host check so DNS-rebinding protection still applies, and it is
+    // never reachable on the default (metrics-off) build.
+    if req.method() == &Method::Get {
+        let path = req.url().split('?').next().unwrap_or("");
+        if node.metrics_enabled() && path == "/metrics" {
+            let body = node.metrics_text();
+            let mut resp = Response::from_string(body);
+            if let Ok(h) = Header::from_bytes(
+                &b"Content-Type"[..],
+                &b"text/plain; version=0.0.4; charset=utf-8"[..],
+            ) {
+                resp.add_header(h);
+            }
+            let _ = req.respond(resp);
+            return;
+        }
+    }
+    if let Some(code) = rpc_http_reject(req.method() == &Method::Post, 0) {
+        if code == 405 {
+            let _ = req.respond(Response::from_string("POST only").with_status_code(405));
+            return;
+        }
+    }
+    let content_type = req
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Content-Type"))
+        .map(|h| h.value.as_str().to_string());
+    if let Some(code) = rpc_http_content_type_reject(content_type.as_deref()) {
+        let _ = req.respond(Response::from_string("unsupported media type").with_status_code(code));
+        return;
+    }
+    let mut buf = Vec::new();
+    let mut limited = req.as_reader().take((MAX_RPC_BODY as u64) + 1);
+    limited.read_to_end(&mut buf).ok();
+    if let Some(code) = rpc_http_reject(true, buf.len()) {
+        let _ = req.respond(Response::from_string("payload too large").with_status_code(code));
+        return;
+    }
+    let out = node.dispatch_bytes(&buf);
+    if out.is_null() {
+        let _ = req.respond(Response::from_string("").with_status_code(204));
+        return;
+    }
+    let mut resp = Response::from_string(out.to_string());
+    if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]) {
+        resp = resp.with_header(h);
+    }
+    // Never Access-Control-Allow-Origin: * — a page could then call 127.0.0.1:8545.
+    let _ = req.respond(resp);
 }
 
 /// `None` = accept. `Some(status)` = HTTP error (405 POST-only / 413 body cap).
