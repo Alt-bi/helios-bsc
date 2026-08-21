@@ -4,7 +4,7 @@ use crate::seal::{verify_seal_coinbase, SealError};
 use crate::vote::{decode_vote_attestation, verify_attestation_signature, VoteData, VoteError};
 use helios_bsc_config::{
     miner_history_check_len, params_at, parse_extra, ExtraDataVersion, ExtraError,
-    SealingValidator, DIFF_IN_TURN, DIFF_NO_TURN, MAXWELL_EPOCH_LENGTH,
+    SealingValidator, DIFF_IN_TURN, DIFF_NO_TURN, MAXWELL_EPOCH_LENGTH, MAXWELL_TIME,
 };
 use helios_bsc_types::{
     decode_hex, decode_hex_fixed, decode_u64, format_address, Checkpoint, RpcBlockHeader,
@@ -166,6 +166,74 @@ impl Snapshot {
         self.attestation.map(|a| (a.source_number, a.source_hash))
     }
 
+    /// v1.7.8 `Snapshot.getFinalizedNumber`:
+    ///
+    /// ```text
+    /// func (s *Snapshot) getFinalizedNumber() uint64 {
+    ///     if s.Attestation != nil {
+    ///         return s.Attestation.SourceNumber
+    ///     }
+    ///     return 0
+    /// }
+    /// ```
+    fn finalized_number(&self) -> u64 {
+        self.attestation.map(|a| a.source_number).unwrap_or(0)
+    }
+
+    /// Tail of v1.7.8 `Snapshot.updateAttestation`:
+    ///
+    /// ```text
+    /// if s.Attestation != nil && attestation.Data.SourceNumber+1 != attestation.Data.TargetNumber {
+    ///     s.Attestation.TargetNumber = attestation.Data.TargetNumber
+    ///     s.Attestation.TargetHash = attestation.Data.TargetHash
+    /// } else {
+    ///     s.Attestation = attestation.Data
+    /// }
+    /// ```
+    ///
+    /// A **non-contiguous** attestation (`source + 1 != target`, which happens whenever a
+    /// header in between carried no attestation) advances only the justified head; the
+    /// source — the finalized block — stays where it was. Finality moves only on two
+    /// consecutive justified blocks. This matters directly for the Maxwell prune below:
+    /// replacing the source wholesale would report a finalized block ahead of geth's and
+    /// prune `recents` entries geth still counts, which is exactly the fail-open direction.
+    fn adopt_attestation(&mut self, data: VoteData) {
+        match self.attestation.as_mut() {
+            Some(cur) if data.source_number.saturating_add(1) != data.target_number => {
+                cur.target_number = data.target_number;
+                cur.target_hash = data.target_hash;
+            }
+            _ => self.attestation = Some(data),
+        }
+    }
+
+    /// Maxwell BEP-524, from v1.7.8 `Snapshot.apply`:
+    ///
+    /// ```text
+    /// if chainConfig.IsMaxwell(header.Number, header.Time) {
+    ///     latestFinalizedBlockNumber := snap.getFinalizedNumber()
+    ///     // BEP-524: Clear entries up to the latest finalized block
+    ///     for blockNumber := range snap.Recents {
+    ///         if blockNumber <= latestFinalizedBlockNumber {
+    ///             delete(snap.Recents, blockNumber)
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// Two properties fall out of the geth code and are worth stating, because both are
+    /// load-bearing here:
+    ///
+    /// * With no attestation ever adopted, `getFinalizedNumber` is 0 and the loop can only
+    ///   delete block 0 — which `recents` never holds. The confirmation-depth path is
+    ///   therefore untouched, not merely "usually" untouched.
+    /// * The Bohr epoch sentinel is keyed `u64::MAX - epoch`, far above any block number,
+    ///   so it survives the prune and `sign_recently` keeps skipping it.
+    fn prune_recents_to_finalized(&mut self) {
+        let latest_finalized = self.finalized_number();
+        self.recents.retain(|&block, _| block > latest_finalized);
+    }
+
     /// Validator set an attestation in header `number` must be checked against.
     ///
     /// geth uses the snapshot at `TargetNumber - 1` = `number - 2`, so the previous
@@ -262,7 +330,9 @@ impl Snapshot {
 
     /// v1.7.8 `Snapshot.SignRecently` (Bohr+): `seenTimes >= turnLength` in the
     /// `minerHistoryCheckLen` window. Recents from *before* the checkpoint are unknown
-    /// (walk starts empty). Maxwell BEP-524 prune-to-FF is not applied (no BLS).
+    /// (walk starts empty). Entries at or below the BLS-finalized block are already gone
+    /// from Maxwell onwards — see [`Snapshot::prune_recents_to_finalized`] — so this walks
+    /// a shorter map than it used to, with the same left bound and the same sentinel skip.
     pub fn sign_recently(&self, signer: &[u8; 20]) -> bool {
         let check_len = self.delay();
         let left_bound = self.number.saturating_sub(check_len);
@@ -292,6 +362,7 @@ impl Snapshot {
         signer: [u8; 20],
     ) -> Result<(), SnapshotError> {
         let number = decode_u64(&header.number)?;
+        let time = decode_u64(&header.timestamp)?;
         let parent = decode_hex_fixed::<32>(&header.parent_hash)?;
         let hash = decode_hex_fixed::<32>(&header.hash)?;
 
@@ -360,7 +431,22 @@ impl Snapshot {
             });
         }
 
+        // Order is geth's, from `snapshot.apply`: `updateAttestation`, then
+        // `Recents[number] = validator`, then the Maxwell prune — and only after all of
+        // that, the validator-set switch that may clear `Recents` outright. Adopting the
+        // attestation later (as this function used to) would prune against a stale
+        // finalized head for exactly one block.
+        if let Some(data) = adopted {
+            self.adopt_attestation(data);
+        }
+
         self.recents.insert(number, signer);
+
+        // `chainConfig.IsMaxwell(header.Number, header.Time)` — time-gated, on the header
+        // being applied, so a pre-Maxwell segment is bit-for-bit unaffected.
+        if time >= MAXWELL_TIME {
+            self.prune_recents_to_finalized();
+        }
 
         if let Some(pending) = self.pending.clone() {
             if number == pending.activate_at {
@@ -389,10 +475,6 @@ impl Snapshot {
                     self.recents.insert(epoch_key, RECENT_EPOCH_SENTINEL);
                 }
             }
-        }
-
-        if let Some(data) = adopted {
-            self.attestation = Some(data);
         }
 
         self.number = number;
@@ -594,6 +676,182 @@ mod tests {
         assert!(matches!(err, SnapshotError::RecentlySigned(_)), "{err}");
         // A different sealer is still allowed.
         snap.apply_verified(&h, addr(2)).unwrap();
+    }
+
+    // ---- Maxwell BEP-524: prune `recents` to the BLS-finalized block ----
+    //
+    // The gate is the header timestamp, so `dummy_header` (timestamp `0x1`) keeps every
+    // test above on the pre-Maxwell path unchanged. These tests opt in explicitly.
+
+    fn block_hash(n: u64) -> [u8; 32] {
+        let mut h = [0u8; 32];
+        h[..8].copy_from_slice(&n.to_be_bytes());
+        h
+    }
+
+    /// `dummy_header` at a chosen timestamp, out-of-turn difficulty.
+    fn header_at(number: u64, parent: [u8; 32], time: u64) -> RpcBlockHeader {
+        let mut h = dummy_header(number, parent, block_hash(number));
+        h.timestamp = format!("0x{time:x}");
+        h.difficulty = "0x1".into();
+        h
+    }
+
+    fn vote(source: u64, target: u64) -> VoteData {
+        VoteData {
+            source_number: source,
+            source_hash: block_hash(source),
+            target_number: target,
+            target_hash: block_hash(target),
+        }
+    }
+
+    /// Seal `from..=to` with one signer. Headers carry no attestation, so the snapshot's
+    /// attestation (whatever the test set) is left alone.
+    fn walk(snap: &mut Snapshot, from: u64, to: u64, signer: [u8; 20], time: u64) {
+        let mut parent = snap.hash;
+        for n in from..=to {
+            snap.apply_verified(&header_at(n, parent, time), signer)
+                .unwrap();
+            parent = block_hash(n);
+        }
+    }
+
+    fn recent_keys(snap: &Snapshot) -> Vec<u64> {
+        let mut keys: Vec<u64> = snap.recents.keys().copied().collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// Regression guard for the confirmation-depth path: Maxwell is active, but no
+    /// attestation was ever adopted, so `getFinalizedNumber()` is 0 and the geth loop can
+    /// only delete block 0 — which `recents` never holds. Nothing may change.
+    #[test]
+    fn maxwell_prune_is_a_no_op_without_a_finalized_head() {
+        let mut snap = Snapshot::from_checkpoint(&cp()).unwrap();
+        snap.enforce_inturn = false;
+        assert!(snap.finalized().is_none());
+
+        walk(&mut snap, 1001, 1008, addr(1), MAXWELL_TIME);
+
+        assert_eq!(recent_keys(&snap), (1001..=1008).collect::<Vec<_>>());
+        assert!(snap.sign_recently(&addr(1)));
+
+        let err = snap
+            .apply_verified(&header_at(1009, block_hash(1008), MAXWELL_TIME), addr(1))
+            .unwrap_err();
+        assert!(matches!(err, SnapshotError::RecentlySigned(_)), "{err}");
+    }
+
+    /// The gate is `chainConfig.IsMaxwell(header.Number, header.Time)`. One second earlier
+    /// the prune must not exist, even with a finalized head sitting in the snapshot.
+    #[test]
+    fn prune_is_inert_one_second_before_maxwell() {
+        let mut snap = Snapshot::from_checkpoint(&cp()).unwrap();
+        snap.enforce_inturn = false;
+        let pre = MAXWELL_TIME - 1;
+
+        walk(&mut snap, 1001, 1008, addr(1), pre);
+        snap.attestation = Some(vote(1004, 1005));
+
+        snap.apply_verified(&header_at(1009, block_hash(1008), pre), addr(2))
+            .unwrap();
+
+        assert_eq!(recent_keys(&snap), (1001..=1009).collect::<Vec<_>>());
+        assert!(
+            snap.sign_recently(&addr(1)),
+            "pre-fork history must survive"
+        );
+    }
+
+    /// `blockNumber <= latestFinalizedBlockNumber` — inclusive of the finalized block
+    /// itself. The Bohr epoch sentinel is keyed `u64::MAX - epoch`, so it survives.
+    #[test]
+    fn maxwell_prune_drops_recents_at_or_below_the_finalized_block() {
+        let mut snap = Snapshot::from_checkpoint(&cp()).unwrap();
+        snap.enforce_inturn = false;
+        walk(&mut snap, 1001, 1008, addr(1), MAXWELL_TIME);
+
+        let epoch_key = u64::MAX - 1;
+        snap.recents.insert(epoch_key, RECENT_EPOCH_SENTINEL);
+        snap.attestation = Some(vote(1004, 1005));
+        assert_eq!(snap.finalized().map(|(n, _)| n), Some(1004));
+
+        snap.apply_verified(&header_at(1009, block_hash(1008), MAXWELL_TIME), addr(2))
+            .unwrap();
+
+        assert_eq!(
+            recent_keys(&snap),
+            vec![1005, 1006, 1007, 1008, 1009, epoch_key],
+            "1001..=1004 are at or below the finalized block; the sentinel is not"
+        );
+        assert_eq!(snap.recents.get(&epoch_key), Some(&RECENT_EPOCH_SENTINEL));
+    }
+
+    /// A finalized head below every entry prunes nothing, so `sign_recently` must give
+    /// the same answer it gave before the rule existed.
+    #[test]
+    fn sign_recently_unchanged_when_finality_is_below_all_history() {
+        let mut snap = Snapshot::from_checkpoint(&cp()).unwrap();
+        snap.enforce_inturn = false;
+        walk(&mut snap, 1001, 1008, addr(1), MAXWELL_TIME);
+
+        snap.attestation = Some(vote(1000, 1001));
+        snap.apply_verified(&header_at(1009, block_hash(1008), MAXWELL_TIME), addr(2))
+            .unwrap();
+
+        assert_eq!(recent_keys(&snap), (1001..=1009).collect::<Vec<_>>());
+        assert!(snap.sign_recently(&addr(1)));
+    }
+
+    /// The point of BEP-524: once history is finalized it stops counting, so a validator
+    /// that had used up its turn can seal again. Same setup as
+    /// `maxwell_prune_is_a_no_op_without_a_finalized_head`, which rejects block 1009 from
+    /// `addr(1)` — the only difference here is the finalized head.
+    #[test]
+    fn finalized_history_stops_counting_toward_sign_recently() {
+        let mut snap = Snapshot::from_checkpoint(&cp()).unwrap();
+        snap.enforce_inturn = false;
+        walk(&mut snap, 1001, 1008, addr(1), MAXWELL_TIME);
+        assert!(snap.sign_recently(&addr(1)));
+
+        snap.attestation = Some(vote(1004, 1005));
+        snap.apply_verified(&header_at(1009, block_hash(1008), MAXWELL_TIME), addr(2))
+            .unwrap();
+
+        assert!(
+            !snap.sign_recently(&addr(1)),
+            "4 unfinalized seals is under turnLength 8"
+        );
+        snap.apply_verified(&header_at(1010, block_hash(1009), MAXWELL_TIME), addr(1))
+            .unwrap();
+    }
+
+    /// `updateAttestation`: finality only advances on two consecutive justified blocks.
+    /// The prune reads this number, so getting it wrong would prune too much.
+    #[test]
+    fn non_contiguous_attestation_advances_only_the_justified_head() {
+        let mut snap = Snapshot::from_checkpoint(&cp()).unwrap();
+
+        // `s.Attestation == nil`: adopted whole.
+        snap.adopt_attestation(vote(1000, 1001));
+        assert_eq!(snap.finalized(), Some((1000, block_hash(1000))));
+        assert_eq!(snap.justified(), Some((1001, block_hash(1001))));
+
+        // source+1 == target: adopted whole, finality advances.
+        snap.adopt_attestation(vote(1001, 1002));
+        assert_eq!(snap.finalized(), Some((1001, block_hash(1001))));
+        assert_eq!(snap.justified(), Some((1002, block_hash(1002))));
+
+        // A header in between carried no attestation, so this one skips: geth moves only
+        // the target and leaves the source — the finalized block — untouched.
+        snap.adopt_attestation(vote(1002, 1004));
+        assert_eq!(
+            snap.finalized(),
+            Some((1001, block_hash(1001))),
+            "finality must not jump over an unjustified gap"
+        );
+        assert_eq!(snap.justified(), Some((1004, block_hash(1004))));
     }
 
     #[test]
