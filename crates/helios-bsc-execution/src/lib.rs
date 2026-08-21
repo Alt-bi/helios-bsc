@@ -5,6 +5,7 @@ mod mpt;
 mod ordered_trie;
 mod proof;
 mod raw_tx;
+mod receipt_list;
 mod rlp;
 
 use helios_bsc_types::{HexAddress, HexHash, TrustClass};
@@ -23,6 +24,7 @@ pub use proof::{
     VerifiedAccount, MAX_CODE_SIZE, MAX_PROOF_NODES, MAX_PROOF_NODE_BYTES,
 };
 pub use raw_tx::{validate_bsc_raw_tx, RawTxError, MAX_RAW_TX};
+pub use receipt_list::{verify_receipt_list, ReceiptListError};
 
 #[derive(Debug, Error)]
 pub enum ExecutionError {
