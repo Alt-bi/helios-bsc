@@ -239,10 +239,13 @@ impl Database for ProofDb {
     }
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        let acc = self
-            .accounts
-            .get(&address)
-            .ok_or(CallError::Missing(Miss::Account(addr_bytes(address))))?;
+        let Some(acc) = self.accounts.get(&address) else {
+            // Include the slot so the next proof fetch covers account + key.
+            return Err(CallError::Missing(Miss::Storage {
+                address: addr_bytes(address),
+                slot: u256_to_slot(index),
+            }));
+        };
         if let Some(v) = acc.storage.get(&index) {
             return Ok(*v);
         }
@@ -421,8 +424,19 @@ fn seed_call_accounts<P: ProveAtSafe>(
     Ok(())
 }
 
+fn slot_is_proven(db: &ProofDb, address: &[u8; 20], slot: &[u8; 32]) -> bool {
+    match db.accounts.get(&Address::from(*address)) {
+        None => false,
+        Some(acc) => {
+            acc.storage_root == EMPTY_TRIE_ROOT
+                || acc.storage.contains_key(&U256::from_be_bytes(*slot))
+        }
+    }
+}
+
 /// Fetch proofs for Missing account/slot and retry the same `gas`. One `rounds`
-/// counter for the whole call/estimate (not per mid).
+/// counter for the whole call/estimate (not per mid). An omitted storage key is
+/// `Missing` immediately — do not spin until [`MAX_PROOF_ROUNDS`].
 fn transact_call_proven<P: ProveAtSafe>(
     prover: &P,
     db: &mut ProofDb,
@@ -448,6 +462,9 @@ fn transact_call_proven<P: ProveAtSafe>(
                     }
                     Miss::Storage { address, slot } => {
                         fetch_and_load(prover, db, block, &address, &[slot])?;
+                        if !slot_is_proven(db, &address, &slot) {
+                            return Err(CallError::Missing(Miss::Storage { address, slot }));
+                        }
                     }
                     Miss::BlockHash(_) => unreachable!(),
                 }
@@ -528,6 +545,7 @@ fn estimate_gas_search<P: ProveAtSafe>(
                     lo = hint;
                 }
             }
+            // After cap-success, mid revert/halt/intrinsic = need more gas (geth/reth).
             Ok(ExecutionResult::Revert { .. })
             | Ok(ExecutionResult::Halt { .. })
             | Err(CallError::Invalid("transaction"))
@@ -842,6 +860,77 @@ mod tests {
                 return Err(CallError::Missing(Miss::Account(*address)));
             }
             Ok(self.code.clone())
+        }
+    }
+
+    /// Account proof verifies, but requested storage keys are stripped (lying / truncated RPC).
+    struct OmitSlotsProver {
+        address: [u8; 20],
+        proof: EthAccountProof,
+        code: Vec<u8>,
+        fetches: std::cell::Cell<u32>,
+    }
+
+    impl ProveAtSafe for OmitSlotsProver {
+        fn get_proof(
+            &self,
+            address: &[u8; 20],
+            _slots: &[[u8; 32]],
+            _block_hash: &[u8; 32],
+            _block_number: u64,
+        ) -> Result<EthAccountProof, CallError> {
+            self.fetches.set(self.fetches.get() + 1);
+            if address != &self.address {
+                return Err(CallError::Missing(Miss::Account(*address)));
+            }
+            let mut proof = self.proof.clone();
+            proof.storage_proof.clear();
+            Ok(proof)
+        }
+
+        fn get_code(
+            &self,
+            address: &[u8; 20],
+            _block_hash: &[u8; 32],
+            _block_number: u64,
+        ) -> Result<Vec<u8>, CallError> {
+            if address != &self.address {
+                return Err(CallError::Missing(Miss::Account(*address)));
+            }
+            Ok(self.code.clone())
+        }
+    }
+
+    #[test]
+    fn omitted_storage_key_is_missing_not_budget() {
+        let f = load_tip();
+        let root = decode_hex_fixed::<32>(&f.state_root).unwrap();
+        let addr = decode_hex_fixed::<20>(&f.address).unwrap();
+        let prover = OmitSlotsProver {
+            address: addr,
+            proof: f.proof,
+            code: load_wbnb_code(),
+            fetches: std::cell::Cell::new(0),
+        };
+        let data = decode_hex("0x06fdde03").unwrap();
+        let mut block = sample_block(root);
+        block.beneficiary = addr;
+        let err =
+            eth_call_verified(&prover, &block, &call_tx(addr, addr, data.clone())).unwrap_err();
+        match err {
+            CallError::Missing(Miss::Storage { .. }) => {}
+            other => panic!("expected Missing storage, got {other:?}"),
+        }
+        assert!(
+            prover.fetches.get() < MAX_PROOF_ROUNDS,
+            "omitted slot must not spin to Budget (fetches={})",
+            prover.fetches.get()
+        );
+        let err =
+            eth_estimate_gas_verified(&prover, &block, &call_tx(addr, addr, data)).unwrap_err();
+        match err {
+            CallError::Missing(Miss::Storage { .. }) => {}
+            other => panic!("estimate expected Missing storage, got {other:?}"),
         }
     }
 
