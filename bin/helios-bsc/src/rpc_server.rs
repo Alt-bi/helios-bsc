@@ -22,10 +22,10 @@ use helios_bsc_execution::{
 };
 use helios_bsc_rpc::{
     jsonrpc_id_ok, jsonrpc_is_v2, jsonrpc_params_len, jsonrpc_params_ok, method_policy, rpc_err,
-    rpc_err_data, rpc_ok, unverified_passthrough_ok, wallet_block_number_allowed,
-    wallet_tag_is_safe, BlockId, MethodPolicy, ERR_EXECUTION, ERR_INVALID, ERR_METHOD,
-    ERR_NOT_SYNCED, ERR_PARAMS, ERR_PARSE, ERR_PROOF_FAILED, ERR_STATE_ROOT,
-    MAX_PROOF_STORAGE_KEYS, MAX_RPC_BATCH, MAX_RPC_METHOD, MAX_RPC_PARAMS,
+    rpc_err_data, rpc_ok, unverified_passthrough_ok, wallet_block_number_allowed, BlockId,
+    MethodPolicy, ERR_EXECUTION, ERR_INVALID, ERR_METHOD, ERR_NOT_SYNCED, ERR_PARAMS, ERR_PARSE,
+    ERR_PROOF_FAILED, ERR_STATE_ROOT, MAX_PROOF_STORAGE_KEYS, MAX_RPC_BATCH, MAX_RPC_METHOD,
+    MAX_RPC_PARAMS,
 };
 use helios_bsc_types::{
     decode_hex, decode_hex_fixed, decode_u64, keccak256, Checkpoint, RpcBlockHeader, SafeHead,
@@ -568,19 +568,19 @@ impl Node {
         if let Err(e) = require_rpc_address(addr) {
             return rpc_err(id, ERR_PARAMS, &e);
         }
-        let tag = params.get(1).and_then(Value::as_str);
+        let tag = match wallet_block_id_str(id.clone(), params.get(1)) {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
         let (tip, safe) = match self.refresh() {
             Ok(v) => v,
             Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
         };
-        if !wallet_tag_is_safe(tag, safe.number, &safe.hash) {
-            return rpc_err(
-                id,
-                ERR_NOT_SYNCED,
-                "wallet mode only serves the local Safe head (latest→Safe)",
-            );
-        }
-        match self.verified_account(id.clone(), addr, tip, &safe) {
+        let local = match self.resolve_wallet_exec_block(id.clone(), tag, tip, &safe) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        match self.verified_account(id.clone(), addr, tip, &local) {
             Ok(acc) => match field {
                 AccountField::Balance => rpc_ok(id, json!(encode_qty(&acc.balance_wei))),
                 AccountField::Nonce => rpc_ok(id, json!(format!("0x{:x}", acc.nonce))),
@@ -600,29 +600,31 @@ impl Node {
         if let Err(e) = require_rpc_address(addr) {
             return rpc_err(id, ERR_PARAMS, &e);
         }
-        let tag = params.get(1).and_then(Value::as_str);
+        let tag = match wallet_block_id_str(id.clone(), params.get(1)) {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
         let (tip, safe) = match self.refresh() {
             Ok(v) => v,
             Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
         };
-        if !wallet_tag_is_safe(tag, safe.number, &safe.hash) {
-            return rpc_err(
-                id,
-                ERR_NOT_SYNCED,
-                "wallet mode only serves the local Safe head (latest→Safe)",
-            );
-        }
-        let acc = match self.verified_account(id.clone(), addr, tip, &safe) {
+        let local = match self.resolve_wallet_exec_block(id.clone(), tag, tip, &safe) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        let acc = match self.verified_account(id.clone(), addr, tip, &local) {
             Ok(a) => a,
             Err(e) => return e,
         };
         if acc.code_hash == EMPTY_CODE_HASH {
             return rpc_ok(id, json!("0x"));
         }
+        let hash = format!("0x{}", hex::encode(local.hash));
+        let number = format!("0x{:x}", local.number);
         let code = match self
             .up
-            .get_code(addr, &safe.hash)
-            .or_else(|_| self.up.get_code(addr, &format!("0x{:x}", safe.number)))
+            .get_code(addr, &hash)
+            .or_else(|_| self.up.get_code(addr, &number))
         {
             Ok(c) => c,
             Err(e) => {
@@ -651,53 +653,20 @@ impl Node {
             Ok(t) => t,
             Err(e) => return Err(rpc_err(id, ERR_PARAMS, &e)),
         };
-        let tag = match req
-            .get("params")
-            .and_then(Value::as_array)
-            .and_then(|p| p.get(1))
-        {
-            None | Some(Value::Null) => None,
-            Some(Value::String(s)) => Some(s.as_str()),
-            Some(_) => {
-                return Err(rpc_err(
-                    id,
-                    ERR_PARAMS,
-                    "block id must be a string tag or hex",
-                ))
-            }
-        };
+        let tag = wallet_block_id_str(
+            id.clone(),
+            req.get("params")
+                .and_then(Value::as_array)
+                .and_then(|p| p.get(1)),
+        )?;
         let (tip, safe) = match self.refresh() {
             Ok(v) => v,
             Err(e) => return Err(rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}"))),
         };
-        if !wallet_tag_is_safe(tag, safe.number, &safe.hash) {
-            return Err(rpc_err(
-                id,
-                ERR_NOT_SYNCED,
-                "wallet mode only serves the local Safe head (latest→Safe)",
-            ));
-        }
-        let lag = proof_lag(tip, safe.number);
-        if lag > PROVIDER_PROOF_LOOKBACK {
-            return Err(rpc_err(
-                id,
-                ERR_NOT_SYNCED,
-                &format!("proof window exceeded: lag {lag} > {PROVIDER_PROOF_LOOKBACK}"),
-            ));
-        }
+        let local = self.resolve_wallet_exec_block(id, tag, tip, &safe)?;
         let block = {
             let chain = self.chain.lock().expect("chain lock");
-            chain
-                .iter()
-                .find(|b| b.number == safe.number)
-                .map(|local| call_block_from_verified(local, &chain))
-        };
-        let Some(block) = block else {
-            return Err(rpc_err(
-                id,
-                ERR_NOT_SYNCED,
-                "wallet mode only serves the local Safe head (latest→Safe)",
-            ));
+            call_block_from_verified(&local, &chain)
         };
         Ok((tx, block))
     }
@@ -765,19 +734,19 @@ impl Node {
             Ok(k) => k,
             Err(e) => return rpc_err(id, ERR_PARAMS, &e),
         };
-        let tag = params.get(2).and_then(Value::as_str);
+        let tag = match wallet_block_id_str(id.clone(), params.get(2)) {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
         let (tip, safe) = match self.refresh() {
             Ok(v) => v,
             Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
         };
-        if !wallet_tag_is_safe(tag, safe.number, &safe.hash) {
-            return rpc_err(
-                id,
-                ERR_NOT_SYNCED,
-                "wallet mode only serves the local Safe head (latest→Safe)",
-            );
-        }
-        let (acc, mut proof) = match self.verified_proof(id.clone(), addr, tip, &safe, &keys) {
+        let local = match self.resolve_wallet_exec_block(id.clone(), tag, tip, &safe) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        let (acc, mut proof) = match self.verified_proof(id.clone(), addr, tip, &local, &keys) {
             Ok(v) => v,
             Err(e) => return e,
         };
@@ -825,7 +794,10 @@ impl Node {
         let Some(slot_hex) = params.get(1).and_then(Value::as_str) else {
             return rpc_err(id, ERR_PARAMS, "storage slot required");
         };
-        let tag = params.get(2).and_then(Value::as_str);
+        let tag = match wallet_block_id_str(id.clone(), params.get(2)) {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
         let slot = match parse_slot(slot_hex) {
             Ok(s) => s,
             Err(e) => return rpc_err(id, ERR_PARAMS, &e),
@@ -834,16 +806,13 @@ impl Node {
             Ok(v) => v,
             Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
         };
-        if !wallet_tag_is_safe(tag, safe.number, &safe.hash) {
-            return rpc_err(
-                id,
-                ERR_NOT_SYNCED,
-                "wallet mode only serves the local Safe head (latest→Safe)",
-            );
-        }
+        let local = match self.resolve_wallet_exec_block(id.clone(), tag, tip, &safe) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
         let key = format!("0x{}", hex::encode(slot));
         let (acc, proof) =
-            match self.verified_proof(id.clone(), addr, tip, &safe, std::slice::from_ref(&key)) {
+            match self.verified_proof(id.clone(), addr, tip, &local, std::slice::from_ref(&key)) {
                 Ok(v) => v,
                 Err(e) => return e,
             };
@@ -1108,14 +1077,49 @@ impl Node {
         }
     }
 
+    /// Wallet-mode exec header: tags → Safe; hex/hash iff local verified and `n ≤ Safe`.
+    /// Proof window is `proof_lag(tip, requested.number) ≤ 112` (fail-closed).
+    fn resolve_wallet_exec_block(
+        &self,
+        id: Value,
+        tag: Option<&str>,
+        tip: u64,
+        safe: &SafeHead,
+    ) -> Result<VerifiedBlock, Value> {
+        let local = {
+            let chain = self.chain.lock().expect("chain lock");
+            wallet_get_block_by_number(tag, safe.number, &safe.hash, &chain)
+                .cloned()
+                .or_else(|| {
+                    tag.and_then(|t| wallet_get_block_by_hash(t, safe.number, &chain).cloned())
+                })
+        };
+        let Some(local) = local else {
+            return Err(rpc_err(
+                id,
+                ERR_NOT_SYNCED,
+                "wallet mode only serves Safe or below (latest→Safe)",
+            ));
+        };
+        let lag = proof_lag(tip, local.number);
+        if lag > PROVIDER_PROOF_LOOKBACK {
+            return Err(rpc_err(
+                id,
+                ERR_NOT_SYNCED,
+                &format!("proof window exceeded: lag {lag} > {PROVIDER_PROOF_LOOKBACK}"),
+            ));
+        }
+        Ok(local)
+    }
+
     fn verified_account(
         &self,
         id: Value,
         addr: &str,
         tip: u64,
-        safe: &SafeHead,
+        exec: &VerifiedBlock,
     ) -> Result<VerifiedAccount, Value> {
-        self.verified_proof(id, addr, tip, safe, &[])
+        self.verified_proof(id, addr, tip, exec, &[])
             .map(|(acc, _)| acc)
     }
 
@@ -1124,10 +1128,10 @@ impl Node {
         id: Value,
         addr: &str,
         tip: u64,
-        safe: &SafeHead,
+        exec: &VerifiedBlock,
         keys: &[String],
     ) -> Result<(VerifiedAccount, EthAccountProof), Value> {
-        let lag = proof_lag(tip, safe.number);
+        let lag = proof_lag(tip, exec.number);
         if lag > PROVIDER_PROOF_LOOKBACK {
             return Err(rpc_err(
                 id,
@@ -1135,9 +1139,10 @@ impl Node {
                 &format!("proof window exceeded: lag {lag} > {PROVIDER_PROOF_LOOKBACK}"),
             ));
         }
+        let hash = format!("0x{}", hex::encode(exec.hash));
         let raw = self
             .up
-            .get_proof_at_safe(addr, keys, &safe.hash, safe.number)
+            .get_proof_at_safe(addr, keys, &hash, exec.number)
             .map_err(|e| {
                 self.bump_proof_fail();
                 rpc_err(
@@ -1154,17 +1159,9 @@ impl Node {
                 &format!("proof_verification_failed: {e}"),
             )
         })?;
-        let root = decode_hex_fixed::<32>(&safe.state_root).map_err(|e| {
-            self.bump_proof_fail();
-            rpc_err(
-                id.clone(),
-                ERR_STATE_ROOT,
-                &format!("state_root_mismatch: {e}"),
-            )
-        })?;
         let want = decode_hex_fixed::<20>(addr)
             .map_err(|e| rpc_err(id.clone(), ERR_PARAMS, &format!("bad address: {e}")))?;
-        let acc = verify_eth_get_proof(&root, &want, &proof).map_err(|e| {
+        let acc = verify_eth_get_proof(&exec.state_root, &want, &proof).map_err(|e| {
             self.bump_proof_fail();
             rpc_err(
                 id,
@@ -1413,6 +1410,19 @@ fn decode_qty_pad32(s: &str) -> Result<[u8; 32], String> {
     };
     let bytes = hex::decode(even).map_err(|e| format!("invalid value: {e}"))?;
     Ok(pad32(&bytes))
+}
+
+/// EIP-1898 object (and any non-string) block id is invalid, not silent Safe.
+fn wallet_block_id_str(id: Value, raw: Option<&Value>) -> Result<Option<&str>, Value> {
+    match raw {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.as_str())),
+        Some(_) => Err(rpc_err(
+            id,
+            ERR_PARAMS,
+            "block id must be a string tag or hex",
+        )),
+    }
 }
 
 /// Wallet-mode `eth_getBlockByNumber`: tag must resolve to a local verified block at or below Safe.
@@ -2041,7 +2051,6 @@ mod tests {
             wallet_get_block_by_number(Some(&safe_hash), 100, &safe_hash, &chain).map(|b| b.number),
             Some(100)
         );
-        assert!(!wallet_tag_is_safe(Some("0x1"), 100, &safe_hash));
     }
 
     #[test]

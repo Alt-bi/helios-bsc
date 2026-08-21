@@ -9,8 +9,8 @@ use anyhow::{anyhow, Result};
 use helios_bsc_consensus::{header_hash, newest_safe, Snapshot, VerifiedBlock};
 use helios_bsc_execution::{encode_data32, encode_qty, EMPTY_TRIE_ROOT, MAX_RAW_TX, TX_GAS};
 use helios_bsc_mock::{
-    cycling_sealer_chain, distinct_sealer_chain, headers_from_chain, relink_dummy_chain, MockRpc,
-    Scenario, WBNB_ADDRESS, WRONG_STATE_ROOT,
+    cycling_sealer_chain, distinct_sealer_chain, headers_from_chain, n_seal, relink_dummy_chain,
+    MockRpc, Scenario, WBNB_ADDRESS, WRONG_STATE_ROOT,
 };
 use helios_bsc_rpc::{
     ERR_INVALID, ERR_METHOD, ERR_NOT_SYNCED, ERR_PARAMS, ERR_PARSE, ERR_PROOF_FAILED,
@@ -1702,4 +1702,78 @@ fn eth_estimate_gas_unproven_name_still_proof_failed() {
     assert_ne!(err_code(&v), 3, "{v}");
     let msg = v["error"]["message"].as_str().unwrap_or("");
     assert!(msg.contains("proof_verification_failed"), "{v}");
+}
+
+#[test]
+fn get_balance_exact_safe_hex_ok() {
+    let (chain, rpc) = safe_chain_with_fixture_root();
+    let safe_n = chain[0].number;
+    let node = node_from_chain(chain, rpc.proof_json());
+    let v = node.handle(&req(
+        "eth_getBalance",
+        json!([WBNB_ADDRESS, format!("0x{safe_n:x}")]),
+    ));
+    assert!(v.get("result").is_some(), "{v}");
+}
+
+#[test]
+fn get_balance_at_safe_minus_one_when_in_chain() {
+    let rpc = MockRpc::new(Scenario::HonestFixtures);
+    let root = rpc.fixture_state_root();
+    let mut chain = distinct_sealer_chain(16);
+    for b in &mut chain {
+        b.state_root = root;
+    }
+    relink_dummy_chain(&mut chain);
+    let safe = newest_safe(&chain, n_seal()).expect("safe");
+    assert!(safe.number >= 1, "need a pre-Safe block");
+    let below = safe.number - 1;
+    assert!(
+        chain.iter().any(|b| b.number == below),
+        "safe-1 must be in-chain"
+    );
+    let node = node_from_chain(chain, rpc.proof_json());
+    let v = node.handle(&req(
+        "eth_getBalance",
+        json!([WBNB_ADDRESS, format!("0x{below:x}")]),
+    ));
+    if v.get("error").is_some() {
+        assert_ne!(err_code(&v), ERR_NOT_SYNCED, "{v}");
+    } else {
+        assert!(v.get("result").is_some(), "{v}");
+    }
+}
+
+#[test]
+fn get_balance_above_safe_not_synced() {
+    let (chain, rpc) = safe_chain_with_fixture_root();
+    let safe_n = chain[0].number;
+    let tip = chain.last().unwrap().number;
+    let node = node_from_chain(chain, rpc.proof_json());
+    let above = node.handle(&req(
+        "eth_getBalance",
+        json!([WBNB_ADDRESS, format!("0x{:x}", safe_n + 1)]),
+    ));
+    assert_eq!(err_code(&above), ERR_NOT_SYNCED, "{above}");
+    let at_tip = node.handle(&req(
+        "eth_getBalance",
+        json!([WBNB_ADDRESS, format!("0x{tip:x}")]),
+    ));
+    assert_eq!(err_code(&at_tip), ERR_NOT_SYNCED, "{at_tip}");
+}
+
+#[test]
+fn get_balance_and_eth_call_object_block_id_rejected() {
+    let (chain, rpc) = safe_chain_with_fixture_root();
+    let node = node_from_chain(chain, rpc.proof_json());
+    let bal = node.handle(&req(
+        "eth_getBalance",
+        json!([WBNB_ADDRESS, {"blockNumber": "latest"}]),
+    ));
+    assert_eq!(err_code(&bal), ERR_PARAMS, "{bal}");
+    let call = node.handle(&req(
+        "eth_call",
+        json!([{"to": WBNB_ADDRESS}, {"blockNumber": "0x0"}]),
+    ));
+    assert_eq!(err_code(&call), ERR_PARAMS, "{call}");
 }

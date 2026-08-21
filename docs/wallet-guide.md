@@ -15,7 +15,7 @@ Custom RPC URL: `http://127.0.0.1:8545` · chainId **56**.
 |----------------------|------------------------|
 | `latest` / `eth_blockNumber` | **Safe** — newest block with ≥15 distinct subsequent sealers |
 | `safe` / `finalized` | Same Safe head (MVP-1; Fast Finality not verified) |
-| Exact number/hash | Only if it is the current Safe |
+| Exact number/hash | Local verified header with `n ≤ Safe` (same as `eth_getBlockByNumber`; `latest` still maps to Safe) |
 
 Safe lag on mainnet is ~106–112 blocks (~50s), not “the last mined block”.
 

@@ -103,9 +103,10 @@ pub fn wallet_tag_is_safe(tag: Option<&str>, safe_number: u64, safe_hash: &str) 
     }
 }
 
-/// Wallet mode for `eth_getBlockByNumber`: tags map to Safe; hex heights `n <= Safe`
-/// are allowed (existence in the local verified chain is checked by the server).
-/// `pending` / `earliest` and heights above Safe are rejected.
+/// Wallet mode for `eth_getBlockByNumber` and verified state reads: tags map to
+/// Safe; hex heights `n <= Safe` are allowed (existence in the local verified
+/// chain is checked by the server). `pending` / `earliest` and heights above
+/// Safe are rejected.
 pub fn wallet_block_number_allowed(
     tag: Option<&str>,
     safe_number: u64,
@@ -190,7 +191,8 @@ mod tests {
         );
         assert!(!wallet_tag_is_safe(Some("pending"), 100, "0xabc"));
         assert!(!wallet_tag_is_safe(Some("earliest"), 100, "0xabc"));
-        // Balances stay exact-Safe: 0x1 is still rejected there.
+        // Exact-Safe helper still rejects other heights (state reads use this
+        // `wallet_block_number_allowed` path, not `wallet_tag_is_safe`).
         assert!(!wallet_tag_is_safe(Some("0x1"), 100, "0xabc"));
     }
 
