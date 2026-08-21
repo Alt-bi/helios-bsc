@@ -1613,7 +1613,7 @@ fn bind_optional_status(v: Option<&Value>) -> Result<(), String> {
     }
 }
 
-/// Unverified fee oracles: hex quantity or a JSON object (`eth_feeHistory`).
+/// Unverified fee oracles: known methods only; hex qty or `eth_feeHistory` object.
 fn bind_fee_result(method: &str, v: &Value) -> Result<(), String> {
     match method {
         "eth_gasPrice" | "eth_maxPriorityFeePerGas" | "eth_blobBaseFee" => {
@@ -1632,10 +1632,21 @@ fn bind_fee_result(method: &str, v: &Value) -> Result<(), String> {
             bind_qty_array(o.get("baseFeePerBlobGas"), "baseFeePerBlobGas")?;
             match o.get("gasUsedRatio") {
                 None | Some(Value::Null) => {}
-                Some(Value::Array(a)) if a.len() > MAX_FEE_HISTORY_ITEMS => {
-                    return Err("too many gasUsedRatio".into());
+                Some(Value::Array(a)) => {
+                    if a.len() > MAX_FEE_HISTORY_ITEMS {
+                        return Err("too many gasUsedRatio".into());
+                    }
+                    for x in a {
+                        let ok = match x {
+                            Value::Number(n) => n.as_f64().is_some(),
+                            Value::String(s) => s.parse::<f64>().is_ok(),
+                            _ => false,
+                        };
+                        if !ok {
+                            return Err("gasUsedRatio element is not a number".into());
+                        }
+                    }
                 }
-                Some(Value::Array(_)) => {}
                 Some(_) => return Err("gasUsedRatio is not an array".into()),
             }
             match o.get("reward") {
@@ -1652,7 +1663,7 @@ fn bind_fee_result(method: &str, v: &Value) -> Result<(), String> {
             }
             Ok(())
         }
-        _ => Ok(()),
+        _ => Err(format!("unknown fee method: {method}")),
     }
 }
 
@@ -2279,6 +2290,19 @@ mod tests {
         assert!(err.contains("too many"), "{err}");
         let err = bind_fee_result("eth_feeHistory", &json!({"reward": [[true]]})).unwrap_err();
         assert!(err.contains("reward"), "{err}");
+        assert!(
+            bind_fee_result("eth_feeHistory", &json!({"gasUsedRatio": [0.5, "0.25", 1]})).is_ok()
+        );
+        for bad in [json!([true]), json!([{}]), json!([[0.1]]), json!([false])] {
+            let err = bind_fee_result("eth_feeHistory", &json!({"gasUsedRatio": bad})).unwrap_err();
+            assert!(err.contains("gasUsedRatio"), "{err}");
+        }
+        let too_ratio: Vec<Value> = (0..=MAX_FEE_HISTORY_ITEMS).map(|_| json!(0.5)).collect();
+        let err =
+            bind_fee_result("eth_feeHistory", &json!({"gasUsedRatio": too_ratio})).unwrap_err();
+        assert!(err.contains("too many"), "{err}");
+        let err = bind_fee_result("eth_unknownFee", &json!("0x1")).unwrap_err();
+        assert!(err.contains("unknown"), "{err}");
     }
 
     #[test]

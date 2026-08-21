@@ -766,6 +766,12 @@ fn filters_and_subscribe_unsupported() {
         "eth_getLogs",
         "eth_getBlockTransactionCountByNumber",
         "eth_getTransactionByBlockHashAndIndex",
+        "eth_newPendingTransactionFilter",
+        "eth_uninstallFilter",
+        "eth_getFilterLogs",
+        "eth_unsubscribe",
+        "eth_getBlockTransactionCountByHash",
+        "eth_getTransactionByBlockNumberAndIndex",
     ] {
         let v = node.handle(&req(m, json!([])));
         assert_eq!(err_code(&v), ERR_METHOD, "{m}: {v}");
@@ -1288,4 +1294,37 @@ fn gas_price_passthrough_with_flag() {
     let st = node.handle(&req("helios_bsc_syncStatus", json!([])));
     assert_eq!(st["result"]["unverifiedPassthrough"], json!(true));
     assert_eq!(st["result"]["safeLagWithinBound"], json!(true));
+}
+
+#[test]
+fn blob_base_fee_passthrough_with_flag() {
+    let chain = distinct_sealer_chain(15);
+    let off = Node::from_parts(
+        Box::new(MockUpstream::for_chain(&chain, json!({}))),
+        130,
+        chain.clone(),
+    );
+    let v = off.handle(&req("eth_blobBaseFee", json!([])));
+    assert_eq!(err_code(&v), ERR_METHOD);
+
+    let mut up = MockUpstream::for_chain(&chain, json!({}));
+    up.unverified = json!("0x12a05f200");
+    let mut node = Node::from_parts(Box::new(up), 130, chain.clone());
+    node.set_allow_unverified_passthrough(true);
+    let v = node.handle(&req("eth_blobBaseFee", json!([])));
+    assert_eq!(v["result"], json!("0x12a05f200"));
+
+    let mut obj_up = MockUpstream::for_chain(&chain, json!({}));
+    obj_up.unverified = json!({"blobBaseFee": "0x1"});
+    let mut obj_node = Node::from_parts(Box::new(obj_up), 130, chain.clone());
+    obj_node.set_allow_unverified_passthrough(true);
+    let obj = obj_node.handle(&req("eth_blobBaseFee", json!([])));
+    assert_eq!(err_code(&obj), ERR_PARAMS, "{obj}");
+
+    let mut bad_up = MockUpstream::for_chain(&chain, json!({}));
+    bad_up.unverified = json!("not-hex");
+    let mut bad_node = Node::from_parts(Box::new(bad_up), 130, chain);
+    bad_node.set_allow_unverified_passthrough(true);
+    let bad = bad_node.handle(&req("eth_blobBaseFee", json!([])));
+    assert_eq!(err_code(&bad), ERR_PARAMS, "{bad}");
 }
