@@ -23,7 +23,7 @@ use thiserror::Error;
 
 /// geth RPC gas cap used for `eth_call`.
 pub const CALL_GAS_CAP: u64 = 50_000_000;
-/// Max prove-and-retry rounds (initial `to`/`from`/coinbase plus misses).
+/// Max miss-retry proof fetches. Seed of `to`/`from`/coinbase is not charged.
 pub const MAX_PROOF_ROUNDS: u32 = 8;
 /// Max distinct accounts loaded into [`ProofDb`] for one call.
 pub const MAX_CALL_ACCOUNTS: usize = 32;
@@ -65,8 +65,13 @@ pub struct CallBlock {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Miss {
     Account([u8; 20]),
-    Storage { address: [u8; 20], slot: [u8; 32] },
+    Storage {
+        address: [u8; 20],
+        slot: [u8; 32],
+    },
     BlockHash(u64),
+    /// Bytecode for this `keccak256(code)` was never loaded.
+    CodeHash([u8; 32]),
 }
 
 #[derive(Debug, Error)]
@@ -256,7 +261,7 @@ impl Database for ProofDb {
         self.codes
             .get(&code_hash)
             .cloned()
-            .ok_or(CallError::Invalid("code hash"))
+            .ok_or(CallError::Missing(Miss::CodeHash(code_hash.0)))
     }
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
@@ -438,7 +443,6 @@ fn seed_call_accounts<P: ProveAtSafe>(
     db: &mut ProofDb,
     block: &CallBlock,
     tx: &CallTx,
-    rounds: &mut u32,
 ) -> Result<(), CallError> {
     let mut seen: Vec<[u8; 20]> = Vec::with_capacity(3);
     for address in [tx.to, tx.from, block.beneficiary] {
@@ -450,7 +454,6 @@ fn seed_call_accounts<P: ProveAtSafe>(
         }
         seen.push(address);
         fetch_and_load(prover, db, block, &address, &[])?;
-        *rounds += 1;
     }
     Ok(())
 }
@@ -482,6 +485,9 @@ fn transact_call_proven<P: ProveAtSafe>(
             Err(CallError::Missing(Miss::BlockHash(n))) => {
                 return Err(CallError::Missing(Miss::BlockHash(n)));
             }
+            Err(CallError::Missing(Miss::CodeHash(h))) => {
+                return Err(CallError::Missing(Miss::CodeHash(h)));
+            }
             Err(CallError::Missing(miss)) => {
                 if *rounds >= MAX_PROOF_ROUNDS {
                     return Err(CallError::Budget);
@@ -497,7 +503,7 @@ fn transact_call_proven<P: ProveAtSafe>(
                             return Err(CallError::Missing(Miss::Storage { address, slot }));
                         }
                     }
-                    Miss::BlockHash(_) => unreachable!(),
+                    Miss::BlockHash(_) | Miss::CodeHash(_) => unreachable!(),
                 }
             }
             Err(e) => return Err(e),
@@ -531,7 +537,7 @@ pub fn eth_call_verified<P: ProveAtSafe>(
     let mut db = ProofDb::new();
     db.seed_block_hashes(block);
     let mut rounds = 0u32;
-    seed_call_accounts(prover, &mut db, block, tx, &mut rounds)?;
+    seed_call_accounts(prover, &mut db, block, tx)?;
     execution_output(transact_call_proven(
         prover,
         &mut db,
@@ -604,7 +610,7 @@ pub fn eth_estimate_gas_verified<P: ProveAtSafe>(
     let mut db = ProofDb::new();
     db.seed_block_hashes(block);
     let mut rounds = 0u32;
-    seed_call_accounts(prover, &mut db, block, tx, &mut rounds)?;
+    seed_call_accounts(prover, &mut db, block, tx)?;
     estimate_gas_search(prover, &mut db, block, tx, &mut rounds)
 }
 
@@ -612,7 +618,7 @@ pub fn eth_estimate_gas_verified<P: ProveAtSafe>(
 mod tests {
     use super::*;
     use crate::{encode_data32, encode_qty, verify_eth_get_proof};
-    use helios_bsc_types::{decode_hex, decode_hex_fixed};
+    use helios_bsc_types::{decode_hex, decode_hex_fixed, keccak256};
     use serde::Deserialize;
     use std::path::PathBuf;
 
@@ -700,6 +706,147 @@ mod tests {
         db.insert_account(address, 0, [0u8; 32], EMPTY_TRIE_ROOT, &[]);
     }
 
+    fn rlp_len_be(len: usize) -> Vec<u8> {
+        let be = (len as u64).to_be_bytes();
+        let start = be.iter().position(|&b| b != 0).unwrap_or(be.len() - 1);
+        be[start..].to_vec()
+    }
+
+    fn rlp_bytes(data: &[u8]) -> Vec<u8> {
+        if data.len() == 1 && data[0] < 0x80 {
+            return data.to_vec();
+        }
+        if data.len() <= 55 {
+            let mut o = Vec::with_capacity(1 + data.len());
+            o.push(0x80 + data.len() as u8);
+            o.extend_from_slice(data);
+            o
+        } else {
+            let lenb = rlp_len_be(data.len());
+            let mut o = Vec::with_capacity(1 + lenb.len() + data.len());
+            o.push(0xb7 + lenb.len() as u8);
+            o.extend_from_slice(&lenb);
+            o.extend_from_slice(data);
+            o
+        }
+    }
+
+    fn rlp_list(items: &[Vec<u8>]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        for i in items {
+            payload.extend_from_slice(i);
+        }
+        if payload.len() <= 55 {
+            let mut o = vec![0xc0 + payload.len() as u8];
+            o.extend_from_slice(&payload);
+            o
+        } else {
+            let lenb = rlp_len_be(payload.len());
+            let mut o = Vec::with_capacity(1 + lenb.len() + payload.len());
+            o.push(0xf7 + lenb.len() as u8);
+            o.extend_from_slice(&lenb);
+            o.extend_from_slice(&payload);
+            o
+        }
+    }
+
+    /// Single-leaf account trie: `address` is present; any other address is exclusion.
+    fn single_leaf_account(
+        address: [u8; 20],
+        code: &[u8],
+        storage_root: [u8; 32],
+    ) -> ([u8; 32], EthAccountProof) {
+        let code_hash = keccak256(code);
+        let account = rlp_list(&[
+            rlp_bytes(&[1]),
+            rlp_bytes(&[]),
+            rlp_bytes(&storage_root),
+            rlp_bytes(&code_hash),
+        ]);
+        let mut hp = vec![0x20];
+        hp.extend_from_slice(&keccak256(&address));
+        let leaf = rlp_list(&[rlp_bytes(&hp), rlp_bytes(&account)]);
+        let state_root = keccak256(&leaf);
+        let proof = EthAccountProof {
+            address: format!("0x{}", hex::encode(address)),
+            account_proof: vec![format!("0x{}", hex::encode(leaf))],
+            balance: "0x0".into(),
+            code_hash: format!("0x{}", hex::encode(code_hash)),
+            nonce: "0x1".into(),
+            storage_hash: format!("0x{}", hex::encode(storage_root)),
+            storage_proof: vec![],
+        };
+        (state_root, proof)
+    }
+
+    /// Serves a single-leaf proof for `to` (inclusion) and exclusion for anyone else.
+    struct CountingProver {
+        to: [u8; 20],
+        proof: EthAccountProof,
+        code: Vec<u8>,
+        fetches: std::cell::Cell<u32>,
+    }
+
+    impl ProveAtSafe for CountingProver {
+        fn get_proof(
+            &self,
+            address: &[u8; 20],
+            _slots: &[[u8; 32]],
+            _block_hash: &[u8; 32],
+            _block_number: u64,
+        ) -> Result<EthAccountProof, CallError> {
+            self.fetches.set(self.fetches.get() + 1);
+            if address == &self.to {
+                let mut proof = self.proof.clone();
+                proof.storage_proof.clear();
+                return Ok(proof);
+            }
+            Ok(EthAccountProof {
+                address: format!("0x{}", hex::encode(address)),
+                account_proof: self.proof.account_proof.clone(),
+                balance: "0x0".into(),
+                code_hash: format!("0x{}", hex::encode([0u8; 32])),
+                nonce: "0x0".into(),
+                storage_hash: format!("0x{}", hex::encode([0u8; 32])),
+                storage_proof: vec![],
+            })
+        }
+
+        fn get_code(
+            &self,
+            address: &[u8; 20],
+            _block_hash: &[u8; 32],
+            _block_number: u64,
+        ) -> Result<Vec<u8>, CallError> {
+            if address == &self.to {
+                Ok(self.code.clone())
+            } else {
+                Err(CallError::Missing(Miss::Account(*address)))
+            }
+        }
+    }
+
+    fn miss_addr(i: u8) -> [u8; 20] {
+        let mut a = [0xeeu8; 20];
+        a[19] = i;
+        a
+    }
+
+    /// CALL `n` distinct non-precompile addresses (each a miss after seed).
+    fn call_n_addrs(n: u8) -> Vec<u8> {
+        let mut code = Vec::new();
+        for i in 0..n {
+            code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00]);
+            code.push(0x73);
+            code.extend_from_slice(&miss_addr(i));
+            code.extend_from_slice(&[0x61, 0x20, 0x00]);
+            code.push(0xf1);
+            code.push(0x50);
+        }
+        code.push(0x00);
+        code
+    }
+
     #[test]
     fn revm_returns_constant_from_inserted_account() {
         let from = [0x11u8; 20];
@@ -717,6 +864,113 @@ mod tests {
         let mut want = [0u8; 32];
         want[31] = 0x2a;
         assert_eq!(out, want);
+    }
+
+    #[test]
+    fn unknown_code_hash_is_missing_not_invalid() {
+        let from = [0x11u8; 20];
+        let to = [0x22u8; 20];
+        let mut db = ProofDb::new();
+        insert_eoa(&mut db, from);
+        insert_eoa(&mut db, [0u8; 20]);
+        db.insert_account(to, 1, [0u8; 32], EMPTY_TRIE_ROOT, &RETURN_42_FULL);
+        let code_hash = db.accounts.get(&Address::from(to)).unwrap().info.code_hash;
+        db.codes.remove(&code_hash);
+        if let Some(acc) = db.accounts.get_mut(&Address::from(to)) {
+            acc.info.code = None;
+        }
+        let err = eth_call_with_db(
+            &mut db,
+            &sample_block([0u8; 32]),
+            &call_tx(from, to, vec![]),
+        )
+        .unwrap_err();
+        match err {
+            CallError::Missing(Miss::CodeHash(h)) => assert_eq!(h, code_hash.0),
+            CallError::Invalid(_) => panic!("code hash miss must not be Invalid"),
+            other => panic!("expected Missing(CodeHash), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn seed_three_then_storage_miss_is_not_budget() {
+        let from = [0x11u8; 20];
+        let to = [0x22u8; 20];
+        let beneficiary = [0x33u8; 20];
+        let (root, proof) = single_leaf_account(to, &SLOAD0_RETURN, [0x01u8; 32]);
+        let prover = CountingProver {
+            to,
+            proof,
+            code: SLOAD0_RETURN.to_vec(),
+            fetches: std::cell::Cell::new(0),
+        };
+        let mut block = sample_block(root);
+        block.beneficiary = beneficiary;
+        let err = eth_call_verified(&prover, &block, &call_tx(from, to, vec![])).unwrap_err();
+        match err {
+            CallError::Missing(Miss::Storage { address, slot }) => {
+                assert_eq!(address, to);
+                assert_eq!(slot, [0u8; 32]);
+            }
+            CallError::Budget => panic!("seed must not consume miss budget"),
+            other => panic!("expected Missing storage, got {other:?}"),
+        }
+        assert_eq!(
+            prover.fetches.get(),
+            4,
+            "spy must see 3 seed fetches + 1 storage miss, not Budget"
+        );
+    }
+
+    #[test]
+    fn seed_does_not_reduce_miss_retry_budget() {
+        let from = [0x11u8; 20];
+        let to = [0x22u8; 20];
+        let beneficiary = [0x33u8; 20];
+        let code = call_n_addrs(MAX_PROOF_ROUNDS as u8);
+        let (root, proof) = single_leaf_account(to, &code, EMPTY_TRIE_ROOT);
+        let prover = CountingProver {
+            to,
+            proof,
+            code,
+            fetches: std::cell::Cell::new(0),
+        };
+        let mut block = sample_block(root);
+        block.beneficiary = beneficiary;
+        let tx = CallTx {
+            from,
+            to,
+            data: vec![],
+            value: [0u8; 32],
+            gas: Some(1_000_000),
+        };
+        eth_call_verified(&prover, &block, &tx).expect("8 miss-retries after seed");
+        assert_eq!(
+            prover.fetches.get(),
+            3 + MAX_PROOF_ROUNDS,
+            "3 seed + 8 miss fetches"
+        );
+
+        let code9 = call_n_addrs(MAX_PROOF_ROUNDS as u8 + 1);
+        let (root9, proof9) = single_leaf_account(to, &code9, EMPTY_TRIE_ROOT);
+        let prover9 = CountingProver {
+            to,
+            proof: proof9,
+            code: code9,
+            fetches: std::cell::Cell::new(0),
+        };
+        let mut block9 = sample_block(root9);
+        block9.beneficiary = beneficiary;
+        let err = eth_call_verified(&prover9, &block9, &tx).unwrap_err();
+        match err {
+            CallError::Budget => {}
+            other => panic!("9th miss-retry must be Budget, got {other:?}"),
+        }
+        assert_eq!(
+            prover9.fetches.get(),
+            3 + MAX_PROOF_ROUNDS,
+            "9th miss is Budget without another fetch"
+        );
     }
 
     #[test]
