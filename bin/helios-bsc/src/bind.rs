@@ -110,5 +110,14 @@ mod tests {
         assert_eq!(rpc_http_host_reject(Some("evil.example"), true), Some(403));
         assert_eq!(rpc_http_host_reject(None, true), Some(403));
         assert_eq!(rpc_http_host_reject(Some("evil.example"), false), None);
+        assert_eq!(
+            rpc_http_host_reject(Some("localhost.evil.com"), true),
+            Some(403)
+        );
+        assert_eq!(
+            rpc_http_host_reject(Some("127.0.0.1.nip.io"), true),
+            Some(403)
+        );
+        assert_eq!(rpc_http_host_reject(Some(""), true), Some(403));
     }
 }

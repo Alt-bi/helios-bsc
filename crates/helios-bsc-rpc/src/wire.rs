@@ -71,9 +71,11 @@ pub enum BlockId {
 
 /// Wallet mode: `latest` / `safe` / `finalized` / omitted → local Safe.
 /// Hex number or hash allowed only if it is exactly the local Safe head.
+/// `pending` / `earliest` are never Safe (error, not genesis).
 pub fn wallet_tag_is_safe(tag: Option<&str>, safe_number: u64, safe_hash: &str) -> bool {
     match tag {
         None | Some("") | Some("latest") | Some("safe") | Some("finalized") => true,
+        Some("pending") | Some("earliest") => false,
         Some(t) if t.eq_ignore_ascii_case(safe_hash) => true,
         Some(t) if t.starts_with("0x") || t.starts_with("0X") => {
             parse_hex_u64(t).is_some_and(|n| n == safe_number)
@@ -84,7 +86,7 @@ pub fn wallet_tag_is_safe(tag: Option<&str>, safe_number: u64, safe_hash: &str) 
 
 /// Wallet mode for `eth_getBlockByNumber`: tags map to Safe; hex heights `n <= Safe`
 /// are allowed (existence in the local verified chain is checked by the server).
-/// `pending` and heights above Safe are rejected.
+/// `pending` / `earliest` and heights above Safe are rejected.
 pub fn wallet_block_number_allowed(
     tag: Option<&str>,
     safe_number: u64,
@@ -92,7 +94,7 @@ pub fn wallet_block_number_allowed(
 ) -> Option<BlockId> {
     match tag {
         None | Some("") | Some("latest") | Some("safe") | Some("finalized") => Some(BlockId::Safe),
-        Some("pending") => None,
+        Some("pending") | Some("earliest") => None,
         Some(t) if t.eq_ignore_ascii_case(safe_hash) => Some(BlockId::Safe),
         Some(t) if t.starts_with("0x") || t.starts_with("0X") => {
             parse_hex_u64(t).and_then(|n| (n <= safe_number).then_some(BlockId::Number(n)))
@@ -163,6 +165,12 @@ mod tests {
             wallet_block_number_allowed(Some("pending"), 100, "0xabc"),
             None
         );
+        assert_eq!(
+            wallet_block_number_allowed(Some("earliest"), 100, "0xabc"),
+            None
+        );
+        assert!(!wallet_tag_is_safe(Some("pending"), 100, "0xabc"));
+        assert!(!wallet_tag_is_safe(Some("earliest"), 100, "0xabc"));
         // Balances stay exact-Safe: 0x1 is still rejected there.
         assert!(!wallet_tag_is_safe(Some("0x1"), 100, "0xabc"));
     }

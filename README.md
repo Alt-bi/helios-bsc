@@ -6,7 +6,8 @@ Inspired by [a16z/helios](https://github.com/a16z/helios) for Ethereum. BSC has 
 
 | | |
 |--|--|
-| **Status** | **Demo Slice** — seals + Safe + MPT; local RPC `helios-bsc run` (header-verified `eth_getBlock*`) |
+| **Status** | **Demo Slice closed.** 1h re-diff soak GATE PASS (2026-08-19). **24h soak** is still the MVP-1 GA live gate. |
+| **Repo** | https://github.com/Alt-bi/helios-bsc |
 | **License** | MIT OR Apache-2.0 |
 | **Design** | [docs/design.md](docs/design.md) · [RPC matrix](docs/rpc-matrix.md) · [wallet guide](docs/wallet-guide.md) · [checkpoints](docs/checkpointing.md) · [SLOs](docs/slo.md) · [threat model](docs/threat-model.md) |
 | **Chain** | BSC mainnet (`chainId` 56) |
@@ -86,7 +87,7 @@ Soak vs an independent oracle (not the proof upstream):
 
 ```bash
 # MPT-verified, no local RPC server. Retries skipped addresses after recatch.
-# Demo Slice gate: --min-unique 10. Stretch 1h: --duration-secs 3600
+# Demo Slice gate: --min-unique 10. 1h re-diff closed 2026-08-19; 24h still for GA.
 cargo run -p helios-bsc -- soak --oracle https://bsc-mainnet.public.blastapi.io --once --min-unique 10
 
 # or loop a running helios-bsc RPC
@@ -95,12 +96,12 @@ python scripts/soak_vs_oracle.py --once
 
 ## Roadmap (short)
 
-1. **Phase 0** — hardfork pin, fixtures, proof provider matrix (hash/number or Alt F)
-2. **Demo Slice** — checkpoint → seals → Safe → verified `eth_getBalance`
-3. **MVP-1** — more verified reads + unverified `eth_sendRawTransaction`
-4. **MVP-2** — Fast Finality (if RPC exposes votes), constrained `eth_call`
+1. **Phase 0** — **done** (hardfork pin, epoch fixtures, proof provider matrix)
+2. **Demo Slice** — **closed** (checkpoint → seals → Safe → verified `eth_getBalance`; 1h re-diff soak GATE PASS 2026-08-19: unique=19, compared=214, match=214, mismatch=0, skip=38)
+3. **MVP-1** — verified nonce/code/storageAt + unverified `eth_sendRawTransaction` **in tree**; **≥24h soak still the GA live gate**. Not implemented (no fixtures): out-of-turn backoff, Maxwell FF recents prune, EIP-1559 parent `baseFee` formulas.
+4. **MVP-2** — Fast Finality BLS, constrained `eth_call` — **not** this close-out
 
-Honest calendar: **months** of part-time work, not a weekend. See design doc.
+Honest calendar: **months** of part-time work, not a weekend. See design doc. Pasteur (2026-08-25) is scheduled, not live.
 
 ## Deploy note
 
@@ -116,5 +117,5 @@ Default bind is loopback (`127.0.0.1:8545`). For LAN/VPN exposure use a reverse 
 
 ## Community
 
-Independent open-source track (MIT OR Apache-2.0). Optional discussion with Helios maintainers only **after** a solid public Demo Slice.
+Public repo: [github.com/Alt-bi/helios-bsc](https://github.com/Alt-bi/helios-bsc) (MIT OR Apache-2.0). See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md). Optional discussion with Helios maintainers only **after** a solid public Demo Slice.
 

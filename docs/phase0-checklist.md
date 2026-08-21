@@ -39,4 +39,4 @@ From a ≤24h multisource checkpoint: sync → Safe → verified `eth_getBalance
 - [x] `eth_blockNumber` → Safe height.
 - [x] Zero silent passthrough (CI `helios-bsc-mock` + `Node::handle`).
 - [x] Phase 0 gates (hardfork pin, epoch fixtures, appendix, proof matrix **partial**: Ankr number ≤~108 vs Safe 106–112).
-- [x] ≥10 mainnet addresses vs **independent** oracle (live 2026-08-19: **19 unique / 214 compared / 0 mismatch**, Ankr vs BlastAPI, **≥1h** re-diff soak).
+- [x] ≥10 mainnet addresses vs **independent** oracle (live 2026-08-19: **19 unique / 214 compared / 0 mismatch**, Ankr vs BlastAPI, **≥1h** re-diff soak). **Not claimed:** 24h soak (still the MVP-1 GA live gate). Pasteur (2026-08-25) is scheduled, not live.

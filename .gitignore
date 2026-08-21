@@ -10,6 +10,7 @@
 *.pdb
 checkpoint.json
 last-verified.json
+req.json
 **/__pycache__/
 *.pyc
 # Grant application drafts — never publish

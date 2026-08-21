@@ -1,6 +1,6 @@
 # helios-bsc status
 
-**Updated:** 2026-08-19
+**Updated:** 2026-08-20
 
 | Milestone | State |
 |-----------|--------|
@@ -22,27 +22,29 @@
 | Adversarial mock (PR 10) | **Done** — `helios-bsc-mock` + `RpcUpstream` trait; `Node::handle` fail-closed on lying seals/proofs/parent/`stateRoot`; 14-sealer ≠ Safe; `eth_call` stays `-32601`. |
 | Checkpoint / sealing-set (PR 13 slice) | **Done** — `--checkpoint` + persist + multisource + `verify-checkpoint`. Persist is **tmp+rename**. Sealing-set addresses must be unique 20-byte values; hash/parentHash/stateRoot 32 bytes. `--max-sync` 16000 (~2h) for restart from last-verified. Lookback 130 is the no-checkpoint Safe window only. Reorg/link-break resyncs lookback or replays the origin checkpoint. |
 | Soak (PR 14) | **Done (code + live ≥10 + 1h re-diff)** — unique recatch/retry; nonce vs oracle when historical nonce exists. Duration soak **re-diffs the full list** after unique is full (`visit_all`; re-matches are not empty bursts). Live 2026-08-19 Ankr vs BlastAPI: smoke **unique=10**; idle 1h **unique=19 / compared=19**; re-diff 1h **GATE PASS unique=19 compared=214 match=214 mismatch=0 skip=38** (13 rounds; Ankr window skips, not mismatches). |
-| Bind policy | **Done** — default loopback; `--allow-non-loopback` for LAN (warns: no in-process auth). Docker: `Dockerfile` + `compose.yaml` publish **127.0.0.1:8545** only (`docs/deploy.md`). JSON-RPC HTTP is **POST-only**, body capped at 1 MiB. Loopback `Host` required (403 on DNS-rebinding Host); no CORS `*`. |
+| Bind policy | **Done** — default loopback; `--allow-non-loopback` for LAN (warns: no in-process auth). Docker: `Dockerfile` + `compose.yaml` publish **127.0.0.1:8545** only (`docs/deploy.md`). JSON-RPC HTTP is **POST-only**, body capped at 1 MiB. Loopback `Host` required (403 on DNS-rebinding Host); no CORS `*`. Content-Type missing/JSON ok; `text/html` / form → **415**. |
 | Data-plane backup | **Done** — `--backup` / `HELIOS_BSC_BACKUP`: transport failover if the primary RPC errors. Both untrusted; seals/MPT still apply. Soak backup must not be the oracle host. |
 | Header.Hash() | **Done** — keccak256(RLP(header)) vs RPC `hash` on every sealed header (v1.7.8 `Header.Hash()` / `gen_header_rlp.go`). Re-fetch / persist / checkpoint match the computed hash, not the JSON field. |
 | Sync counters | **Done** — `syncStatus.proofOk` / `proofFail` / `headersVerified` (process lifetime). |
 | Demo Slice | **Vertical closed:** Safe=15, wallet `latest`→Safe, WBNB MPT, `verify-checkpoint` GATE PASS, soak **19 unique / 214 compared / 0 mismatch** vs BlastAPI over **≥1h** re-diff. Wallet guide: `docs/wallet-guide.md`. |
 | Operator doctor | **Done** — `helios-bsc doctor` prints RPC **hosts** only (no keys); Pasteur countdown; checkpoint age without the sealing-set list. |
 | `syncStatus` lag fields | **Done** — `safeLagBlocks` / `safeLagSeconds` + `finality=confirmation-depth` (Demo Slice DoD). |
-| Pasteur profile | **Done** — `params_at` names `pasteur` at unix `1787625000`; extraData/epoch/turnLength unchanged vs Fermi until re-pin. |
+| Pasteur profile | **Named, not live** — `params_at` names `pasteur` at unix `1787625000` (2026-08-25); extraData/epoch/turnLength unchanged vs Fermi until re-pin. |
 | Checkpoint from epoch extraData | **Done** — `write-checkpoint --sealing-set-from-epoch` (activated extraData only; not miners). |
-| Unverified passthrough (opt-in) | **Done** — `--allow-unverified-passthrough`: receipts/txs header-bound to Safe **and** to the requested 32-byte hash; `chainId`=56, address fields, `status` ∈ {0,1}, structural `logs[]`. Fee oracles: hex qty / feeHistory object. Default still `-32601`. `eth_getProof` ≤64 storage keys; served fields overwritten from the verified account. Account methods reject non-20-byte addresses locally. |
+| Unverified passthrough (opt-in) | **Done** — `--allow-unverified-passthrough`: receipts/txs header-bound to Safe **and** to the requested 32-byte hash; `chainId`=56, address fields including `contractAddress`, `status` ∈ {0,1}, structural `logs[]`, `input`/`data` ≤512 KiB, `logsBloom` 256 B. Fee oracles: hex qty / feeHistory object (arrays ≤1024). Default still `-32601`. `eth_getProof` ≤64 storage keys (hex ≤32 B, validated before fetch); served fields overwritten from the verified account. Account methods reject non-20-byte addresses locally. `pending`/`earliest` rejected. |
 | Operator SLOs | **Done** — `docs/slo.md`; `doctor` slo=ok/warn/fail; `syncStatus.safeLagWithinBound`. |
 | In-turn difficulty | **Done** — range on all headers; `inturn_validator` on checkpoint walks (padded fixture sets cannot satisfy live in-turn). |
 | SignRecently (Bohr recents) | **Done** — `seenTimes >= turnLength` in `minerHistoryCheckLen`; recents cleared on set switch. No Maxwell FF prune. |
 | Unsealed header fields | **Done** — empty uncles, gasUsed/gasLimit, Lorentz mixDigest ms, Bohr zero `parentBeaconRoot`, extraData ≤100KiB, empty `withdrawalsRoot`, `header.Time ≤ now+15s`, Parlia nonce empty. Epoch extraData must parse (n≥1 **unique** validators, Bohr `turnLength` 1..=64); membership still needs `--checkpoint`. |
 | Cascading parent fields | **Done** — `MilliTimestamp ≥ parent + BlockInterval` (Ramanujan floor, no out-of-turn backoff); Lorentz+ gasLimit bound `parent/1024`, min 5000. Fixture 998→999 is exactly 450ms. |
+| Header-verify remaining | **Not implemented** (no fixtures; do not claim done): **out-of-turn backoff**, **Maxwell FF recents prune**, **EIP-1559 parent `baseFee` formulas**. |
 
 ## Next engineering steps
 
-1. MVP-1 GA still wants **≥24h** soak, mismatch=0 (1h re-diff is closed).
-2. Re-pin after Pasteur (2026-08-25) if extraData / epoch / turnLength change.
-3. Constrained `eth_call` (MVP-2). Deeper RPC (≥128) still helps if proofs start failing.
+1. **≥24h** mainnet differential soak, mismatch=0 — still the **MVP-1 GA live gate**. 1h re-diff 2026-08-19 is closed (Ankr vs BlastAPI: unique=19, compared=214, match=214, mismatch=0, skip=38 Ankr window, not false-accept).
+2. Re-pin after Pasteur (**2026-08-25**, scheduled, **not live**) if extraData / epoch / turnLength change.
+3. Remaining header-verify items that still lack fixtures: **out-of-turn backoff**, **Maxwell FF recents prune**, **EIP-1559 parent `baseFee` formulas**. Not implemented — do not invent from prose.
+4. MVP-2: constrained `eth_call` and Fast Finality BLS — **not** this close-out. Deeper RPC (≥128) still helps if proofs start failing.
 
 ## Live pins (do not assume design-doc 16)
 
@@ -52,4 +54,5 @@
 | turnLength | **8** |
 | N_seal | 21 |
 | minerHistoryCheckLen | 87 |
-| Safe lag | ~108–112 live / 120 in-turn upper |
+| proof window | 112 |
+| Safe lag | ~106–112 live / 120 in-turn upper |

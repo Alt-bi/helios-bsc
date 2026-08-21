@@ -547,6 +547,7 @@ mod tests {
     struct ReorgUp {
         tip: u64,
         honest: Vec<RpcBlockHeader>,
+        lie_parent: bool,
     }
 
     impl crate::upstream::RpcUpstream for ReorgUp {
@@ -569,7 +570,7 @@ mod tests {
         }
         fn headers_range(&self, from: u64, to: u64) -> Result<Vec<RpcBlockHeader>> {
             // First catch-up append: lie about parent so the stitch fails.
-            if from == 116_664_001 {
+            if self.lie_parent && from == 116_664_001 {
                 let mut h = self.honest[3].clone();
                 h.parent_hash = format!("0x{}", hex::encode([0x11u8; 32]));
                 return Ok(vec![h]);
@@ -610,12 +611,31 @@ mod tests {
         let up = ReorgUp {
             tip: 116_664_002,
             honest,
+            lie_parent: true,
         };
         let tip = catch_up(&up, &mut chain, 5, 5, None).expect("resync");
         assert_eq!(tip, 116_664_002);
         assert_eq!(chain.first().unwrap().number, 116_663_998);
         assert_eq!(chain.last().unwrap().number, 116_664_002);
         assert_eq!(chain.len(), 5);
+    }
+
+    #[test]
+    fn catch_up_parent_break_no_overlap_fail_closed() {
+        let honest = load_chain();
+        let mut chain: Vec<_> = (0..21).map(|i| lite(116_663_980 + i, 0xff)).collect();
+        assert_eq!(chain.last().unwrap().number, 116_664_000);
+        let before = chain.clone();
+        let up = ReorgUp {
+            tip: 116_664_002,
+            honest,
+            lie_parent: false,
+        };
+        let err = catch_up(&up, &mut chain, 5, 5, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("21"), "{err}");
+        assert_eq!(chain, before);
     }
 
     fn lite(n: u64, marker: u8) -> VerifiedBlock {

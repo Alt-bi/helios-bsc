@@ -653,18 +653,10 @@ impl Node {
         if let Err(e) = require_rpc_address(addr) {
             return rpc_err(id, ERR_PARAMS, &e);
         }
-        let keys: Vec<String> = match params.get(1) {
-            None | Some(Value::Null) => Vec::new(),
-            Some(Value::Array(a)) => a
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect(),
-            Some(_) => return rpc_err(id, ERR_PARAMS, "storage keys must be an array"),
+        let keys = match parse_storage_keys(params.get(1)) {
+            Ok(k) => k,
+            Err(e) => return rpc_err(id, ERR_PARAMS, &e),
         };
-        if keys.len() > MAX_PROOF_STORAGE_KEYS {
-            return rpc_err(id, ERR_PARAMS, "too many storage keys");
-        }
         let tag = params.get(2).and_then(Value::as_str);
         let (tip, safe) = match self.refresh() {
             Ok(v) => v,
@@ -1219,6 +1211,8 @@ fn bind_result_tx_hash(
 
 const MAX_RECEIPT_LOGS: usize = 1024;
 const MAX_LOG_TOPICS: usize = 4;
+const MAX_LOG_DATA: usize = 64 * 1024;
+const MAX_FEE_HISTORY_ITEMS: usize = 1024;
 
 fn bind_optional_logs(
     v: Option<&Value>,
@@ -1247,7 +1241,7 @@ fn bind_optional_logs(
                         Value::Null => {}
                         Value::String(s) => {
                             let bytes = decode_hex(s).map_err(|_| "log.data is not hex")?;
-                            if bytes.len() > 64 * 1024 {
+                            if bytes.len() > MAX_LOG_DATA {
                                 return Err("log.data too large".into());
                             }
                         }
@@ -1299,6 +1293,36 @@ fn bind_optional_qty(v: Option<&Value>, field: &str) -> Result<(), String> {
     }
 }
 
+fn bind_optional_hex_cap(v: Option<&Value>, field: &str, max: usize) -> Result<(), String> {
+    match v {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(s)) => {
+            let bytes = decode_hex(s).map_err(|_| format!("{field} is not hex"))?;
+            if bytes.len() > max {
+                return Err(format!("{field} too large"));
+            }
+            Ok(())
+        }
+        Some(_) => Err(format!("{field} not a hex string")),
+    }
+}
+
+fn bind_qty_array(v: Option<&Value>, field: &str) -> Result<(), String> {
+    match v {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::Array(a)) => {
+            if a.len() > MAX_FEE_HISTORY_ITEMS {
+                return Err(format!("too many {field}"));
+            }
+            for x in a {
+                bind_optional_qty(Some(x), field)?;
+            }
+            Ok(())
+        }
+        Some(_) => Err(format!("{field} is not an array")),
+    }
+}
+
 fn bind_optional_tx_type(v: Option<&Value>) -> Result<(), String> {
     match v {
         None | Some(Value::Null) => Ok(()),
@@ -1344,13 +1368,27 @@ fn bind_fee_result(method: &str, v: &Value) -> Result<(), String> {
                 .as_object()
                 .ok_or_else(|| "feeHistory is not an object".to_string())?;
             bind_optional_qty(o.get("oldestBlock"), "oldestBlock")?;
-            if let Some(arr) = o.get("baseFeePerGas") {
-                let a = arr
-                    .as_array()
-                    .ok_or_else(|| "baseFeePerGas is not an array".to_string())?;
-                for x in a {
-                    bind_optional_qty(Some(x), "baseFeePerGas")?;
+            bind_qty_array(o.get("baseFeePerGas"), "baseFeePerGas")?;
+            bind_qty_array(o.get("baseFeePerBlobGas"), "baseFeePerBlobGas")?;
+            match o.get("gasUsedRatio") {
+                None | Some(Value::Null) => {}
+                Some(Value::Array(a)) if a.len() > MAX_FEE_HISTORY_ITEMS => {
+                    return Err("too many gasUsedRatio".into());
                 }
+                Some(Value::Array(_)) => {}
+                Some(_) => return Err("gasUsedRatio is not an array".into()),
+            }
+            match o.get("reward") {
+                None | Some(Value::Null) => {}
+                Some(Value::Array(rows)) => {
+                    if rows.len() > MAX_FEE_HISTORY_ITEMS {
+                        return Err("too many reward".into());
+                    }
+                    for row in rows {
+                        bind_qty_array(Some(row), "reward")?;
+                    }
+                }
+                Some(_) => return Err("reward is not an array".into()),
             }
             Ok(())
         }
@@ -1374,10 +1412,20 @@ fn bind_mined_object(
     bind_optional_chain_id(map.get("chainId"))?;
     bind_optional_address(map.get("from"), "from", false)?;
     bind_optional_address(map.get("to"), "to", true)?;
+    bind_optional_address(map.get("contractAddress"), "contractAddress", true)?;
     bind_optional_status(map.get("status"))?;
     bind_optional_tx_type(map.get("type"))?;
     bind_optional_qty(map.get("gasUsed"), "gasUsed")?;
     bind_optional_qty(map.get("cumulativeGasUsed"), "cumulativeGasUsed")?;
+    bind_optional_hex_cap(map.get("input"), "input", MAX_RAW_TX)?;
+    bind_optional_hex_cap(map.get("data"), "data", MAX_RAW_TX)?;
+    match map.get("logsBloom") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(s)) => {
+            decode_hex_fixed::<256>(s).map_err(|_| "logsBloom is not 256 bytes".to_string())?;
+        }
+        Some(_) => return Err("logsBloom not a hex string".into()),
+    }
     let receipt_block = map.get("blockHash").and_then(Value::as_str);
     bind_optional_logs(map.get("logs"), want_tx, receipt_block)?;
     let hash_v = map.get("blockHash");
@@ -1454,14 +1502,48 @@ fn rpc_block_json(hdr: &RpcBlockHeader) -> Value {
     v
 }
 
+fn parse_storage_keys(v: Option<&Value>) -> Result<Vec<String>, String> {
+    match v {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(a)) => {
+            if a.len() > MAX_PROOF_STORAGE_KEYS {
+                return Err("too many storage keys".into());
+            }
+            let mut out = Vec::with_capacity(a.len());
+            for x in a {
+                let s = x
+                    .as_str()
+                    .ok_or_else(|| "storage key is not a hex quantity".to_string())?;
+                let _ = parse_slot(s)?;
+                out.push(s.to_string());
+            }
+            Ok(out)
+        }
+        Some(_) => Err("storage keys must be an array".into()),
+    }
+}
+
+/// Quantity-style storage key: hex, at most 32 bytes, left-padded. Junk / oversize rejected.
 fn parse_slot(s: &str) -> Result<[u8; 32], String> {
+    if s.is_empty() {
+        return Err("storage key is not a hex quantity".into());
+    }
     let raw = s.trim_start_matches("0x").trim_start_matches("0X");
+    if !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("storage key is not a hex quantity".into());
+    }
+    if raw.len() > 64 {
+        return Err("storage key is not 32 bytes".into());
+    }
     let even = if raw.len() % 2 == 1 {
         format!("0{raw}")
     } else {
         raw.to_string()
     };
     let bytes = hex::decode(even).map_err(|e| format!("bad slot: {e}"))?;
+    if bytes.len() > 32 {
+        return Err("storage key is not 32 bytes".into());
+    }
     Ok(pad32(&bytes))
 }
 
@@ -1500,6 +1582,16 @@ pub fn serve(node: Arc<Node>, listen: &str) -> Result<()> {
                 continue;
             }
         }
+        let content_type = req
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Content-Type"))
+            .map(|h| h.value.as_str().to_string());
+        if let Some(code) = rpc_http_content_type_reject(content_type.as_deref()) {
+            let _ =
+                req.respond(Response::from_string("unsupported media type").with_status_code(code));
+            continue;
+        }
         let mut buf = Vec::new();
         let mut limited = req.as_reader().take((MAX_RPC_BODY as u64) + 1);
         limited.read_to_end(&mut buf).ok();
@@ -1531,6 +1623,18 @@ pub fn rpc_http_reject(is_post: bool, body_len: usize) -> Option<u16> {
         return Some(413);
     }
     None
+}
+
+/// Missing Content-Type is ok (curl). JSON media types ok. `text/html` etc. → 415.
+pub fn rpc_http_content_type_reject(content_type: Option<&str>) -> Option<u16> {
+    let raw = content_type.map(str::trim).filter(|s| !s.is_empty())?;
+    let media = raw.split(';').next().unwrap_or(raw).trim();
+    let m = media.to_ascii_lowercase();
+    if m == "application/json" || m == "application/json-rpc" || m == "application/jsonrequest" {
+        None
+    } else {
+        Some(415)
+    }
 }
 
 #[cfg(test)]
@@ -1575,6 +1679,7 @@ mod tests {
         assert!(wallet_get_block_by_number(Some("0x6e"), 100, &safe_hash, &chain).is_none());
         assert!(wallet_get_block_by_number(Some("0x3"), 100, &safe_hash, &chain).is_none());
         assert!(wallet_get_block_by_number(Some("pending"), 100, &safe_hash, &chain).is_none());
+        assert!(wallet_get_block_by_number(Some("earliest"), 100, &safe_hash, &chain).is_none());
         assert_eq!(
             wallet_get_block_by_number(Some(&safe_hash), 100, &safe_hash, &chain).map(|b| b.number),
             Some(100)
@@ -1653,6 +1758,48 @@ mod tests {
         assert_eq!(rpc_http_reject(true, 16), None);
         assert_eq!(rpc_http_reject(true, MAX_RPC_BODY), None);
         assert_eq!(rpc_http_reject(true, MAX_RPC_BODY + 1), Some(413));
+    }
+
+    #[test]
+    fn rpc_http_content_type_json_or_missing() {
+        assert_eq!(rpc_http_content_type_reject(None), None);
+        assert_eq!(rpc_http_content_type_reject(Some("")), None);
+        assert_eq!(rpc_http_content_type_reject(Some("application/json")), None);
+        assert_eq!(
+            rpc_http_content_type_reject(Some("application/json; charset=utf-8")),
+            None
+        );
+        assert_eq!(rpc_http_content_type_reject(Some("Application/JSON")), None);
+        assert_eq!(
+            rpc_http_content_type_reject(Some("application/json-rpc")),
+            None
+        );
+        assert_eq!(rpc_http_content_type_reject(Some("text/html")), Some(415));
+        assert_eq!(rpc_http_content_type_reject(Some("text/plain")), Some(415));
+        assert_eq!(
+            rpc_http_content_type_reject(Some("application/x-www-form-urlencoded")),
+            Some(415)
+        );
+    }
+
+    #[test]
+    fn parse_slot_quantity_or_32_bytes_rejects_junk() {
+        assert_eq!(parse_slot("0x0").unwrap(), [0u8; 32]);
+        assert_eq!(parse_slot("0x1").unwrap()[31], 1);
+        let full = format!("0x{}", "ab".repeat(32));
+        assert!(parse_slot(&full).is_ok());
+        assert!(parse_slot("not-hex").is_err());
+        assert!(parse_slot("0xgg").is_err());
+        assert!(parse_slot("").is_err());
+        assert!(parse_slot(&format!("0x{}", "aa".repeat(33))).is_err());
+        assert!(parse_storage_keys(Some(&json!([1]))).is_err());
+        assert!(parse_storage_keys(Some(&json!("0x0"))).is_err());
+        assert!(parse_storage_keys(Some(&json!(["0x0", "junk"]))).is_err());
+        assert_eq!(parse_storage_keys(Some(&json!(["0x0"]))).unwrap().len(), 1);
+        let too_many: Vec<Value> = (0..=MAX_PROOF_STORAGE_KEYS)
+            .map(|i| json!(format!("0x{i:x}")))
+            .collect();
+        assert!(parse_storage_keys(Some(&Value::Array(too_many))).is_err());
     }
 
     #[test]
@@ -1777,6 +1924,101 @@ mod tests {
         });
         let err = bind_mined_object(&bad_gas, &safe, &chain, None).unwrap_err();
         assert!(err.contains("gasUsed"), "{err}");
+        let bad_contract = json!({
+            "blockHash": hash_hex(&chain[1]),
+            "blockNumber": "0x64",
+            "contractAddress": "0x01",
+        });
+        let err = bind_mined_object(&bad_contract, &safe, &chain, None).unwrap_err();
+        assert!(err.contains("contractAddress"), "{err}");
+        let huge_input = json!({
+            "blockHash": hash_hex(&chain[1]),
+            "blockNumber": "0x64",
+            "input": format!("0x{}", "aa".repeat(MAX_RAW_TX + 1)),
+        });
+        let err = bind_mined_object(&huge_input, &safe, &chain, None).unwrap_err();
+        assert!(err.contains("input"), "{err}");
+        let ok_input = json!({
+            "blockHash": hash_hex(&chain[1]),
+            "blockNumber": "0x64",
+            "input": "0xabcdef",
+            "contractAddress": Value::Null,
+        });
+        assert!(bind_mined_object(&ok_input, &safe, &chain, None).is_ok());
+        let bad_bloom = json!({
+            "blockHash": hash_hex(&chain[1]),
+            "blockNumber": "0x64",
+            "logsBloom": "0x01",
+        });
+        let err = bind_mined_object(&bad_bloom, &safe, &chain, None).unwrap_err();
+        assert!(err.contains("logsBloom"), "{err}");
+    }
+
+    #[test]
+    fn bind_logs_txhash_topics_and_cap() {
+        let chain = vec![blk(1, 1), blk(100, 100), blk(110, 110)];
+        let safe = SafeHead {
+            number: 100,
+            hash: hash_hex(&chain[1]),
+            state_root: format!("0x{}", hex::encode(chain[1].state_root)),
+            distinct_sealers: 15,
+            required_sealers: 15,
+        };
+        let txh = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let want = decode_hex_fixed::<32>(txh).unwrap();
+        let addr = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let other = "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let mismatch = json!({
+            "blockHash": hash_hex(&chain[1]),
+            "blockNumber": "0x64",
+            "transactionHash": txh,
+            "logs": [{
+                "address": addr,
+                "transactionHash": other,
+            }],
+        });
+        let err = bind_mined_object(&mismatch, &safe, &chain, Some(&want)).unwrap_err();
+        assert!(err.contains("log.transactionHash"), "{err}");
+        let five: Vec<Value> = (0..5).map(|_| json!(txh)).collect();
+        let too_topics = json!({
+            "blockHash": hash_hex(&chain[1]),
+            "blockNumber": "0x64",
+            "transactionHash": txh,
+            "logs": [{
+                "address": addr,
+                "topics": five,
+            }],
+        });
+        let err = bind_mined_object(&too_topics, &safe, &chain, Some(&want)).unwrap_err();
+        assert!(err.contains("topics"), "{err}");
+        let logs: Vec<Value> = (0..=MAX_RECEIPT_LOGS)
+            .map(|_| json!({"address": addr}))
+            .collect();
+        let too_logs = json!({
+            "blockHash": hash_hex(&chain[1]),
+            "blockNumber": "0x64",
+            "logs": logs,
+        });
+        let err = bind_mined_object(&too_logs, &safe, &chain, None).unwrap_err();
+        assert!(err.contains("logs"), "{err}");
+    }
+
+    #[test]
+    fn fee_history_caps_arrays() {
+        assert!(bind_fee_result(
+            "eth_feeHistory",
+            &json!({"oldestBlock": "0x1", "baseFeePerGas": ["0x1"]})
+        )
+        .is_ok());
+        let too: Vec<Value> = (0..=MAX_FEE_HISTORY_ITEMS).map(|_| json!("0x1")).collect();
+        let err = bind_fee_result(
+            "eth_feeHistory",
+            &json!({"oldestBlock": "0x1", "baseFeePerGas": too}),
+        )
+        .unwrap_err();
+        assert!(err.contains("too many"), "{err}");
+        let err = bind_fee_result("eth_feeHistory", &json!({"reward": [[true]]})).unwrap_err();
+        assert!(err.contains("reward"), "{err}");
     }
 
     #[test]

@@ -104,6 +104,20 @@ mod tests {
     }
 
     #[test]
+    fn storage_proof_too_many_nodes_rejected() {
+        let mut f = load_slot0();
+        let root = decode_hex_fixed::<32>(&f.state_root).unwrap();
+        let addr = decode_hex_fixed::<20>(&f.address).unwrap();
+        f.proof.storage_proof[0]
+            .proof
+            .resize(MAX_PROOF_NODES + 1, "0x80".into());
+        assert!(matches!(
+            verify_eth_get_proof(&root, &addr, &f.proof).unwrap_err(),
+            ProofError::TooManyNodes
+        ));
+    }
+
+    #[test]
     fn mutated_proof_node_rejected() {
         let (mut f, _) = load();
         let root = decode_hex_fixed::<32>(&f.state_root).unwrap();

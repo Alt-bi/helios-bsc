@@ -4,8 +4,8 @@
 |-------|-------|
 | **Document** | BSC Verified Local JSON-RPC (Parlia Light Client) |
 | **Author** | helios-bsc maintainers |
-| **Date** | 2026-08-18 |
-| **Status** | **Active development** — Demo Slice in this repository |
+| **Date** | 2026-08-20 |
+| **Status** | **Active** — Demo Slice closed; MVP-1 methods+docs in tree; 24h soak remains the GA live gate |
 | **Working name** | **helios-bsc** (crate/binary: `helios-bsc`) |
 | **License** | Dual Apache-2.0 OR MIT |
 | **Repo** | https://github.com/Alt-bi/helios-bsc |
@@ -118,10 +118,10 @@ Honest conclusion: **execution-proof reuse is high; consensus path is a new Parl
 
 ### MVP-1 DoD
 
-- [ ] All Demo Slice criteria, plus verified nonce/code/storageAt; `eth_sendRawTransaction` labeled unverified; unsupported methods hard-error by default.
-- [ ] Mainnet differential soak **≥24h** with zero proof false-accepts; oracle **independent** of the sole upstream used for proofs/headers (second RPC, explorer API, or second Alt F).
-- [ ] Checkpoint age / sync lag SLOs documented and met under default freshness policy.
-- [ ] Docs: threat model, RPC matrix, checkpointing, incident stub for proof-fail storms.
+- [x] All Demo Slice criteria, plus verified nonce/code/storageAt; `eth_sendRawTransaction` labeled unverified; unsupported methods hard-error by default.
+- [ ] Mainnet differential soak **≥24h** with zero proof false-accepts; oracle **independent** of the sole upstream used for proofs/headers (second RPC, explorer API, or second Alt F). 1h re-diff 2026-08-19 GATE PASS (Ankr vs BlastAPI: unique=19, compared=214, match=214, mismatch=0, skip=38 — Ankr window, not false-accept). **24h remains the GA live gate.**
+- [x] Checkpoint age / sync lag SLOs documented (`docs/slo.md`) and wired on `doctor` / `syncStatus` under default freshness policy (24h checkpoint age; Safe lag bound 120). 24h soak is a separate gate.
+- [x] Docs: threat model (`docs/threat-model.md`), RPC matrix (`docs/rpc-matrix.md`), checkpointing (`docs/checkpointing.md`), incident stub for proof-fail storms (`docs/runbooks/proof-fail-storm.md`).
 
 ### MVP-2 DoD (optional track)
 
@@ -717,7 +717,7 @@ Prefer a dedicated spare volume or small VPS for any Alt F full/fast node. Avoid
 12. **Max checkpoint age driven by header-walk cost** — Default ≤24h strict; not Helios’s week-scale window.
 13. **Required upstream proof capability for Demo Slice / GA** — At least one reproducible **`eth_getProof` by block hash or number**. **Order (operator-decided):** measure **public/paid RPC provider matrix first**; stand up **Alt F only if that matrix fails**. Tag-only degraded mode does not satisfy wallet-mode Safe proofs.
 14. **Independent public repo `helios-bsc`** (dual MIT/Apache) — not starting inside a16z/helios workspace; optional upstream discussion only after Demo Slice.
-15. **~~Design parked~~ → development resumed (2026-08-18)** — scaffold + Phase 0 docs/scripts live under `this repository/`. Consensus seal/sync still gated on Phase 0 checklist.
+15. **Development in this repo (2026-08-20)** — Demo Slice closed; MVP-1 verified reads + unverified `sendRaw` + operator docs in tree. **24h soak remains the GA live gate.** FF / `eth_call` are MVP-2. Out-of-turn backoff, Maxwell FF recents prune, and EIP-1559 parent `baseFee` formulas are **not implemented**.
 
 ### Operator decisions (2026-08-18)
 
@@ -727,7 +727,7 @@ Settled by operator; treat as final (not open for re-debate in this doc):
 |---|----------|
 | A | **OSS home:** independent public repo **`helios-bsc`**, dual MIT/Apache. No initial a16z/helios workspace membership; optional upstream chat **only after Demo Slice**. |
 | B | **`eth_getProof` path:** **first** fill/measure the public/paid provider matrix for hash/number proofs; **Alt F only if the matrix fails**. |
-| C | **Near-term work:** **save design only** — development has resumed in this repository; keep milestones honest. |
+| C | **Near-term work:** keep milestones honest — Demo Slice closed; 24h soak still blocks MVP-1 GA; Pasteur 2026-08-25 is scheduled, not live. |
 
 This file is the canonical design document for the public repository.
 
@@ -899,3 +899,5 @@ _Rev 3 (2026-08-18): Follow-up review — default wallet mode maps proof-backed 
 _Rev 4 (2026-08-18): Demo Slice / wallet mode require hash/number `eth_getProof` or Alt F (tag-only degraded demoted—cannot match Safe ~240 blocks behind tip); `eth_blockNumber` → Safe height in wallet mode; KD13 / Phase 0 gate tightened._
 
 _Rev 5 (2026-08-18): Operator decisions locked — independent `helios-bsc` repo (MIT/Apache); measure public/paid proof matrix first, Alt F only if fails; design parked (no Phase 0 coding until resume). Status: Ready for Phase 0 (parked)._
+
+_Rev 6 (2026-08-20): Honest close-out — Demo Slice closed; tick MVP-1 DoD for verified nonce/code/storageAt, unverified sendRaw, fail-closed unsupported methods, and operator docs (threat model / rpc-matrix / checkpointing / proof-fail runbook / SLOs). Leave 24h soak and MVP-2 FF/`eth_call` unchecked. Pasteur 2026-08-25 is not live._

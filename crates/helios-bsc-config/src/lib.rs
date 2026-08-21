@@ -278,6 +278,12 @@ mod tests {
     }
 
     #[test]
+    fn max_reorg_depth_is_n_seal() {
+        assert_eq!(crate::max_reorg_depth(), 21);
+        assert_eq!(max_reorg_depth(), u64::from(mainnet_n_seal()));
+    }
+
+    #[test]
     fn miner_history_legacy_is_n_over_2() {
         // turnLength=1, N=21 → (10+1)*1 - 1 = 10
         assert_eq!(miner_history_check_len(21, 1), 10);

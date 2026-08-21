@@ -4,17 +4,41 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Channel matches rust-toolchain.toml (stable + clippy, rustfmt); not nightly.
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
       - name: cargo fmt
         run: cargo fmt --all -- --check
       - name: cargo test
         run: cargo test --workspace
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker compose config
+        env:
+          # Dummy interpolant only — not a live RPC and not a secret.
+          HELIOS_BSC_UPSTREAM: http://127.0.0.1:1
+        run: |
+          cp .env.example .env
+          docker compose config --quiet
+          docker compose config --format json | jq -e '
+            .services["helios-bsc"].ports
+            | map(select((.published | tostring) == "8545" or (.target | tostring) == "8545"))
+            | length > 0 and all(.host_ip == "127.0.0.1")
+          '
+      - name: Dockerfile syntax check
+        run: docker build --check .

@@ -160,27 +160,22 @@ mod tests {
 
     /// Minimal signed EIP-1559 skeleton (dummy r/s).
     fn dummy_eip1559(chain_id: u64) -> Vec<u8> {
-        let mut out = vec![0x02];
+        dummy_typed(0x02, chain_id, 12)
+    }
+
+    /// Typed tx with `n_items` RLP fields (chainId first, dummy r/s last).
+    fn dummy_typed(ty: u8, chain_id: u64, n_items: usize) -> Vec<u8> {
         let z = rlp_bytes(&[]);
-        let gas = be(21_000);
-        let to = addr20();
-        let access = vec![0xc0];
         let r = rlp_bytes(&[1]);
         let s = rlp_bytes(&[1]);
-        out.extend(rlp_list(&[
-            be(chain_id),
-            z.clone(),
-            z.clone(),
-            z.clone(),
-            gas,
-            to,
-            z.clone(),
-            z.clone(),
-            access,
-            z,
-            r,
-            s,
-        ]));
+        let mut items = vec![be(chain_id)];
+        while items.len() + 2 < n_items {
+            items.push(z.clone());
+        }
+        items.push(r);
+        items.push(s);
+        let mut out = vec![ty];
+        out.extend(rlp_list(&items));
         out
     }
 
@@ -224,6 +219,20 @@ mod tests {
             validate_bsc_raw_tx(&raw).unwrap_err(),
             RawTxError::WrongChain
         );
+    }
+
+    #[test]
+    fn typed_access_blob_setcode_chain_id() {
+        for (ty, n) in [(0x01, 11), (0x03, 14), (0x04, 13)] {
+            let eth = dummy_typed(ty, 1, n);
+            assert_eq!(
+                validate_bsc_raw_tx(&eth).unwrap_err(),
+                RawTxError::WrongChain,
+                "type 0x{ty:02x} chainId=1"
+            );
+            let bsc = dummy_typed(ty, 56, n);
+            validate_bsc_raw_tx(&bsc).unwrap_or_else(|e| panic!("type 0x{ty:02x} chainId=56: {e}"));
+        }
     }
 
     #[test]

@@ -207,4 +207,25 @@ mod tests {
             Err(TypesError::BadCheckpointHash { field: "hash" })
         ));
     }
+
+    #[test]
+    fn checkpoint_rejects_duplicate_sealer_hex_case() {
+        let mut cp = Checkpoint {
+            chain_id: 56,
+            number: 1,
+            hash: format!("0x{}", "aa".repeat(32)),
+            parent_hash: format!("0x{}", "bb".repeat(32)),
+            state_root: format!("0x{}", "cc".repeat(32)),
+            timestamp: 0,
+            fork_id: "fermi".into(),
+            sealing_set: sample_set(21),
+            attestation: None,
+        };
+        cp.sealing_set[0] = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
+        cp.sealing_set[20] = "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into();
+        assert!(matches!(
+            cp.validate_basic(),
+            Err(TypesError::DuplicateSealingAddress)
+        ));
+    }
 }

@@ -7,7 +7,7 @@ use crate::sync::{
 use crate::{Node, RpcUpstream};
 use anyhow::{anyhow, Result};
 use helios_bsc_consensus::{header_hash, newest_safe, Snapshot, VerifiedBlock};
-use helios_bsc_execution::encode_qty;
+use helios_bsc_execution::{encode_qty, MAX_RAW_TX};
 use helios_bsc_mock::{
     cycling_sealer_chain, distinct_sealer_chain, headers_from_chain, relink_dummy_chain, MockRpc,
     Scenario, WBNB_ADDRESS, WRONG_STATE_ROOT,
@@ -327,6 +327,16 @@ fn jsonrpc_invalid_and_batch() {
 }
 
 #[test]
+fn jsonrpc_method_non_ascii_nul_tab_is_invalid_request() {
+    let (chain, rpc) = safe_chain_with_fixture_root();
+    let node = node_from_chain(chain, rpc.proof_json());
+    for method in ["eth_chainId\0", "eth_chainId\t", "eth_chainIdé"] {
+        let v = node.handle(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":[]}));
+        assert_eq!(err_code(&v), ERR_INVALID, "{method:?}: {v}");
+    }
+}
+
+#[test]
 fn fourteen_sealers_block_number_is_not_synced() {
     let chain = cycling_sealer_chain(20, 14);
     let node = node_from_chain(chain, json!({}));
@@ -397,6 +407,18 @@ fn honest_get_proof_at_safe() {
         json!([WBNB_ADDRESS, too_many, "latest"]),
     ));
     assert_eq!(err_code(&over), ERR_PARAMS, "{over}");
+    let junk = node.handle(&req(
+        "eth_getProof",
+        json!([WBNB_ADDRESS, ["not-a-slot"], "latest"]),
+    ));
+    assert_eq!(err_code(&junk), ERR_PARAMS, "{junk}");
+    let not_str = node.handle(&req("eth_getProof", json!([WBNB_ADDRESS, [1], "latest"])));
+    assert_eq!(err_code(&not_str), ERR_PARAMS, "{not_str}");
+    let oversized = node.handle(&req(
+        "eth_getProof",
+        json!([WBNB_ADDRESS, [format!("0x{}", "aa".repeat(33))], "latest"]),
+    ));
+    assert_eq!(err_code(&oversized), ERR_PARAMS, "{oversized}");
 }
 
 #[test]
@@ -444,6 +466,22 @@ fn honest_mock_get_balance_ok() {
     assert_eq!(v["result"], json!(encode_qty(&acc.balance_wei)));
     let short = node.handle(&req("eth_getBalance", json!(["0x1", "latest"])));
     assert_eq!(err_code(&short), ERR_PARAMS, "{short}");
+    for m in [
+        "eth_getTransactionCount",
+        "eth_getCode",
+        "eth_getStorageAt",
+        "eth_getProof",
+    ] {
+        let params = if m == "eth_getStorageAt" {
+            json!(["0x1", "0x0", "latest"])
+        } else if m == "eth_getProof" {
+            json!(["0x1", [], "latest"])
+        } else {
+            json!(["0x1", "latest"])
+        };
+        let bad = node.handle(&req(m, params));
+        assert_eq!(err_code(&bad), ERR_PARAMS, "{m}: {bad}");
+    }
     let nonce = node.handle(&req(
         "eth_getTransactionCount",
         json!([WBNB_ADDRESS, "latest"]),
@@ -476,6 +514,11 @@ fn honest_get_storage_at_slot0() {
         json!("0x5772617070656420424e42000000000000000000000000000000000000000016"),
         "{v}"
     );
+    let junk = node.handle(&req(
+        "eth_getStorageAt",
+        json!([WBNB_ADDRESS, "not-a-slot", "latest"]),
+    ));
+    assert_eq!(err_code(&junk), ERR_PARAMS, "{junk}");
 }
 
 #[test]
@@ -666,6 +709,10 @@ fn pending_tag_not_synced() {
     let node = node_from_chain(chain, rpc.proof_json());
     let v = node.handle(&req("eth_getBalance", json!([WBNB_ADDRESS, "pending"])));
     assert_eq!(err_code(&v), ERR_NOT_SYNCED);
+    let earliest = node.handle(&req("eth_getBalance", json!([WBNB_ADDRESS, "earliest"])));
+    assert_eq!(err_code(&earliest), ERR_NOT_SYNCED);
+    let blk = node.handle(&req("eth_getBlockByNumber", json!(["earliest", false])));
+    assert_eq!(err_code(&blk), ERR_NOT_SYNCED);
 }
 
 #[test]
@@ -1026,6 +1073,31 @@ fn send_raw_rejects_bad_hex_locally() {
     assert_eq!(err_code(&send), ERR_METHOD);
     let dbg = node.handle(&req("debug_traceTransaction", json!([])));
     assert_eq!(err_code(&dbg), ERR_METHOD);
+}
+
+#[test]
+fn blocked_namespaces_are_method_not_found() {
+    let (chain, rpc) = safe_chain_with_fixture_root();
+    let node = node_from_chain(chain, rpc.proof_json());
+    for m in [
+        "rpc_modules",
+        "clique_getSnapshot",
+        "les_serverInfo",
+        "parlia_getSnapshot",
+        "bsc_getValidators",
+    ] {
+        let v = node.handle(&req(m, json!([])));
+        assert_eq!(err_code(&v), ERR_METHOD, "{m}: {v}");
+    }
+}
+
+#[test]
+fn send_raw_rejects_oversize_body() {
+    let chain = distinct_sealer_chain(15);
+    let node = node_from_chain(chain, json!({}));
+    let huge = format!("0x{}", "00".repeat(MAX_RAW_TX + 1));
+    let v = node.handle(&req("eth_sendRawTransaction", json!([huge])));
+    assert_eq!(err_code(&v), ERR_PARAMS, "{v}");
 }
 
 #[test]

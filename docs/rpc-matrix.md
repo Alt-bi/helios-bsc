@@ -20,7 +20,7 @@ Default bind: `127.0.0.1:8545` (`--allow-non-loopback` required for LAN; no RPC 
 | `eth_getTransactionCount` | Verified | Same as balance |
 | `eth_getCode` | Verified | Bytecode keccak vs proof `codeHash`; ≤24576 bytes (`MaxCodeSize`) |
 | `eth_getStorageAt` | Verified | Storage trie vs account `storageHash` |
-| `eth_getProof` | Verified | EIP-1186 at Safe only; MPT vs `stateRoot` (account + requested slots). At most **64** storage keys, **32** nodes per account/storage proof, **16 KiB** per node. Response `storageProof` is clipped to the requested keys (empty request → empty array). |
+| `eth_getProof` | Verified | EIP-1186 at Safe only; MPT vs `stateRoot` (account + requested slots). At most **64** storage keys, **32** nodes per account/storage proof, **16 KiB** per node. Keys are hex quantities ≤32 bytes, validated **before** the upstream fetch (junk / non-string / oversize → `-32602`). Response `storageProof` is clipped to the requested keys (empty request → empty array). |
 | `eth_getBlockByNumber` | Header-verified | At or below Safe; `fullTx=true` → `-32601`; txs always `[]`. Served from the locally stored sealed header when present (no re-fetch); otherwise re-fetch must `Header.Hash()` to the local verified hash |
 | `eth_getBlockByHash` | Header-verified | Hash in local chain and `number ≤ Safe`. Same stored-header / Hash() bind |
 | `eth_getUncleCountByBlockNumber` / `ByHash` | Verified | `0x0` at or below Safe (Parlia forbids uncles; checked on every header) |
@@ -28,11 +28,11 @@ Default bind: `127.0.0.1:8545` (`--allow-non-loopback` required for LAN; no RPC 
 | `eth_coinbase` | Verified | `0x000…0` (no mining) |
 | `eth_sendRawTransaction` | Unverified | Broadcast only (always on). Local hex decode + empty/size cap (512 KiB) + **chainId=56** (typed 0x01–0x04 / EIP-155 legacy; unprotected txs rejected). Returned hash is local `keccak256(raw)`; a lying upstream hash is `-32001`. |
 | `eth_sendTransaction` / `eth_sign*` / `personal_*` / `debug_*` / `trace_*` / `txpool_*` / `miner_*` / `admin_*` / `engine_*` / `les_*` / `clique_*` / `parlia_*` / `rpc_*` / `bsc_*` | Unsupported | No unlocked keys, no tracing, no consensus RPC (`-32601`) |
-| `eth_getTransactionReceipt` | Unverified opt-in | Default `-32601`. `--allow-unverified-passthrough`: header-bound to local Safe (`blockHash` in chain, `number ≤ Safe`). Query hash must be 32 bytes and match `transactionHash`/`hash`. If present: `chainId`=56, `from`/`to` 20-byte addresses (`to` may be null), `status` ∈ {0,1}, `type` ∈ {0…4}, `gasUsed`/`cumulativeGasUsed` hex quantities. Present `logs[]`: 20-byte `address`, ≤4×32-byte topics (≤1024 logs). Logs not MPT-verified. Pending (null hash+number) allowed if the tx hash still matches. |
+| `eth_getTransactionReceipt` | Unverified opt-in | Default `-32601`. `--allow-unverified-passthrough`: header-bound to local Safe (`blockHash` in chain, `number ≤ Safe`). Query hash must be 32 bytes and match `transactionHash`/`hash`. If present: `chainId`=56, `from`/`to`/`contractAddress` 20-byte addresses (`to`/`contractAddress` may be null), `status` ∈ {0,1}, `type` ∈ {0…4}, `gasUsed`/`cumulativeGasUsed` hex quantities, `input`/`data` ≤512 KiB, `logsBloom` 256 bytes if present. Present `logs[]`: 20-byte `address`, ≤4×32-byte topics (≤1024 logs). Logs not MPT-verified. Pending (null hash+number) allowed if the tx hash still matches. |
 | `eth_getTransactionByHash` | Unverified opt-in | Same header-bind + query-hash bind as receipts |
 | `eth_gasPrice` | Unverified opt-in | Default `-32601`. Flag on: hex quantity only (not an object) |
 | `eth_maxPriorityFeePerGas` | Unverified opt-in | Same flag as `eth_gasPrice` (EIP-1559 tip). Hex quantity. |
-| `eth_feeHistory` | Unverified opt-in | Same flag. JSON object; `oldestBlock` hex qty if present; `baseFeePerGas` array of hex qty if present. Unbound fee oracle. |
+| `eth_feeHistory` | Unverified opt-in | Same flag. JSON object; `oldestBlock` hex qty if present; `baseFeePerGas` / `gasUsedRatio` / `reward` arrays ≤1024; `reward` rows of hex qty if present. Unbound fee oracle. |
 | `eth_blobBaseFee` | Unverified opt-in | Same flag. Hex quantity. |
 | `helios_bsc_syncStatus` | Verified | tip, safe, `lag` / `safeLagBlocks` / `safeLagSeconds`, `safeLagWithinBound`, `unverifiedPassthrough`, `backupTransport`, sealers, proof window, `finality=confirmation-depth`, `sealingSetEnforced`, `proofOk` / `proofFail` / `headersVerified` |
 | `helios_bsc_getVerificationStatus` | Verified | same status body (`trustClass`, `finality`, lag fields) |
@@ -40,6 +40,8 @@ Default bind: `127.0.0.1:8545` (`--allow-non-loopback` required for LAN; no RPC 
 | `eth_getLogs` / filters / `eth_subscribe` | Unsupported | `-32601` (no log index, no pub/sub) |
 | `eth_getBlockTransactionCount*` / `eth_getTransactionByBlock*AndIndex` | Unsupported | `-32601` (no tx index; `fullTx` already refused) |
 
-Error codes: `-32700` parse error, `-32600` invalid request (including empty batch, batch > 64, missing/`jsonrpc` ≠ `"2.0"`, `id` not string≤128 / integer / null, fractional `id`), `-32602` `params` not an array or more than 16 params, `-32001` proof failed, `-32002` stateRoot, `-32003` not synced / wallet tag, `-32601` unsupported. JSON-RPC **batches** are supported (max 64); notifications (no `id`) are omitted from the batch response; a lone notification is HTTP 204 / JSON `null`.
+Wallet tags: `latest` / `safe` / `finalized` → Safe. `pending` and `earliest` are rejected (`-32003`), not genesis. HTTP is **POST-only**; missing Content-Type is allowed (curl); `application/json` / `json-rpc` / `jsonrequest` ok; `text/html` and form-urlencoded → **415**. Loopback binds also require a loopback `Host` (403 otherwise).
+
+Error codes: `-32700` parse error, `-32600` invalid request (including empty batch, batch > 64, missing/`jsonrpc` ≠ `"2.0"`, `id` not string≤128 / integer / null, fractional `id`, non-graphic method name), `-32602` `params` not an array or more than 16 params, `-32001` proof failed, `-32002` stateRoot, `-32003` not synced / wallet tag, `-32601` unsupported. JSON-RPC **batches** are supported (max 64); notifications (no `id`) are omitted from the batch response; a lone notification is HTTP 204 / JSON `null`.
 
 `--checkpoint` enables sealing-set membership **and** in-turn difficulty. `--oracle` / `helios-bsc soak --min-unique 10` compares MPT balances to an independent host (not the proof upstream). `--backup` / `HELIOS_BSC_BACKUP` is transport failover only (not a trust oracle). Wallet pointing: [wallet-guide.md](./wallet-guide.md).
