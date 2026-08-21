@@ -51,6 +51,7 @@ cargo run -p helios-bsc -- doctor   # env hosts only, never API keys; Pasteur co
 cargo run -p helios-bsc -- probe-safe --upstream %HELIOS_BSC_UPSTREAM% --oracle https://bsc-mainnet.public.blastapi.io
 cargo run -p helios-bsc -- run --listen 127.0.0.1:8545
 # Optional transport failover (still untrusted): --backup $HELIOS_BSC_BACKUP
+# Optional Prometheus metrics on GET /metrics (off by default): --metrics
 
 # Optional: sealing-set membership (does not invent validators from recent miners)
 cargo run -p helios-bsc -- write-checkpoint --block 0x… --sealing-set 0xabc,0xdef,… --out checkpoint.json

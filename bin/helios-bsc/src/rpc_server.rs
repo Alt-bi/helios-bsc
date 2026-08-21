@@ -12,7 +12,8 @@ use helios_bsc_config::{
     safe_lag_seconds, safe_lag_within_slo, PROVIDER_PROOF_LOOKBACK,
 };
 use helios_bsc_consensus::{
-    checkpoint_at_snapshot, header_hash, proof_lag, within_proof_window, Snapshot, VerifiedBlock,
+    checkpoint_age_secs, checkpoint_at_snapshot, header_hash, proof_lag, unix_now,
+    within_proof_window, Snapshot, VerifiedBlock,
 };
 use helios_bsc_execution::{
     encode_consensus_receipt, encode_data32, encode_qty, eth_call_verified,
@@ -57,9 +58,21 @@ pub struct Node {
     proof_ok: AtomicU64,
     proof_fail: AtomicU64,
     headers_verified: AtomicU64,
+    /// Sync failures after the tip was fetched (seal / parent-link / Safe).
+    header_verify_fail: AtomicU64,
+    /// Upstream `eth_blockNumber` failures (transport, not verification).
+    upstream_errors: AtomicU64,
+    /// Last observed tip / Safe, published after each sync so `/metrics` never has to
+    /// take the chain lock. [`NO_BLOCK`] means "not known yet".
+    last_tip: AtomicU64,
+    last_safe: AtomicU64,
     allow_unverified_passthrough: bool,
     backup_transport: bool,
+    metrics_enabled: bool,
 }
+
+/// Sentinel for an unpublished `last_tip` / `last_safe` gauge.
+const NO_BLOCK: u64 = u64::MAX;
 
 impl Node {
     pub fn bootstrap(up: Box<dyn RpcUpstream>, lookback: u64) -> Result<Self> {
@@ -67,7 +80,7 @@ impl Node {
         let from = tip.saturating_sub(lookback.saturating_sub(1));
         eprintln!("sync {from}..={tip}");
         let chain = walk_headers(up.as_ref(), from, tip)?;
-        let _ = safe_of(&chain)?;
+        let safe = safe_of(&chain)?;
         let n = chain.len() as u64;
         Ok(Self {
             up,
@@ -82,8 +95,13 @@ impl Node {
             proof_ok: AtomicU64::new(0),
             proof_fail: AtomicU64::new(0),
             headers_verified: AtomicU64::new(n),
+            header_verify_fail: AtomicU64::new(0),
+            upstream_errors: AtomicU64::new(0),
+            last_tip: AtomicU64::new(tip),
+            last_safe: AtomicU64::new(safe.number),
             allow_unverified_passthrough: false,
             backup_transport: false,
+            metrics_enabled: false,
         })
     }
 
@@ -104,7 +122,7 @@ impl Node {
         let fork_id = checkpoint.fork_id.clone();
         let (chain, snapshot) =
             walk_from_checkpoint(up.as_ref(), checkpoint.clone(), tip, max_sync)?;
-        let _ = safe_of(&chain)?;
+        let safe = safe_of(&chain)?;
         let n = chain.len() as u64;
         Ok(Self {
             up,
@@ -119,8 +137,13 @@ impl Node {
             proof_ok: AtomicU64::new(0),
             proof_fail: AtomicU64::new(0),
             headers_verified: AtomicU64::new(n),
+            header_verify_fail: AtomicU64::new(0),
+            upstream_errors: AtomicU64::new(0),
+            last_tip: AtomicU64::new(tip),
+            last_safe: AtomicU64::new(safe.number),
             allow_unverified_passthrough: false,
             backup_transport: false,
+            metrics_enabled: false,
         })
     }
 
@@ -140,8 +163,13 @@ impl Node {
             proof_ok: AtomicU64::new(0),
             proof_fail: AtomicU64::new(0),
             headers_verified: AtomicU64::new(0),
+            header_verify_fail: AtomicU64::new(0),
+            upstream_errors: AtomicU64::new(0),
+            last_tip: AtomicU64::new(NO_BLOCK),
+            last_safe: AtomicU64::new(NO_BLOCK),
             allow_unverified_passthrough: false,
             backup_transport: false,
+            metrics_enabled: false,
         }
     }
 
@@ -166,8 +194,13 @@ impl Node {
             proof_ok: AtomicU64::new(0),
             proof_fail: AtomicU64::new(0),
             headers_verified: AtomicU64::new(0),
+            header_verify_fail: AtomicU64::new(0),
+            upstream_errors: AtomicU64::new(0),
+            last_tip: AtomicU64::new(NO_BLOCK),
+            last_safe: AtomicU64::new(NO_BLOCK),
             allow_unverified_passthrough: false,
             backup_transport: false,
+            metrics_enabled: false,
         }
     }
 
@@ -186,6 +219,135 @@ impl Node {
 
     pub fn set_backup_transport(&mut self, yes: bool) {
         self.backup_transport = yes;
+    }
+
+    pub fn set_metrics_enabled(&mut self, yes: bool) {
+        self.metrics_enabled = yes;
+    }
+
+    pub fn metrics_enabled(&self) -> bool {
+        self.metrics_enabled
+    }
+
+    /// Hold the chain lock, so a test can prove `/metrics` does not need it.
+    #[cfg(test)]
+    pub fn lock_chain_for_test(&self) -> std::sync::MutexGuard<'_, Vec<VerifiedBlock>> {
+        self.chain.lock().expect("chain lock")
+    }
+
+    /// Prometheus text exposition (`docs/slo.md`).
+    ///
+    /// **Lock-free by construction.** It reads only atomics published by the last
+    /// successful sync — never the chain mutex, and never `refresh()`. Both matter:
+    /// a scrape must not drive upstream RPC load, and it must not queue behind a sync
+    /// that is holding the chain lock across slow network I/O. Otherwise scrapes time
+    /// out exactly when the node is struggling, which is when metrics are needed most.
+    /// Values are therefore as of the last sync: a stalled poller surfaces as a
+    /// growing `safe_lag`, it does not hide behind a fetch.
+    pub fn metrics_text(&self) -> String {
+        let raw_tip = self.last_tip.load(Ordering::Relaxed);
+        let raw_safe = self.last_safe.load(Ordering::Relaxed);
+        let tip = (raw_tip != NO_BLOCK).then_some(raw_tip);
+        let safe = (raw_safe != NO_BLOCK).then_some(raw_safe);
+        let interval_ms = mainnet_current_fork().block_interval_ms;
+        let lag = match (tip, safe) {
+            (Some(t), Some(s)) => Some(proof_lag(t, s)),
+            _ => None,
+        };
+        let checkpoint_age = self
+            .origin
+            .as_ref()
+            .map(|cp| checkpoint_age_secs(cp.timestamp, unix_now()));
+
+        let mut out = String::with_capacity(2048);
+        let mut counter = |name: &str, help: &str, v: u64| {
+            out.push_str(&format!(
+                "# HELP {name} {help}\n# TYPE {name} counter\n{name} {v}\n"
+            ));
+        };
+        counter(
+            "helios_bsc_headers_verified_total",
+            "Headers whose seal and parent link verified since process start.",
+            self.headers_verified.load(Ordering::Relaxed),
+        );
+        counter(
+            "helios_bsc_header_verify_fail_total",
+            "Sync attempts rejected after the tip was fetched (seal, parent link, or no Safe).",
+            self.header_verify_fail.load(Ordering::Relaxed),
+        );
+        counter(
+            "helios_bsc_proof_success_total",
+            "Merkle proofs that verified against a Safe stateRoot.",
+            self.proof_ok.load(Ordering::Relaxed),
+        );
+        counter(
+            "helios_bsc_proof_fail_total",
+            "Merkle proofs rejected (root mismatch or malformed trie node).",
+            self.proof_fail.load(Ordering::Relaxed),
+        );
+        counter(
+            "helios_bsc_upstream_errors_total",
+            "Upstream transport failures fetching the tip (not a verification failure).",
+            self.upstream_errors.load(Ordering::Relaxed),
+        );
+
+        let mut gauge = |name: &str, help: &str, v: String| {
+            out.push_str(&format!(
+                "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {v}\n"
+            ));
+        };
+        gauge(
+            "helios_bsc_tip_block",
+            "Highest locally verified block number (-1 before the first sync).",
+            tip.map_or_else(|| "-1".into(), |t| t.to_string()),
+        );
+        gauge(
+            "helios_bsc_safe_block",
+            "Confirmation-depth Safe head (-1 when no Safe head exists yet).",
+            safe.map_or_else(|| "-1".into(), |s| s.to_string()),
+        );
+        gauge(
+            "helios_bsc_safe_lag_blocks",
+            "Tip minus Safe, in blocks (-1 when no Safe head exists yet).",
+            lag.map_or_else(|| "-1".into(), |l| l.to_string()),
+        );
+        gauge(
+            "helios_bsc_safe_lag_seconds",
+            "Tip minus Safe, in seconds (-1 when no Safe head exists yet).",
+            lag.map_or_else(
+                || "-1".into(),
+                |l| safe_lag_seconds(l, interval_ms).to_string(),
+            ),
+        );
+        gauge(
+            "helios_bsc_safe_lag_within_bound",
+            "1 when Safe lag is inside the documented SLO bound, else 0.",
+            lag.map_or_else(
+                || "0".into(),
+                |l| u8::from(safe_lag_within_slo(l)).to_string(),
+            ),
+        );
+        gauge(
+            "helios_bsc_checkpoint_age_seconds",
+            "Age of the origin checkpoint (-1 when running without one).",
+            checkpoint_age.map_or_else(|| "-1".into(), |a| a.to_string()),
+        );
+        gauge(
+            "helios_bsc_finality_mode",
+            "0 = confirmation-depth, 1 = fast finality (BLS, not implemented).",
+            "0".into(),
+        );
+        gauge(
+            "helios_bsc_sealing_set_enforced",
+            "1 when a checkpoint supplies the sealing set, else 0 (lookback-only).",
+            u8::from(self.origin_checkpoint.is_some()).to_string(),
+        );
+        gauge(
+            "helios_bsc_unverified_passthrough_enabled",
+            "1 when --allow-unverified-passthrough is on, else 0.",
+            u8::from(self.allow_unverified_passthrough).to_string(),
+        );
+        out
     }
 
     fn bump_proof_ok(&self) {
@@ -278,7 +440,41 @@ impl Node {
     fn refresh(&self) -> Result<(u64, SafeHead)> {
         let mut chain = self.chain.lock().expect("chain lock");
         let mut snapshot = self.snapshot.lock().expect("snapshot lock");
-        let tip = self.up.block_number()?;
+        // Transport failure here is not a verification failure — count it apart so a
+        // flaky provider never looks like a lying one on the metrics dashboard.
+        let tip = match self.up.block_number() {
+            Ok(t) => t,
+            Err(e) => {
+                self.upstream_errors.fetch_add(1, Ordering::Relaxed);
+                return Err(e);
+            }
+        };
+        let (safe, verified_this, grew) = match self.resync_locked(&mut chain, &mut snapshot, tip) {
+            Ok(v) => v,
+            Err(e) => {
+                self.header_verify_fail.fetch_add(1, Ordering::Relaxed);
+                return Err(e);
+            }
+        };
+        drop(chain);
+        drop(snapshot);
+        self.bump_headers(verified_this);
+        // Publish for /metrics so a scrape never contends with this sync.
+        self.last_tip.store(tip, Ordering::Relaxed);
+        self.last_safe.store(safe.number, Ordering::Relaxed);
+        if grew {
+            self.persist_verified_tip();
+        }
+        Ok((tip, safe))
+    }
+
+    /// Advance the locked chain to `tip`. Returns `(safe, newly_verified, grew)`.
+    fn resync_locked(
+        &self,
+        chain: &mut Vec<VerifiedBlock>,
+        snapshot: &mut Option<Snapshot>,
+        tip: u64,
+    ) -> Result<(SafeHead, u64, bool)> {
         let last = chain.last().map(|b| b.number).unwrap_or(0);
         let mut grew = false;
         let verified_this;
@@ -290,7 +486,7 @@ impl Node {
                     self.max_sync
                 );
             }
-            match append_new_with_snapshot(self.up.as_ref(), &mut chain, tip, snapshot.as_mut()) {
+            match append_new_with_snapshot(self.up.as_ref(), chain, tip, snapshot.as_mut()) {
                 Ok(()) => {}
                 Err(e) if is_link_err(&e) => {
                     let Some(cp) = self.origin.clone() else {
@@ -313,7 +509,7 @@ impl Node {
             let from = tip.saturating_sub(self.lookback.saturating_sub(1));
             *chain = walk_headers(self.up.as_ref(), from, tip)?;
             verified_this = chain.len() as u64;
-        } else if let Err(e) = append_new(self.up.as_ref(), &mut chain, tip) {
+        } else if let Err(e) = append_new(self.up.as_ref(), chain, tip) {
             if is_link_err(&e) {
                 eprintln!(
                     "reorg/link break ({e}); resync lookback (max reorg {})",
@@ -333,14 +529,8 @@ impl Node {
                 .map(|b| b.number.saturating_sub(last))
                 .unwrap_or(0);
         }
-        let safe = safe_of(&chain)?;
-        drop(chain);
-        drop(snapshot);
-        self.bump_headers(verified_this);
-        if grew {
-            self.persist_verified_tip();
-        }
-        Ok((tip, safe))
+        let safe = safe_of(chain)?;
+        Ok((safe, verified_this, grew))
     }
 
     /// JSON-RPC 2.0 envelope: single object, batch array, or parse error.
@@ -2797,6 +2987,24 @@ pub fn serve(node: Arc<Node>, listen: &str) -> Result<()> {
         if let Some(code) = rpc_http_host_reject(host.as_deref(), loopback_only) {
             let _ = req.respond(Response::from_string("forbidden host").with_status_code(code));
             continue;
+        }
+        // Metrics is the one GET route, and only when explicitly enabled. It sits
+        // after the Host check so DNS-rebinding protection still applies, and it is
+        // never reachable on the default (metrics-off) build.
+        if req.method() == &Method::Get {
+            let path = req.url().split('?').next().unwrap_or("");
+            if node.metrics_enabled() && path == "/metrics" {
+                let body = node.metrics_text();
+                let mut resp = Response::from_string(body);
+                if let Ok(h) = Header::from_bytes(
+                    &b"Content-Type"[..],
+                    &b"text/plain; version=0.0.4; charset=utf-8"[..],
+                ) {
+                    resp.add_header(h);
+                }
+                let _ = req.respond(resp);
+                continue;
+            }
         }
         if let Some(code) = rpc_http_reject(req.method() == &Method::Post, 0) {
             if code == 405 {

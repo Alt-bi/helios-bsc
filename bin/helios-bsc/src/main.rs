@@ -124,6 +124,9 @@ enum Commands {
         /// Opt-in: receipts/txs header-bound to Safe; gasPrice / feeHistory / maxPriorityFeePerGas unbound.
         #[arg(long)]
         allow_unverified_passthrough: bool,
+        /// Serve Prometheus metrics on `GET /metrics` (same bind; off by default).
+        #[arg(long)]
+        metrics: bool,
     },
     /// Write a checkpoint JSON from a trusted header + operator sealing set.
     WriteCheckpoint {
@@ -263,6 +266,7 @@ async fn main() -> Result<()> {
             require_checkpoint,
             allow_non_loopback,
             allow_unverified_passthrough,
+            metrics,
         } => {
             info!(%listen, lookback, max_sync, "starting verified RPC");
             assert_listen_policy(&listen, allow_non_loopback)?;
@@ -302,6 +306,10 @@ async fn main() -> Result<()> {
             }
             if has_backup {
                 node.set_backup_transport(true);
+            }
+            if metrics {
+                node.set_metrics_enabled(true);
+                eprintln!("metrics on http://{listen}/metrics");
             }
             rpc_server::serve(Arc::new(node), &listen)
         }

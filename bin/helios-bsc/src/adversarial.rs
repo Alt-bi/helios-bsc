@@ -1101,6 +1101,89 @@ fn proof_counters_ok_and_fail() {
     assert!(st_bad["result"]["proofFail"].as_u64().unwrap() >= 1);
 }
 
+#[test]
+fn metrics_are_off_by_default_and_opt_in() {
+    let (chain, rpc) = safe_chain_with_fixture_root();
+    let mut node = node_from_chain(chain, rpc.proof_json());
+    assert!(!node.metrics_enabled(), "metrics must default to off");
+    node.set_metrics_enabled(true);
+    assert!(node.metrics_enabled());
+}
+
+#[test]
+fn metrics_text_is_prometheus_and_tracks_proof_counters() {
+    let (chain, rpc) = safe_chain_with_fixture_root();
+    let node = node_from_chain(chain.clone(), rpc.proof_json());
+    let ok = node.handle(&req("eth_getBalance", json!([WBNB_ADDRESS, "latest"])));
+    assert!(ok.get("result").is_some(), "{ok}");
+
+    let m = node.metrics_text();
+    for name in [
+        "helios_bsc_headers_verified_total",
+        "helios_bsc_header_verify_fail_total",
+        "helios_bsc_proof_success_total",
+        "helios_bsc_proof_fail_total",
+        "helios_bsc_upstream_errors_total",
+        "helios_bsc_safe_lag_blocks",
+        "helios_bsc_safe_lag_seconds",
+        "helios_bsc_checkpoint_age_seconds",
+        "helios_bsc_finality_mode",
+    ] {
+        assert!(
+            m.contains(&format!("# TYPE {name} ")),
+            "missing {name}:\n{m}"
+        );
+        assert!(
+            m.lines().any(|l| l.starts_with(&format!("{name} "))),
+            "no sample line for {name}:\n{m}"
+        );
+    }
+    assert!(m.contains("helios_bsc_proof_success_total 1"), "{m}");
+    assert!(m.contains("helios_bsc_proof_fail_total 0"), "{m}");
+    assert!(m.contains("helios_bsc_finality_mode 0"), "{m}");
+
+    // A rejected proof must move proof_fail, not upstream_errors.
+    let lying = MockRpc::new(Scenario::LyingBalance).proof_json();
+    let bad = node_from_chain(chain, lying);
+    let _ = bad.handle(&req("eth_getBalance", json!([WBNB_ADDRESS, "latest"])));
+    let mb = bad.metrics_text();
+    assert!(mb.contains("helios_bsc_proof_fail_total 1"), "{mb}");
+    assert!(mb.contains("helios_bsc_upstream_errors_total 0"), "{mb}");
+}
+
+/// Regression: a scrape must not queue behind a sync holding the chain lock.
+/// A live run stalled `/metrics` for 180s because it took that mutex; the gauges
+/// are published to atomics instead, so this must return while the lock is held.
+#[test]
+fn metrics_do_not_take_the_chain_lock() {
+    let (chain, rpc) = safe_chain_with_fixture_root();
+    let node = node_from_chain(chain, rpc.proof_json());
+    let _ = node.handle(&req("eth_getBalance", json!([WBNB_ADDRESS, "latest"])));
+
+    let held = node.lock_chain_for_test();
+    // Would deadlock (std Mutex is not reentrant) if metrics touched the chain.
+    let m = node.metrics_text();
+    drop(held);
+
+    assert!(m.contains("helios_bsc_tip_block "), "{m}");
+    assert!(m.contains("helios_bsc_safe_lag_blocks "), "{m}");
+}
+
+/// Before the first sync the gauges must say "unknown" (-1), never a fake 0 that
+/// would read as "tip is block 0" or "zero lag" on a dashboard.
+#[test]
+fn metrics_report_unknown_before_first_sync() {
+    let node = node_from_chain(
+        Vec::new(),
+        MockRpc::new(Scenario::HonestFixtures).proof_json(),
+    );
+    let m = node.metrics_text();
+    assert!(m.contains("helios_bsc_tip_block -1"), "{m}");
+    assert!(m.contains("helios_bsc_safe_block -1"), "{m}");
+    assert!(m.contains("helios_bsc_safe_lag_blocks -1"), "{m}");
+    assert!(m.contains("helios_bsc_checkpoint_age_seconds -1"), "{m}");
+}
+
 fn snapshot_for_chain(chain: &[VerifiedBlock]) -> Snapshot {
     let g = &chain[0];
     let mut set: Vec<String> = chain
