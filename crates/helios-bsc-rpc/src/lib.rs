@@ -74,7 +74,9 @@ pub fn method_policy(method: &str) -> MethodPolicy {
         | "eth_getBlockTransactionCountByNumber"
         | "eth_getBlockTransactionCountByHash"
         | "eth_getTransactionByBlockNumberAndIndex"
-        | "eth_getTransactionByBlockHashAndIndex" => MethodPolicy::Verified,
+        | "eth_getTransactionByBlockHashAndIndex"
+        | "eth_getBlockReceipts"
+        | "eth_getLogs" => MethodPolicy::Verified,
         "eth_getUncleCountByBlockNumber"
         | "eth_getUncleCountByBlockHash"
         | "eth_getUncleByBlockNumberAndIndex"
@@ -89,8 +91,7 @@ pub fn method_policy(method: &str) -> MethodPolicy {
         | "eth_feeHistory"
         | "eth_blobBaseFee" => MethodPolicy::Unverified,
         "helios_bsc_syncStatus" | "helios_bsc_getVerificationStatus" => MethodPolicy::Verified,
-        "eth_getLogs"
-        | "eth_newFilter"
+        "eth_newFilter"
         | "eth_newBlockFilter"
         | "eth_newPendingTransactionFilter"
         | "eth_uninstallFilter"
@@ -185,8 +186,12 @@ mod tests {
     }
 
     #[test]
-    fn get_logs_still_unsupported() {
-        assert_eq!(method_policy("eth_getLogs"), MethodPolicy::Unsupported);
+    fn get_logs_is_verified_single_block() {
+        assert_eq!(method_policy("eth_getLogs"), MethodPolicy::Verified);
+        assert_eq!(
+            method_policy("eth_getBlockReceipts"),
+            MethodPolicy::Verified
+        );
         assert_eq!(method_policy("eth_call"), MethodPolicy::Verified);
         assert_eq!(method_policy("eth_estimateGas"), MethodPolicy::Verified);
         assert!(!unverified_passthrough_ok("eth_estimateGas"));
@@ -197,6 +202,7 @@ mod tests {
             MethodPolicy::Unsupported
         );
         assert!(!unverified_passthrough_ok("eth_getLogs"));
+        assert!(!unverified_passthrough_ok("eth_getBlockReceipts"));
         assert!(!unverified_passthrough_ok("eth_subscribe"));
         assert_eq!(
             method_policy("eth_getBlockTransactionCountByNumber"),

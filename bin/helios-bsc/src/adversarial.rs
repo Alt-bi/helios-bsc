@@ -8,11 +8,12 @@ use crate::{Node, RpcUpstream};
 use anyhow::{anyhow, Result};
 use helios_bsc_consensus::{header_hash, newest_safe, Snapshot, VerifiedBlock};
 use helios_bsc_execution::{
-    encode_data32, encode_qty, EMPTY_TRIE_ROOT, MAX_CALL_ACCOUNTS, MAX_RAW_TX, TX_GAS,
+    encode_consensus_receipt, encode_data32, encode_qty, ordered_trie_root, ConsensusReceipt,
+    EMPTY_TRIE_ROOT, MAX_CALL_ACCOUNTS, MAX_RAW_TX, TX_GAS,
 };
 use helios_bsc_mock::{
-    cycling_sealer_chain, distinct_sealer_chain, headers_from_chain, n_seal, relink_dummy_chain,
-    MockRpc, Scenario, WBNB_ADDRESS, WRONG_STATE_ROOT,
+    cycling_sealer_chain, distinct_sealer_chain, header_from_verified, headers_from_chain, n_seal,
+    relink_dummy_chain, MockRpc, Scenario, WBNB_ADDRESS, WRONG_STATE_ROOT,
 };
 use helios_bsc_rpc::{
     ERR_INVALID, ERR_METHOD, ERR_NOT_SYNCED, ERR_PARAMS, ERR_PARSE, ERR_PROOF_FAILED,
@@ -36,6 +37,7 @@ struct MockUpstream {
     code: Vec<u8>,
     /// When set, `send_raw_transaction` returns this hash instead of keccak(raw).
     lie_raw_hash: Option<String>,
+    receipts: Vec<Value>,
 }
 
 impl MockUpstream {
@@ -55,6 +57,7 @@ impl MockUpstream {
             unverified: Value::Null,
             code: Vec::new(),
             lie_raw_hash: None,
+            receipts: Vec::new(),
         })
     }
 
@@ -69,6 +72,7 @@ impl MockUpstream {
             unverified: Value::Null,
             code: Vec::new(),
             lie_raw_hash: None,
+            receipts: Vec::new(),
         }
     }
 }
@@ -148,6 +152,10 @@ impl RpcUpstream for MockUpstream {
 
     fn unverified_call(&self, _method: &str, _params: &Value) -> Result<Value> {
         Ok(self.unverified.clone())
+    }
+
+    fn block_receipts_json(&self, _block_hash: &str) -> Result<Vec<Value>> {
+        Ok(self.receipts.clone())
     }
 }
 
@@ -915,7 +923,6 @@ fn filters_and_subscribe_unsupported() {
         "eth_newBlockFilter",
         "eth_subscribe",
         "eth_getFilterChanges",
-        "eth_getLogs",
         "eth_newPendingTransactionFilter",
         "eth_uninstallFilter",
         "eth_getFilterLogs",
@@ -1225,9 +1232,7 @@ fn receipt_disabled_without_flag() {
     let chain = distinct_sealer_chain(15);
     let node = node_from_chain(chain, json!({}));
     let v = node.handle(&req("eth_getTransactionReceipt", json!(["0x01"])));
-    assert_eq!(err_code(&v), ERR_METHOD);
-    let msg = v["error"]["message"].as_str().unwrap();
-    assert!(msg.contains("unverified_passthrough"), "{msg}");
+    assert_eq!(err_code(&v), ERR_PARAMS, "{v}");
     let g = node.handle(&req("eth_gasPrice", json!([])));
     assert_eq!(err_code(&g), ERR_METHOD);
 }
@@ -1342,9 +1347,20 @@ fn send_raw_binds_local_hash() {
     assert!(msg.contains("hash"), "{msg}");
 }
 
+fn chain_omitted_receipts_root() -> Vec<VerifiedBlock> {
+    let mut chain = distinct_sealer_chain(15);
+    let mut hdr = header_from_verified(&chain[0], [0u8; 32]);
+    hdr.receipts_root = format!("0x{}", hex::encode([0x11u8; 32]));
+    let hash = header_hash(&hdr).unwrap();
+    hdr.hash = format!("0x{}", hex::encode(hash));
+    chain[0].hash = hash;
+    chain[0].header = Some(hdr);
+    chain
+}
+
 #[test]
 fn receipt_header_bound_with_flag() {
-    let chain = distinct_sealer_chain(15);
+    let chain = chain_omitted_receipts_root();
     let safe = newest_safe(&chain, 21).expect("safe");
     let txh = "0x1111111111111111111111111111111111111111111111111111111111111111";
     let mut up = MockUpstream::for_chain(&chain, json!({}));
@@ -1360,6 +1376,20 @@ fn receipt_header_bound_with_flag() {
     assert_eq!(err_code(&short), ERR_PARAMS, "{short}");
     let v = node.handle(&req("eth_getTransactionReceipt", json!([txh])));
     assert_eq!(v["result"]["status"], json!("0x1"), "{v}");
+
+    let empty_root = distinct_sealer_chain(15);
+    let empty_safe = newest_safe(&empty_root, 21).expect("safe");
+    let mut empty_up = MockUpstream::for_chain(&empty_root, json!({}));
+    empty_up.unverified = json!({
+        "blockHash": empty_safe.hash,
+        "blockNumber": format!("0x{:x}", empty_safe.number),
+        "status": "0x1",
+        "transactionHash": txh,
+    });
+    let mut empty_node = Node::from_parts(Box::new(empty_up), 130, empty_root);
+    empty_node.set_allow_unverified_passthrough(true);
+    let empty = empty_node.handle(&req("eth_getTransactionReceipt", json!([txh])));
+    assert!(empty["result"].is_null(), "{empty}");
 
     let swapped = {
         let mut u = MockUpstream::for_chain(&chain, json!({}));
@@ -1929,4 +1959,157 @@ fn get_raw_tx_by_hash_keccak_bind_with_flag() {
     node_bad.set_allow_unverified_passthrough(true);
     let bad = node_bad.handle(&req("eth_getRawTransactionByHash", json!([txh])));
     assert_eq!(err_code(&bad), ERR_PROOF_FAILED, "{bad}");
+}
+
+#[test]
+fn dummy_empty_receipts_root_get_block_receipts_empty() {
+    let chain = distinct_sealer_chain(15);
+    let node = node_from_chain(chain, json!({}));
+    let v = node.handle(&req("eth_getBlockReceipts", json!(["latest"])));
+    assert_eq!(v["result"], json!([]), "{v}");
+}
+
+#[test]
+fn get_logs_latest_empty_on_dummy() {
+    let chain = distinct_sealer_chain(15);
+    let node = node_from_chain(chain, json!({}));
+    let v = node.handle(&req(
+        "eth_getLogs",
+        json!([{"fromBlock":"latest","toBlock":"latest"}]),
+    ));
+    assert_eq!(v["result"], json!([]), "{v}");
+    let omitted = node.handle(&req("eth_getLogs", json!([{}])));
+    assert_eq!(omitted["result"], json!([]), "{omitted}");
+}
+
+#[test]
+fn get_logs_multi_block_range_invalid() {
+    let chain = distinct_sealer_chain(15);
+    let node = node_from_chain(chain, json!({}));
+    let v = node.handle(&req(
+        "eth_getLogs",
+        json!([{"fromBlock":"0x0","toBlock":"0x1"}]),
+    ));
+    assert_eq!(err_code(&v), ERR_PARAMS, "{v}");
+}
+
+#[test]
+fn get_logs_not_passthrough_deadbeef() {
+    let chain = distinct_sealer_chain(15);
+    let mut up = MockUpstream::for_chain(&chain, json!({}));
+    up.unverified = json!([{
+        "address": "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        "topics": [],
+        "data": "0xdeadbeef",
+        "blockHash": "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    }]);
+    up.receipts = vec![json!({
+        "status": "0x1",
+        "cumulativeGasUsed": "0x1",
+        "logsBloom": format!("0x{}", hex::encode([0u8; 256])),
+        "logs": [{
+            "address": "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "topics": [],
+            "data": "0xdeadbeef",
+        }],
+        "type": "0x0",
+    })];
+    let mut node = Node::from_parts(Box::new(up), 130, chain);
+    node.set_allow_unverified_passthrough(true);
+    let v = node.handle(&req("eth_getLogs", json!([{"fromBlock":"latest"}])));
+    assert_eq!(v["result"], json!([]), "{v}");
+    let s = v.to_string();
+    assert!(!s.contains("deadbeef"), "{v}");
+}
+
+#[test]
+fn get_block_receipts_root_mismatch_is_proof_failed() {
+    let mut chain = distinct_sealer_chain(15);
+    let rec = ConsensusReceipt {
+        status: 1,
+        cumulative_gas_used: 21_000,
+        logs_bloom: [0u8; 256],
+        logs: Vec::new(),
+        tx_type: 2,
+    };
+    let raw = encode_consensus_receipt(&rec).unwrap();
+    let root = ordered_trie_root(&[raw]);
+    let mut hdr = header_from_verified(&chain[0], [0u8; 32]);
+    hdr.receipts_root = format!("0x{}", hex::encode(root));
+    let hash = header_hash(&hdr).unwrap();
+    hdr.hash = format!("0x{}", hex::encode(hash));
+    chain[0].hash = hash;
+    chain[0].header = Some(hdr);
+    let mut up = MockUpstream::for_chain(&chain, json!({}));
+    up.receipts = vec![json!({
+        "status": "0x0",
+        "cumulativeGasUsed": "0x1",
+        "logsBloom": format!("0x{}", hex::encode([0u8; 256])),
+        "logs": [],
+        "type": "0x2",
+        "transactionHash": format!("0x{}", "11".repeat(32)),
+    })];
+    let node = Node::from_parts(Box::new(up), 130, chain);
+    let v = node.handle(&req("eth_getBlockReceipts", json!(["latest"])));
+    assert_eq!(err_code(&v), ERR_PROOF_FAILED, "{v}");
+}
+
+#[test]
+fn pending_receipt_still_passthrough_only() {
+    let chain = distinct_sealer_chain(15);
+    let txh = "0x1111111111111111111111111111111111111111111111111111111111111111";
+    let mut up = MockUpstream::for_chain(&chain, json!({}));
+    up.unverified = json!({
+        "blockHash": Value::Null,
+        "blockNumber": Value::Null,
+        "transactionHash": txh,
+        "status": "0x1",
+    });
+    let node = Node::from_parts(Box::new(up), 130, chain);
+    let v = node.handle(&req("eth_getTransactionReceipt", json!([txh])));
+    assert_eq!(err_code(&v), ERR_METHOD, "{v}");
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("unverified_passthrough"), "{msg}");
+}
+
+#[test]
+fn get_transaction_receipt_verified_without_flag() {
+    let mut chain = distinct_sealer_chain(15);
+    let rec = ConsensusReceipt {
+        status: 1,
+        cumulative_gas_used: 21_000,
+        logs_bloom: [0u8; 256],
+        logs: Vec::new(),
+        tx_type: 2,
+    };
+    let raw = encode_consensus_receipt(&rec).unwrap();
+    let root = ordered_trie_root(&[raw]);
+    let mut hdr = header_from_verified(&chain[0], [0u8; 32]);
+    hdr.receipts_root = format!("0x{}", hex::encode(root));
+    let hash = header_hash(&hdr).unwrap();
+    hdr.hash = format!("0x{}", hex::encode(hash));
+    chain[0].hash = hash;
+    chain[0].header = Some(hdr.clone());
+    let txh = format!("0x{}", "11".repeat(32));
+    let mut up = MockUpstream::for_chain(&chain, json!({}));
+    up.receipts = vec![json!({
+        "status": "0x1",
+        "cumulativeGasUsed": "0x5208",
+        "logsBloom": format!("0x{}", hex::encode([0u8; 256])),
+        "logs": [],
+        "type": "0x2",
+        "transactionHash": txh,
+    })];
+    up.unverified = json!({
+        "blockHash": hdr.hash,
+        "blockNumber": hdr.number,
+        "transactionHash": txh,
+        "status": "0x1",
+    });
+    let node = Node::from_parts(Box::new(up), 130, chain);
+    let v = node.handle(&req("eth_getTransactionReceipt", json!([txh])));
+    assert_eq!(v["result"]["status"], json!("0x1"), "{v}");
+    assert_eq!(v["result"]["transactionHash"], json!(txh), "{v}");
+    let blk = node.handle(&req("eth_getBlockReceipts", json!(["latest"])));
+    assert_eq!(blk["result"].as_array().map(|a| a.len()), Some(1), "{blk}");
 }

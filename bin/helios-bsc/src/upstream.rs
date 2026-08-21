@@ -29,6 +29,13 @@ pub trait RpcUpstream: Send + Sync {
         Ok(vec![])
     }
 
+    /// Untrusted `eth_getBlockReceipts(blockHash)` JSON objects.
+    /// Default is empty (mocks / stubs). HTTP implementations must fetch.
+    fn block_receipts_json(&self, block_hash: &str) -> Result<Vec<Value>> {
+        let _ = block_hash;
+        Ok(vec![])
+    }
+
     fn get_proof(&self, address: &str, block: &str) -> Result<Value> {
         self.get_proof_keys(address, &[], block)
     }
@@ -116,6 +123,9 @@ impl RpcUpstream for Failover {
     }
     fn block_raw_transactions(&self, block_hash: &str) -> Result<Vec<Vec<u8>>> {
         self.fallback(|u| u.block_raw_transactions(block_hash))
+    }
+    fn block_receipts_json(&self, block_hash: &str) -> Result<Vec<Value>> {
+        self.fallback(|u| u.block_receipts_json(block_hash))
     }
 }
 
@@ -363,6 +373,20 @@ impl RpcUpstream for Upstream {
             raws.push(raw);
         }
         Ok(raws)
+    }
+
+    fn block_receipts_json(&self, block_hash: &str) -> Result<Vec<Value>> {
+        let v = self.call("eth_getBlockReceipts", json!([block_hash]))?;
+        if v.is_null() {
+            return Ok(Vec::new());
+        }
+        let arr = v
+            .as_array()
+            .ok_or_else(|| anyhow!("eth_getBlockReceipts: expected array"))?;
+        if arr.len() > MAX_ORDERED_TRIE_ITEMS {
+            return Err(anyhow!("too many receipts"));
+        }
+        Ok(arr.clone())
     }
 }
 

@@ -15,11 +15,13 @@ use helios_bsc_consensus::{
     checkpoint_at_snapshot, header_hash, proof_lag, within_proof_window, Snapshot, VerifiedBlock,
 };
 use helios_bsc_execution::{
-    encode_data32, encode_qty, eth_call_verified, eth_estimate_gas_verified, pad32,
-    retain_requested_storage, validate_bsc_raw_tx, verify_account_code, verify_eth_get_proof,
-    verify_storage_slot, verify_tx_list, CallBlock, CallError, CallTx, EthAccountProof, ProofError,
-    ProveAtSafe, VerifiedAccount, CALL_GAS_CAP, EMPTY_CODE_HASH, EMPTY_TRIE_ROOT,
-    MAX_CALL_ACCOUNTS, MAX_CALL_DATA, MAX_CODE_SIZE, MAX_RAW_TX,
+    encode_consensus_receipt, encode_data32, encode_qty, eth_call_verified,
+    eth_estimate_gas_verified, pad32, retain_requested_storage, validate_bsc_raw_tx,
+    verify_account_code, verify_eth_get_proof, verify_receipt_list, verify_storage_slot,
+    verify_tx_list, CallBlock, CallError, CallTx, ConsensusLog, ConsensusReceipt, EthAccountProof,
+    ProofError, ProveAtSafe, VerifiedAccount, CALL_GAS_CAP, EMPTY_CODE_HASH, EMPTY_TRIE_ROOT,
+    MAX_CALL_ACCOUNTS, MAX_CALL_DATA, MAX_CODE_SIZE, MAX_LOG_TOPICS, MAX_ORDERED_TRIE_ITEMS,
+    MAX_RAW_TX, MAX_RECEIPT_LOGS,
 };
 use helios_bsc_rpc::{
     jsonrpc_id_ok, jsonrpc_is_v2, jsonrpc_params_len, jsonrpc_params_ok, method_policy, rpc_err,
@@ -464,9 +466,10 @@ impl Node {
             "eth_getUncleByBlockHashAndIndex" => self.uncle_by_hash(id, req),
             "eth_coinbase" => rpc_ok(id, json!("0x0000000000000000000000000000000000000000")),
             "eth_sendRawTransaction" => self.send_raw(id, req),
-            "eth_getTransactionReceipt" | "eth_getTransactionByHash" => {
-                self.unverified_mined(id, req, method)
-            }
+            "eth_getBlockReceipts" => self.get_block_receipts(id, req),
+            "eth_getLogs" => self.get_logs(id, req),
+            "eth_getTransactionReceipt" => self.get_transaction_receipt(id, req),
+            "eth_getTransactionByHash" => self.unverified_mined(id, req, method),
             "eth_getRawTransactionByHash" => self.get_raw_tx_by_hash(id, req),
             "eth_gasPrice" | "eth_maxPriorityFeePerGas" | "eth_feeHistory" | "eth_blobBaseFee" => {
                 self.unverified_qty(id, req, method)
@@ -1044,6 +1047,326 @@ impl Node {
         let header = self.load_verified_header(local)?;
         let hashes = self.bind_tx_hashes(&header)?;
         Ok(BoundTxs { header, hashes })
+    }
+
+    /// Bind untrusted receipt JSON to sealed `receiptsRoot`. Empty root → no fetch.
+    /// Empty fetch + non-empty root → omitted (cannot prove; do not invent).
+    fn bind_receipts(&self, hdr: &RpcBlockHeader) -> Result<ReceiptBind, (i64, String)> {
+        let root = decode_hex_fixed::<32>(&hdr.receipts_root).map_err(|e| {
+            (
+                ERR_PROOF_FAILED,
+                format!("proof_verification_failed: receiptsRoot: {e}"),
+            )
+        })?;
+        if root == EMPTY_TRIE_ROOT {
+            return Ok(ReceiptBind::Empty);
+        }
+        let jsons = self
+            .up
+            .block_receipts_json(&hdr.hash)
+            .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))?;
+        if jsons.is_empty() {
+            return Ok(ReceiptBind::Omitted);
+        }
+        if jsons.len() > MAX_ORDERED_TRIE_ITEMS {
+            return Err((
+                ERR_PROOF_FAILED,
+                "proof_verification_failed: too many receipts".into(),
+            ));
+        }
+        let mut raws = Vec::with_capacity(jsons.len());
+        let mut items = Vec::with_capacity(jsons.len());
+        for (i, v) in jsons.iter().enumerate() {
+            let parsed = parse_consensus_receipt_json(v).map_err(|e| {
+                (
+                    ERR_PROOF_FAILED,
+                    format!("proof_verification_failed: receipt {i}: {e}"),
+                )
+            })?;
+            let raw = encode_consensus_receipt(&parsed.consensus).map_err(|e| {
+                (
+                    ERR_PROOF_FAILED,
+                    format!("proof_verification_failed: receipt {i}: {e}"),
+                )
+            })?;
+            raws.push(raw);
+            items.push(BoundReceipt {
+                json: decorate_receipt_json(v.clone(), hdr, i, parsed.tx_hash),
+                tx_hash: parsed.tx_hash,
+                logs: parsed.consensus.logs,
+            });
+        }
+        verify_receipt_list(&raws, &root)
+            .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))?;
+        Ok(ReceiptBind::List(items))
+    }
+
+    fn bound_block_receipts(
+        &self,
+        local: &VerifiedBlock,
+    ) -> Result<(RpcBlockHeader, ReceiptBind), (i64, String)> {
+        let header = self.load_verified_header(local)?;
+        let bind = self.bind_receipts(&header)?;
+        Ok((header, bind))
+    }
+
+    fn get_block_receipts(&self, id: Value, req: &Value) -> Value {
+        let local = match self.local_block_by_number_or_hash(req) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        match self.bound_block_receipts(&local) {
+            Ok((_, ReceiptBind::List(list))) => {
+                rpc_ok(id, Value::Array(list.into_iter().map(|r| r.json).collect()))
+            }
+            Ok((_, ReceiptBind::Empty | ReceiptBind::Omitted)) => rpc_ok(id, json!([])),
+            Err((code, msg)) => rpc_err(id, code, &msg),
+        }
+    }
+
+    fn get_transaction_receipt(&self, id: Value, req: &Value) -> Value {
+        let want = match query_tx_hash(req) {
+            Ok(h) => h,
+            Err(e) => return rpc_err(id, ERR_PARAMS, &e),
+        };
+        let params = req.get("params").cloned().unwrap_or(json!([]));
+        let raw = match self
+            .up
+            .unverified_call("eth_getTransactionReceipt", &params)
+        {
+            Ok(v) => v,
+            Err(e) => return rpc_err(id, -32000, &format!("unverified_upstream: {e}")),
+        };
+        if raw.is_null() {
+            return rpc_ok(id, Value::Null);
+        }
+        let (hash_empty, num_empty, block_hash) = {
+            let Some(map) = raw.as_object() else {
+                return rpc_err(id, ERR_PROOF_FAILED, "receipt is not an object");
+            };
+            let hash_v = map.get("blockHash");
+            let num_v = map.get("blockNumber");
+            (
+                is_empty_block_hash(hash_v),
+                is_nullish_json(num_v),
+                hash_v.and_then(Value::as_str).map(str::to_string),
+            )
+        };
+        if hash_empty && num_empty {
+            return self.passthrough_mined(id, raw, Some(&want));
+        }
+        if hash_empty != num_empty {
+            return rpc_err(id, ERR_NOT_SYNCED, "receipt/tx pending fields inconsistent");
+        }
+        let hash = match block_hash {
+            Some(s) => s,
+            None => return rpc_err(id, ERR_NOT_SYNCED, "receipt/tx blockHash not a string"),
+        };
+        let (_, safe) = match self.refresh() {
+            Ok(v) => v,
+            Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
+        };
+        let local = {
+            let chain = self.chain.lock().expect("chain lock");
+            chain
+                .iter()
+                .find(|b| {
+                    let h = format!("0x{}", hex::encode(b.hash));
+                    hex_eq_loose(&h, &hash)
+                })
+                .cloned()
+        };
+        let Some(local) = local else {
+            return rpc_err(
+                id,
+                ERR_NOT_SYNCED,
+                "receipt/tx blockHash not in local verified chain",
+            );
+        };
+        if local.number > safe.number {
+            return rpc_err(id, ERR_NOT_SYNCED, "receipt/tx is above local Safe");
+        }
+        match self.bound_block_receipts(&local) {
+            Ok((_, ReceiptBind::List(list))) => {
+                match list.into_iter().find(|r| r.tx_hash.as_ref() == Some(&want)) {
+                    Some(r) => rpc_ok(id, r.json),
+                    None => rpc_ok(id, Value::Null),
+                }
+            }
+            Ok((_, ReceiptBind::Empty)) => rpc_ok(id, Value::Null),
+            Ok((_, ReceiptBind::Omitted)) => self.passthrough_mined(id, raw, Some(&want)),
+            Err((code, msg)) => rpc_err(id, code, &msg),
+        }
+    }
+
+    fn passthrough_mined(&self, id: Value, raw: Value, want: Option<&[u8; 32]>) -> Value {
+        if !self.allow_unverified_passthrough {
+            return rpc_err(id, ERR_METHOD, "unverified_passthrough_disabled");
+        }
+        let (_, safe) = match self.refresh() {
+            Ok(v) => v,
+            Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
+        };
+        let chain = self.chain.lock().expect("chain lock");
+        match bind_mined_object(&raw, &safe, &chain, want) {
+            Ok(()) => rpc_ok(id, raw),
+            Err(msg) => rpc_err(id, ERR_NOT_SYNCED, &msg),
+        }
+    }
+
+    fn get_logs(&self, id: Value, req: &Value) -> Value {
+        let filter = match req.get("params").and_then(Value::as_array) {
+            None => None,
+            Some(p) if p.is_empty() => None,
+            Some(p) => match p.first() {
+                Some(Value::Object(m)) => Some(m),
+                Some(Value::Null) => None,
+                _ => return rpc_err(id, ERR_PARAMS, "eth_getLogs filter must be an object"),
+            },
+        };
+        let local = match self.resolve_get_logs_block(id.clone(), filter) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        let addresses = match parse_log_addresses(filter) {
+            Ok(a) => a,
+            Err(e) => return rpc_err(id, ERR_PARAMS, &e),
+        };
+        let topics = match parse_log_topics(filter) {
+            Ok(t) => t,
+            Err(e) => return rpc_err(id, ERR_PARAMS, &e),
+        };
+        let (header, bind) = match self.bound_block_receipts(&local) {
+            Ok(v) => v,
+            Err((code, msg)) => return rpc_err(id, code, &msg),
+        };
+        let receipts = match bind {
+            ReceiptBind::List(list) => list,
+            ReceiptBind::Empty | ReceiptBind::Omitted => return rpc_ok(id, json!([])),
+        };
+        let mut out = Vec::new();
+        let mut log_index: u64 = 0;
+        for (tx_i, rec) in receipts.iter().enumerate() {
+            for log in &rec.logs {
+                if log_matches(log, &addresses, &topics) {
+                    if out.len() >= MAX_GET_LOGS {
+                        break;
+                    }
+                    out.push(rpc_log_json(
+                        log,
+                        &header,
+                        rec.tx_hash,
+                        tx_i as u64,
+                        log_index,
+                    ));
+                }
+                log_index = log_index.saturating_add(1);
+            }
+            if out.len() >= MAX_GET_LOGS {
+                break;
+            }
+        }
+        rpc_ok(id, Value::Array(out))
+    }
+
+    fn resolve_get_logs_block(
+        &self,
+        id: Value,
+        filter: Option<&serde_json::Map<String, Value>>,
+    ) -> Result<VerifiedBlock, Value> {
+        let block_hash = filter.and_then(|m| m.get("blockHash"));
+        let from_v = filter.and_then(|m| m.get("fromBlock"));
+        let to_v = filter.and_then(|m| m.get("toBlock"));
+        let has_range = !is_nullish_json(from_v) || !is_nullish_json(to_v);
+        if !is_nullish_json(block_hash) {
+            if has_range {
+                return Err(rpc_err(
+                    id,
+                    ERR_PARAMS,
+                    "cannot specify both blockHash and fromBlock/toBlock",
+                ));
+            }
+            let hash = block_hash
+                .and_then(Value::as_str)
+                .ok_or_else(|| rpc_err(id.clone(), ERR_PARAMS, "blockHash must be a string"))?;
+            if decode_hex_fixed::<32>(hash).is_err() {
+                return Err(rpc_err(id, ERR_PARAMS, "blockHash is not 32 bytes"));
+            }
+            let (_, safe) = match self.refresh() {
+                Ok(v) => v,
+                Err(e) => return Err(rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}"))),
+            };
+            let chain = self.chain.lock().expect("chain lock");
+            return wallet_get_block_by_hash(hash, safe.number, &chain)
+                .cloned()
+                .ok_or_else(|| {
+                    rpc_err(
+                        id,
+                        ERR_NOT_SYNCED,
+                        "wallet mode only serves verified hashes at or below Safe",
+                    )
+                });
+        }
+        let from_s =
+            wallet_block_tag_str(from_v).map_err(|e| rpc_err(id.clone(), ERR_PARAMS, e))?;
+        let to_s = wallet_block_tag_str(to_v).map_err(|e| rpc_err(id.clone(), ERR_PARAMS, e))?;
+        let (_, safe) = match self.refresh() {
+            Ok(v) => v,
+            Err(e) => return Err(rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}"))),
+        };
+        let from_n = log_filter_block_number(from_s, safe.number, &safe.hash).ok_or_else(|| {
+            rpc_err(
+                id.clone(),
+                ERR_NOT_SYNCED,
+                "wallet mode only serves Safe or below (latest→Safe)",
+            )
+        })?;
+        let to_n = log_filter_block_number(to_s, safe.number, &safe.hash).ok_or_else(|| {
+            rpc_err(
+                id.clone(),
+                ERR_NOT_SYNCED,
+                "wallet mode only serves Safe or below (latest→Safe)",
+            )
+        })?;
+        if from_n != to_n {
+            return Err(rpc_err(
+                id,
+                ERR_PARAMS,
+                "eth_getLogs is single-block only (fromBlock==toBlock or blockHash)",
+            ));
+        }
+        if from_n > safe.number {
+            return Err(rpc_err(
+                id,
+                ERR_NOT_SYNCED,
+                "wallet mode only serves Safe or below (latest→Safe)",
+            ));
+        }
+        let chain = self.chain.lock().expect("chain lock");
+        chain
+            .iter()
+            .find(|b| b.number == from_n)
+            .cloned()
+            .ok_or_else(|| {
+                rpc_err(
+                    id,
+                    ERR_NOT_SYNCED,
+                    "wallet mode only serves Safe or below (latest→Safe)",
+                )
+            })
+    }
+
+    fn local_block_by_number_or_hash(&self, req: &Value) -> Result<VerifiedBlock, Value> {
+        let tag = req
+            .get("params")
+            .and_then(Value::as_array)
+            .and_then(|p| p.first())
+            .and_then(Value::as_str);
+        if tag.is_some_and(|s| decode_hex_fixed::<32>(s).is_ok()) {
+            self.local_block_by_hash(req)
+        } else {
+            self.local_block_by_number(req)
+        }
     }
 
     fn tx_count_by_number(&self, id: Value, req: &Value) -> Value {
@@ -1765,10 +2088,9 @@ fn bind_result_tx_hash(
     Ok(())
 }
 
-const MAX_RECEIPT_LOGS: usize = 1024;
-const MAX_LOG_TOPICS: usize = 4;
 const MAX_LOG_DATA: usize = 64 * 1024;
 const MAX_FEE_HISTORY_ITEMS: usize = 1024;
+const MAX_GET_LOGS: usize = MAX_RECEIPT_LOGS;
 
 fn bind_optional_logs(
     v: Option<&Value>,
@@ -2095,6 +2417,287 @@ fn wants_full_txs(params: Option<&Vec<Value>>) -> bool {
 struct BoundTxs {
     header: RpcBlockHeader,
     hashes: Vec<[u8; 32]>,
+}
+
+enum ReceiptBind {
+    Empty,
+    Omitted,
+    List(Vec<BoundReceipt>),
+}
+
+struct BoundReceipt {
+    json: Value,
+    tx_hash: Option<[u8; 32]>,
+    logs: Vec<ConsensusLog>,
+}
+
+struct ParsedReceipt {
+    consensus: ConsensusReceipt,
+    tx_hash: Option<[u8; 32]>,
+}
+
+fn decorate_receipt_json(
+    mut v: Value,
+    hdr: &RpcBlockHeader,
+    index: usize,
+    tx_hash: Option<[u8; 32]>,
+) -> Value {
+    if let Value::Object(map) = &mut v {
+        map.insert("blockHash".into(), json!(hdr.hash.clone()));
+        map.insert("blockNumber".into(), json!(hdr.number.clone()));
+        map.insert("transactionIndex".into(), json!(format!("0x{index:x}")));
+        if let Some(h) = tx_hash {
+            map.insert(
+                "transactionHash".into(),
+                json!(format!("0x{}", hex::encode(h))),
+            );
+        }
+    }
+    v
+}
+
+fn parse_consensus_receipt_json(v: &Value) -> Result<ParsedReceipt, String> {
+    let map = v
+        .as_object()
+        .ok_or_else(|| "receipt is not an object".to_string())?;
+    let status = match map.get("status") {
+        Some(Value::String(s)) => {
+            let n = decode_u64(s).map_err(|_| "status invalid".to_string())?;
+            if n > 1 {
+                return Err("status is not 0x0 or 0x1".into());
+            }
+            n
+        }
+        _ => return Err("status missing".into()),
+    };
+    let cumulative_gas_used = match map.get("cumulativeGasUsed") {
+        Some(Value::String(s)) => {
+            decode_u64(s).map_err(|_| "cumulativeGasUsed is not a hex quantity".to_string())?
+        }
+        _ => return Err("cumulativeGasUsed missing".into()),
+    };
+    let logs_bloom = match map.get("logsBloom") {
+        Some(Value::String(s)) => {
+            decode_hex_fixed::<256>(s).map_err(|_| "logsBloom is not 256 bytes".to_string())?
+        }
+        _ => return Err("logsBloom missing".into()),
+    };
+    let tx_type = match map.get("type") {
+        None | Some(Value::Null) => 0u8,
+        Some(Value::String(s)) => {
+            let n = decode_u64(s).map_err(|_| "type invalid".to_string())?;
+            if n > 4 {
+                return Err("tx type is not 0x0..=0x4".into());
+            }
+            n as u8
+        }
+        Some(_) => return Err("type not a hex quantity".into()),
+    };
+    let logs = match map.get("logs") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(arr)) => {
+            if arr.len() > MAX_RECEIPT_LOGS {
+                return Err("too many logs".into());
+            }
+            let mut out = Vec::with_capacity(arr.len());
+            for log in arr {
+                out.push(parse_consensus_log_json(log)?);
+            }
+            out
+        }
+        Some(_) => return Err("logs not an array".into()),
+    };
+    let tx_hash = match map.get("transactionHash") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(
+            decode_hex_fixed::<32>(s)
+                .map_err(|_| "transactionHash is not a 32-byte hash".to_string())?,
+        ),
+        Some(_) => return Err("transactionHash not a string".into()),
+    };
+    Ok(ParsedReceipt {
+        consensus: ConsensusReceipt {
+            status,
+            cumulative_gas_used,
+            logs_bloom,
+            logs,
+            tx_type,
+        },
+        tx_hash,
+    })
+}
+
+fn parse_consensus_log_json(v: &Value) -> Result<ConsensusLog, String> {
+    let map = v
+        .as_object()
+        .ok_or_else(|| "log is not an object".to_string())?;
+    let address = match map.get("address") {
+        Some(Value::String(s)) => {
+            decode_hex_fixed::<20>(s).map_err(|_| "log.address is not 20 bytes".to_string())?
+        }
+        _ => return Err("log.address missing".into()),
+    };
+    let mut topics = Vec::new();
+    match map.get("topics") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(arr)) => {
+            if arr.len() > MAX_LOG_TOPICS {
+                return Err("too many log topics".into());
+            }
+            for t in arr {
+                let s = t
+                    .as_str()
+                    .ok_or_else(|| "log topic not a string".to_string())?;
+                topics.push(decode_hex_fixed::<32>(s).map_err(|_| "log topic is not 32 bytes")?);
+            }
+        }
+        Some(_) => return Err("log.topics is not an array".into()),
+    }
+    let data = match map.get("data") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::String(s)) => {
+            let bytes = decode_hex(s).map_err(|_| "log.data is not hex")?;
+            if bytes.len() > MAX_LOG_DATA {
+                return Err("log.data too large".into());
+            }
+            bytes
+        }
+        Some(_) => return Err("log.data not a hex string".into()),
+    };
+    Ok(ConsensusLog {
+        address,
+        topics,
+        data,
+    })
+}
+
+fn parse_log_addresses(
+    filter: Option<&serde_json::Map<String, Value>>,
+) -> Result<Vec<[u8; 20]>, String> {
+    match filter.and_then(|m| m.get("address")) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(s)) => {
+            let a = decode_hex_fixed::<20>(s).map_err(|_| "address is not 20 bytes".to_string())?;
+            Ok(vec![a])
+        }
+        Some(Value::Array(arr)) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for x in arr {
+                let s = x
+                    .as_str()
+                    .ok_or_else(|| "address is not 20 bytes".to_string())?;
+                out.push(decode_hex_fixed::<20>(s).map_err(|_| "address is not 20 bytes")?);
+            }
+            Ok(out)
+        }
+        Some(_) => Err("address must be a 20-byte hex or array".into()),
+    }
+}
+
+fn parse_log_topics(
+    filter: Option<&serde_json::Map<String, Value>>,
+) -> Result<Vec<Option<Vec<[u8; 32]>>>, String> {
+    match filter.and_then(|m| m.get("topics")) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(arr)) => {
+            if arr.len() > MAX_LOG_TOPICS {
+                return Err("too many topics (max 4)".into());
+            }
+            let mut out = Vec::with_capacity(arr.len());
+            for t in arr {
+                out.push(parse_topic_spec(t)?);
+            }
+            Ok(out)
+        }
+        Some(_) => Err("topics must be an array".into()),
+    }
+}
+
+fn parse_topic_spec(v: &Value) -> Result<Option<Vec<[u8; 32]>>, String> {
+    match v {
+        Value::Null => Ok(None),
+        Value::String(s) => {
+            let t = decode_hex_fixed::<32>(s).map_err(|_| "topic is not 32 bytes".to_string())?;
+            Ok(Some(vec![t]))
+        }
+        Value::Array(arr) => {
+            let mut ors = Vec::with_capacity(arr.len());
+            for x in arr {
+                let s = x
+                    .as_str()
+                    .ok_or_else(|| "topic is not 32 bytes".to_string())?;
+                ors.push(decode_hex_fixed::<32>(s).map_err(|_| "topic is not 32 bytes")?);
+            }
+            Ok(Some(ors))
+        }
+        _ => Err("topic must be null, 32-byte hex, or array of 32-byte hex".into()),
+    }
+}
+
+fn log_matches(
+    log: &ConsensusLog,
+    addresses: &[[u8; 20]],
+    topics: &[Option<Vec<[u8; 32]>>],
+) -> bool {
+    if !addresses.is_empty() && !addresses.iter().any(|a| a == &log.address) {
+        return false;
+    }
+    if topics.len() > log.topics.len() {
+        return false;
+    }
+    for (i, spec) in topics.iter().enumerate() {
+        let Some(ors) = spec else {
+            continue;
+        };
+        if ors.is_empty() {
+            continue;
+        }
+        if !ors.iter().any(|t| t == &log.topics[i]) {
+            return false;
+        }
+    }
+    true
+}
+
+fn rpc_log_json(
+    log: &ConsensusLog,
+    hdr: &RpcBlockHeader,
+    tx_hash: Option<[u8; 32]>,
+    tx_index: u64,
+    log_index: u64,
+) -> Value {
+    let topics: Vec<Value> = log
+        .topics
+        .iter()
+        .map(|t| json!(format!("0x{}", hex::encode(t))))
+        .collect();
+    json!({
+        "address": format!("0x{}", hex::encode(log.address)),
+        "topics": topics,
+        "data": format!("0x{}", hex::encode(&log.data)),
+        "blockNumber": hdr.number,
+        "blockHash": hdr.hash,
+        "transactionHash": tx_hash.map(|h| format!("0x{}", hex::encode(h))),
+        "transactionIndex": format!("0x{tx_index:x}"),
+        "logIndex": format!("0x{log_index:x}"),
+        "removed": false,
+    })
+}
+
+fn log_filter_block_number(tag: Option<&str>, safe_number: u64, safe_hash: &str) -> Option<u64> {
+    match tag {
+        None | Some("") | Some("latest") | Some("safe") | Some("finalized") => Some(safe_number),
+        Some("pending") | Some("earliest") => None,
+        Some(t) if t.eq_ignore_ascii_case(safe_hash) => Some(safe_number),
+        Some(t) if t.starts_with("0x") || t.starts_with("0X") => {
+            if decode_hex_fixed::<32>(t).is_ok() {
+                None
+            } else {
+                decode_u64(t).ok()
+            }
+        }
+        _ => None,
+    }
 }
 
 fn rpc_block_json(hdr: &RpcBlockHeader, tx_hashes: &[[u8; 32]]) -> Value {

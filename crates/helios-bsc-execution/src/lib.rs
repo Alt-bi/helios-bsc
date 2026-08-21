@@ -27,7 +27,10 @@ pub use proof::{
 };
 pub use raw_tx::{validate_bsc_raw_tx, RawTxError, MAX_RAW_TX};
 pub use receipt_list::{verify_receipt_list, ReceiptListError};
-pub use receipt_rlp::{encode_consensus_receipt, ConsensusLog, ConsensusReceipt, ReceiptRlpError};
+pub use receipt_rlp::{
+    encode_consensus_receipt, ConsensusLog, ConsensusReceipt, ReceiptRlpError,
+    MAX_LOG_TOPICS, MAX_RECEIPT_LOGS,
+};
 pub use tx_list::{verify_tx_list, TxListError};
 
 #[derive(Debug, Error)]
