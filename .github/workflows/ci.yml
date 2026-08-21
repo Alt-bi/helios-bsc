@@ -11,7 +11,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Channel matches rust-toolchain.toml (stable + clippy, rustfmt); not nightly.
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -27,7 +27,7 @@ jobs:
   docker:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: docker compose config
         env:
           # Dummy interpolant only — not a live RPC and not a secret.
