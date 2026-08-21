@@ -20,9 +20,11 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all -- --check
       - name: cargo test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
+      - name: cargo test helios-bsc-execution
+        run: cargo test -p helios-bsc-execution --lib --locked
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   docker:
     runs-on: ubuntu-latest
