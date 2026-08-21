@@ -49,7 +49,7 @@
 3. Remaining header-verify items that still lack fixtures: **out-of-turn backoff**, **Maxwell FF recents prune**, **EIP-1559 parent `baseFee` formulas**. Not implemented — do not invent from prose.
 4. `eth_estimateGas` best-effort — **closed** (proof-backed binary search; MethodPolicy Verified; never proxied). Local `BLOCKHASH` — **closed**. Revert/Halt JSON-RPC **code 3** — **closed** (geth; not `-32001`).
 5. Fast Finality BLS — **not implemented**; later. Deeper RPC (≥128) still helps if proofs start failing.
-6. Optional remaining (later; **not done**): RPC bind of tx hashes in `eth_getBlock*` (`transactionsRoot`); `receiptsRoot` proofs; `eth_getLogs`. Execution `ordered_trie_root` is in tree at `5b4b06c`; **not** RPC-wired (tx hashes / receipts / getRaw still open). `accessList` prefetch — **closed**. Historical `n≤Safe` — **closed**. Proof-round seed budget — **closed**. Keep `SpecId::CANCUN` on revm 19.7 (not Mendel).
+6. Optional remaining (later; **not done**): `receiptsRoot` proofs on mined receipts/logs; `eth_getLogs`. `transactionsRoot` hashes in `eth_getBlock*` — **closed** (raw-RLP DeriveSha; empty root or no envelopes → `[]`; lying list → `-32001`). Count/ByIndex **Verified**. Opt-in `eth_getRawTransactionByHash` keccak-bound. Execution `verify_receipt_list` in tree, not RPC-wired. `accessList` prefetch — **closed**. Historical `n≤Safe` — **closed**. Keep `SpecId::CANCUN` on revm 19.7 (not Mendel).
 
 ## Live pins (do not assume design-doc 16)
 

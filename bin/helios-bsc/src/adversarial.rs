@@ -896,9 +896,14 @@ fn get_block_prefers_stored_header_over_lying_refetch() {
     up.lie_state_root = true;
     let node = Node::from_parts(Box::new(up), 130, chain);
     let v = node.handle(&req("eth_getBlockByNumber", json!(["latest", false])));
-    // Stored header Hash()/stateRoot match. Lying refetch would be ERR_STATE_ROOT
-    // before tx bind. Fixture transactionsRoot is non-empty and mock has no raws.
-    assert_eq!(err_code(&v), ERR_PROOF_FAILED, "{v}");
+    // Stored header Hash()/stateRoot match. Lying refetch would be ERR_STATE_ROOT.
+    // Fixture transactionsRoot is non-empty; mock has no raw envelopes → hashes omitted.
+    assert_eq!(
+        v["result"]["hash"],
+        json!(format!("0x{}", hex::encode(hash))),
+        "{v}"
+    );
+    assert_eq!(v["result"]["transactions"], json!([]), "{v}");
 }
 
 #[test]

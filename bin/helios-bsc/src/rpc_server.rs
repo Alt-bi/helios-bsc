@@ -1032,6 +1032,10 @@ impl Node {
             .up
             .block_raw_transactions(&hdr.hash)
             .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))?;
+        // No envelopes: omit hashes (do not invent, do not fail the header read).
+        if raws.is_empty() {
+            return Ok(Vec::new());
+        }
         verify_tx_list(&raws, &root)
             .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))
     }
