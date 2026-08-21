@@ -46,8 +46,9 @@
 1. **≥24h** mainnet differential soak, mismatch=0 — still the **MVP-1 GA live gate**. 1h re-diff 2026-08-19 is closed (Ankr vs BlastAPI: unique=19, compared=214, match=214, mismatch=0, skip=38 Ankr window, not false-accept). **Not claimed done.**
 2. Re-pin after Pasteur (**2026-08-25**, scheduled, **not live**) if extraData / epoch / turnLength change.
 3. Remaining header-verify items that still lack fixtures: **out-of-turn backoff**, **Maxwell FF recents prune**, **EIP-1559 parent `baseFee` formulas**. Not implemented — do not invent from prose.
-4. `eth_estimateGas` best-effort — **closed** (proof-backed binary search; MethodPolicy Verified; never proxied).
+4. `eth_estimateGas` best-effort — **closed** (proof-backed binary search; MethodPolicy Verified; never proxied). Local `BLOCKHASH` — **closed**. Revert/Halt JSON-RPC **code 3** — **closed** (geth; not `-32001`).
 5. Fast Finality BLS — **not implemented**; later. Deeper RPC (≥128) still helps if proofs start failing.
+6. Optional remaining (later; **not done**): historical `n≤Safe` state reads; proof-round seed budget; `receiptsRoot`; `transactionsRoot` hashes.
 
 ## Live pins (do not assume design-doc 16)
 
