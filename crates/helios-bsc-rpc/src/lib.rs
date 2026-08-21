@@ -66,7 +66,8 @@ pub fn method_policy(method: &str) -> MethodPolicy {
         | "eth_getCode"
         | "eth_getStorageAt"
         | "eth_getProof"
-        | "eth_call" => MethodPolicy::Verified,
+        | "eth_call"
+        | "eth_estimateGas" => MethodPolicy::Verified,
         "eth_getBlockByNumber" | "eth_getBlockByHash" => MethodPolicy::Verified,
         "eth_getUncleCountByBlockNumber"
         | "eth_getUncleCountByBlockHash"
@@ -81,7 +82,6 @@ pub fn method_policy(method: &str) -> MethodPolicy {
         | "eth_feeHistory"
         | "eth_blobBaseFee" => MethodPolicy::Unverified,
         "helios_bsc_syncStatus" | "helios_bsc_getVerificationStatus" => MethodPolicy::Verified,
-        "eth_estimateGas" => MethodPolicy::Unsupported,
         "eth_getLogs"
         | "eth_newFilter"
         | "eth_newBlockFilter"
@@ -138,9 +138,10 @@ mod tests {
     }
 
     #[test]
-    fn call_unsupported_in_mvp1() {
+    fn call_and_estimate_gas_are_verified() {
         assert_eq!(method_policy("eth_call"), MethodPolicy::Verified);
-        assert_eq!(method_policy("eth_estimateGas"), MethodPolicy::Unsupported);
+        assert_eq!(method_policy("eth_estimateGas"), MethodPolicy::Verified);
+        assert!(!unverified_passthrough_ok("eth_estimateGas"));
     }
 
     #[test]
@@ -189,7 +190,8 @@ mod tests {
     fn get_logs_still_unsupported() {
         assert_eq!(method_policy("eth_getLogs"), MethodPolicy::Unsupported);
         assert_eq!(method_policy("eth_call"), MethodPolicy::Verified);
-        assert_eq!(method_policy("eth_estimateGas"), MethodPolicy::Unsupported);
+        assert_eq!(method_policy("eth_estimateGas"), MethodPolicy::Verified);
+        assert!(!unverified_passthrough_ok("eth_estimateGas"));
         assert_eq!(method_policy("eth_newFilter"), MethodPolicy::Unsupported);
         assert_eq!(method_policy("eth_subscribe"), MethodPolicy::Unsupported);
         assert_eq!(
@@ -277,5 +279,6 @@ mod tests {
         assert!(!unverified_passthrough_ok("eth_sendRawTransaction"));
         assert!(!unverified_passthrough_ok("eth_getBalance"));
         assert!(!unverified_passthrough_ok("eth_call"));
+        assert!(!unverified_passthrough_ok("eth_estimateGas"));
     }
 }

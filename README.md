@@ -79,7 +79,7 @@ docker compose up --build -d    # http://127.0.0.1:8545
 
 See [docs/deploy.md](docs/deploy.md). Do not publish `0.0.0.0:8545` without a reverse proxy and auth. This client stores almost no chain data — do **not** co-locate a BSC full/archive node on a disk you already use for other heavy node datadirs.
 
-Wallet mode: `eth_blockNumber` and proof-backed `latest` map to **Safe**. Verified: `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt`, constrained `eth_call` (Safe only; `to` + optional `data`; revm + iterative proofs; unproven SLOAD/account → `-32001`; gas cap 50_000_000; max 8 proof rounds; no state overrides; no create), header-only `eth_getBlockByNumber` / `eth_getBlockByHash` (at or below Safe). `eth_estimateGas` stays **unsupported**. `eth_sendRawTransaction` is **unverified broadcast**. Many free RPC providers prune `eth_getProof` state before Safe lag (~110 blocks) — fail-closed if the upstream cannot prove Safe; use a deeper provider or self-hosted full/fast node as the untrusted data plane.
+Wallet mode: `eth_blockNumber` and proof-backed `latest` map to **Safe**. Verified: `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt`, constrained `eth_call` (Safe only; `to` + optional `data`; revm + iterative proofs; unproven SLOAD/account → `-32001`; gas cap 50_000_000; max 8 proof rounds; no state overrides; no create), best-effort `eth_estimateGas` (same proof-backed path; never proxied; gas is not consensus), header-only `eth_getBlockByNumber` / `eth_getBlockByHash` (at or below Safe). `eth_sendRawTransaction` is **unverified broadcast**. Many free RPC providers prune `eth_getProof` state before Safe lag (~110 blocks) — fail-closed if the upstream cannot prove Safe; use a deeper provider or self-hosted full/fast node as the untrusted data plane.
 
 `--checkpoint FILE` enables sealing-set membership (unauthorized sealers rejected). Without it, lookback only checks ECDSA coinbase + parent links. Checkpoint age default **24h** (`--allow-stale-checkpoint` to override). The sealing set is operator-supplied — never inferred from miners in the lookback window.
 
@@ -99,7 +99,7 @@ python scripts/soak_vs_oracle.py --once
 1. **Phase 0** — **done** (hardfork pin, epoch fixtures, proof provider matrix)
 2. **Demo Slice** — **closed** (checkpoint → seals → Safe → verified `eth_getBalance`; 1h re-diff soak GATE PASS 2026-08-19: unique=19, compared=214, match=214, mismatch=0, skip=38)
 3. **MVP-1** — verified nonce/code/storageAt + unverified `eth_sendRawTransaction` **in tree**; **≥24h soak still the GA live gate**. Not implemented (no fixtures): out-of-turn backoff, Maxwell FF recents prune, EIP-1559 parent `baseFee` formulas.
-4. **MVP-2** — constrained `eth_call` **slice 1 started** (Safe-only revm + iterative proofs; `eth_estimateGas` still `-32601`). Fast Finality BLS **not started**.
+4. **MVP-2** — constrained `eth_call` + best-effort `eth_estimateGas` (proof-backed revm; never proxied). Fast Finality BLS **not started**.
 
 Honest calendar: **months** of part-time work, not a weekend. See design doc. Pasteur (2026-08-25) is scheduled, not live.
 

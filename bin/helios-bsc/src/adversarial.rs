@@ -7,7 +7,7 @@ use crate::sync::{
 use crate::{Node, RpcUpstream};
 use anyhow::{anyhow, Result};
 use helios_bsc_consensus::{header_hash, newest_safe, Snapshot, VerifiedBlock};
-use helios_bsc_execution::{encode_data32, encode_qty, MAX_RAW_TX};
+use helios_bsc_execution::{encode_data32, encode_qty, MAX_RAW_TX, TX_GAS};
 use helios_bsc_mock::{
     cycling_sealer_chain, distinct_sealer_chain, headers_from_chain, relink_dummy_chain, MockRpc,
     Scenario, WBNB_ADDRESS, WRONG_STATE_ROOT,
@@ -594,7 +594,7 @@ fn honest_mock_eth_block_number_equals_safe_not_tip() {
 }
 
 #[test]
-fn eth_call_still_method_unsupported() {
+fn eth_call_and_estimate_gas_never_proxy() {
     let (chain, rpc) = safe_chain_with_fixture_root();
     let mut up = MockUpstream::for_chain(&chain, rpc.proof_json());
     up.unverified = json!("0xdeadbeef");
@@ -604,7 +604,14 @@ fn eth_call_still_method_unsupported() {
         "eth_estimateGas",
         json!([{"to": WBNB_ADDRESS}, "latest"]),
     ));
-    assert_eq!(err_code(&est), ERR_METHOD, "{est}");
+    assert_ne!(est.get("result"), Some(&json!("0xdeadbeef")), "{est}");
+    if let Some(code) = est
+        .get("error")
+        .and_then(|e| e.get("code"))
+        .and_then(Value::as_i64)
+    {
+        assert_ne!(code, ERR_METHOD, "{est}");
+    }
     let v = node.handle(&req("eth_call", json!([{"to": WBNB_ADDRESS}, "latest"])));
     assert_ne!(v.get("result"), Some(&json!("0xdeadbeef")), "{v}");
     assert_eq!(err_code(&v), ERR_PROOF_FAILED, "{v}");
@@ -660,6 +667,119 @@ fn eth_call_pending_rejected() {
     assert_eq!(err_code(&earliest), ERR_NOT_SYNCED, "{earliest}");
     let missing_to = node.handle(&req("eth_call", json!([{}, "latest"])));
     assert_eq!(err_code(&missing_to), ERR_PARAMS, "{missing_to}");
+}
+
+fn call_object(data: Option<&str>) -> Value {
+    match data {
+        Some(d) => json!({"to": WBNB_ADDRESS, "from": WBNB_ADDRESS, "data": d}),
+        None => json!({"to": WBNB_ADDRESS, "from": WBNB_ADDRESS}),
+    }
+}
+
+fn assert_call_constraints_rejected(node: &Node, method: &str) {
+    let third = node.handle(&req(method, json!([{"to": WBNB_ADDRESS}, "latest", {}])));
+    assert_eq!(err_code(&third), ERR_PARAMS, "{method} 3rd param: {third}");
+    let state = node.handle(&req(
+        method,
+        json!([{"to": WBNB_ADDRESS, "stateOverride": {}}, "latest"]),
+    ));
+    assert_eq!(
+        err_code(&state),
+        ERR_PARAMS,
+        "{method} stateOverride: {state}"
+    );
+    let blob = node.handle(&req(
+        method,
+        json!([{"to": WBNB_ADDRESS, "blobVersionedHashes": []}, "latest"]),
+    ));
+    assert_eq!(
+        err_code(&blob),
+        ERR_PARAMS,
+        "{method} blobVersionedHashes: {blob}"
+    );
+    let auth = node.handle(&req(
+        method,
+        json!([{"to": WBNB_ADDRESS, "authorizationList": []}, "latest"]),
+    ));
+    assert_eq!(
+        err_code(&auth),
+        ERR_PARAMS,
+        "{method} authorizationList: {auth}"
+    );
+    let to_null = node.handle(&req(method, json!([{"to": Value::Null}, "latest"])));
+    assert_eq!(
+        err_code(&to_null),
+        ERR_PARAMS,
+        "{method} to null: {to_null}"
+    );
+}
+
+#[test]
+fn eth_estimate_gas_wbnb_totalsupply_ok() {
+    let (chain, rpc) = safe_chain_with_fixture_root();
+    let node = node_wbnb_eth_call(chain, rpc.proof_json());
+    let v = node.handle(&req(
+        "eth_estimateGas",
+        json!([call_object(Some("0x18160ddd")), "latest"]),
+    ));
+    let hex = v["result"].as_str().unwrap_or("");
+    assert!(hex.starts_with("0x"), "{v}");
+    let gas = decode_u64(hex).expect("qty");
+    assert!(gas >= TX_GAS, "{v}");
+}
+
+#[test]
+fn eth_estimate_gas_unproven_name_fail_closed() {
+    let (chain, rpc) = safe_chain_with_fixture_root();
+    let node = node_wbnb_eth_call(chain, rpc.proof_json());
+    let v = node.handle(&req(
+        "eth_estimateGas",
+        json!([call_object(Some("0x06fdde03")), "latest"]),
+    ));
+    assert_eq!(err_code(&v), ERR_PROOF_FAILED, "{v}");
+}
+
+#[test]
+fn eth_estimate_gas_name_with_slot0_ok() {
+    let (proof, root) = load_wbnb_slot0();
+    let mut chain = distinct_sealer_chain(15);
+    chain[0].state_root = root;
+    relink_dummy_chain(&mut chain);
+    let node = node_wbnb_eth_call(chain, proof);
+    let v = node.handle(&req(
+        "eth_estimateGas",
+        json!([call_object(Some("0x06fdde03")), "latest"]),
+    ));
+    let hex = v["result"].as_str().unwrap_or("");
+    assert!(hex.starts_with("0x"), "{v}");
+    let gas = decode_u64(hex).expect("qty");
+    assert!(gas >= TX_GAS, "{v}");
+}
+
+#[test]
+fn eth_estimate_gas_pending_rejected() {
+    let (chain, rpc) = safe_chain_with_fixture_root();
+    let node = node_from_chain(chain, rpc.proof_json());
+    let pending = node.handle(&req(
+        "eth_estimateGas",
+        json!([{"to": WBNB_ADDRESS}, "pending"]),
+    ));
+    assert_eq!(err_code(&pending), ERR_NOT_SYNCED, "{pending}");
+    let earliest = node.handle(&req(
+        "eth_estimateGas",
+        json!([{"to": WBNB_ADDRESS}, "earliest"]),
+    ));
+    assert_eq!(err_code(&earliest), ERR_NOT_SYNCED, "{earliest}");
+    let missing_to = node.handle(&req("eth_estimateGas", json!([{}, "latest"])));
+    assert_eq!(err_code(&missing_to), ERR_PARAMS, "{missing_to}");
+}
+
+#[test]
+fn eth_call_and_estimate_gas_reject_overrides() {
+    let (chain, rpc) = safe_chain_with_fixture_root();
+    let node = node_from_chain(chain, rpc.proof_json());
+    assert_call_constraints_rejected(&node, "eth_call");
+    assert_call_constraints_rejected(&node, "eth_estimateGas");
 }
 
 #[test]
@@ -1396,4 +1516,20 @@ fn eth_call_lying_get_code_is_proof_failed() {
         ]),
     ));
     assert_eq!(err_code(&v), ERR_PROOF_FAILED, "{v}");
+}
+
+#[test]
+fn eth_call_object_block_id_rejected() {
+    let (chain, rpc) = safe_chain_with_fixture_root();
+    let node = node_from_chain(chain, rpc.proof_json());
+    let v = node.handle(&req(
+        "eth_call",
+        json!([{"to": WBNB_ADDRESS}, {"blockNumber": "latest"}]),
+    ));
+    assert_eq!(err_code(&v), ERR_PARAMS, "{v}");
+    let est = node.handle(&req(
+        "eth_estimateGas",
+        json!([{"to": WBNB_ADDRESS}, {"blockHash": "0x00"}]),
+    ));
+    assert_eq!(err_code(&est), ERR_PARAMS, "{est}");
 }

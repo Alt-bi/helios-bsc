@@ -10,9 +10,9 @@ use helios_bsc_types::{HexAddress, HexHash, TrustClass};
 use thiserror::Error;
 
 pub use call::{
-    eth_call_verified, eth_call_with_db, load_proven_account, CallBlock, CallError, CallTx, Miss,
-    ProofDb, ProveAtSafe, CALL_GAS_CAP, MAX_CALL_ACCOUNTS, MAX_CALL_DATA, MAX_PROOF_ROUNDS,
-    MAX_PROOF_STORAGE_KEYS,
+    eth_call_verified, eth_call_with_db, eth_estimate_gas_verified, load_proven_account, CallBlock,
+    CallError, CallTx, Miss, ProofDb, ProveAtSafe, CALL_GAS_CAP, MAX_CALL_ACCOUNTS, MAX_CALL_DATA,
+    MAX_ESTIMATE_ITERS, MAX_PROOF_ROUNDS, MAX_PROOF_STORAGE_KEYS, TX_GAS,
 };
 pub use mpt::{EMPTY_CODE_HASH, EMPTY_TRIE_ROOT};
 pub use proof::{

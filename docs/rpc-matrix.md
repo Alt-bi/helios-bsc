@@ -37,7 +37,7 @@ Default bind: `127.0.0.1:8545` (`--allow-non-loopback` required for LAN; no RPC 
 | `eth_blobBaseFee` | Unverified opt-in | Same flag. Hex quantity. |
 | `helios_bsc_syncStatus` | Verified | tip, safe, `lag` / `safeLagBlocks` / `safeLagSeconds`, `safeLagWithinBound`, `unverifiedPassthrough`, `backupTransport`, sealers, proof window, `finality=confirmation-depth`, `sealingSetEnforced`, `proofOk` / `proofFail` / `headersVerified` |
 | `helios_bsc_getVerificationStatus` | Verified | same status body (`trustClass`, `finality`, lag fields) |
-| `eth_estimateGas` | Unsupported | `-32601` (best-effort later; not this slice) |
+| `eth_estimateGas` | Verified (constrained, best-effort) | Same policy as `eth_call` (Safe only; `to` + optional `data`; **no create**; **no state overrides**; no `blobVersionedHashes` / `authorizationList`). Never proxied to upstream `eth_estimateGas` / `eth_call`. Unproven SLOAD/account → `-32001`. Binary search `TX_GAS..=min(user gas, 50_000_000, block.gasLimit)` (geth/reth; not a single `gas_used`). Max **8** proof rounds for the whole estimate. Gas is **not consensus**. |
 | `eth_getLogs` / filters / `eth_subscribe` | Unsupported | `-32601` (no log index, no pub/sub) |
 | `eth_getBlockTransactionCount*` / `eth_getTransactionByBlock*AndIndex` | Unsupported | `-32601` (no tx index; `fullTx` already refused) |
 

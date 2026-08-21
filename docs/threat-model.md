@@ -6,6 +6,7 @@ Wallet RPC treats the upstream as an **untrusted data plane**. Integrity comes f
 |--------|------------|
 | Lying balance / nonce / code / storage | `eth_getProof` vs Safe `stateRoot`; claimed fields must match trie; bytecode keccak vs `codeHash` |
 | Lying / unverified `eth_call` | **Verified-or-error**, never passthrough and never proxied to upstream `eth_call`. Safe only (`latest`→Safe); `to` + optional `data`; revm on iterative `eth_getProof` at Safe hash/number. No state overrides; no create. |
+| Lying / unverified `eth_estimateGas` | **Verified-or-error**, never passthrough and never proxied to upstream `eth_estimateGas` / `eth_call`. Same Safe-only constraints as `eth_call`. Binary-search estimate is **best-effort** (gas is not consensus). |
 | Unproven `eth_call` SLOAD / account | Fail-closed `-32001` (**not** zero / empty). Missing proof is not empty storage. |
 | Valid proof for the wrong root | Bind to consensus-verified `stateRoot` (`-32002` / `-32001`) |
 | Mutated trie node | MPT walker rejects; CI adversarial tests |
@@ -22,7 +23,7 @@ Wallet RPC treats the upstream as an **untrusted data plane**. Integrity comes f
 | Epoch extraData rewrite | Epoch extraData must parse (n≥1 **unique** validator records, Bohr `turnLength` in 1..=64). Activation still waits `minerHistoryCheckLen` (87 @ N=21,T=8). Lookback-only still does **not** check membership |
 | 100/110-block “Safe” | Not used. Safe = **15** distinct subsequent sealers (`floor(2N/3)+1`) |
 | Tag-only `eth_getProof` | Proofs by Safe **hash then number**, never `latest` on the upstream |
-| Silent passthrough | Unsupported methods `-32601`. `eth_call` is verified-or-error (never silent, never upstream `eth_call`). Receipts/gasPrice stay `-32601` unless `--allow-unverified-passthrough`. `eth_estimateGas` stays `-32601`. |
+| Silent passthrough | Unsupported methods `-32601`. `eth_call` / `eth_estimateGas` are verified-or-error (never silent, never upstream `eth_call` / `eth_estimateGas`). Receipts/gasPrice stay `-32601` unless `--allow-unverified-passthrough`. |
 | Lying receipt / tx object | Opt-in only; `blockHash` must be in the local verified chain and `number ≤ Safe`. Query hash must match `transactionHash`/`hash` (no swap of another mined tx). Present `chainId` must be 56; address fields 20 bytes; `status` ∈ {0,1}; `type` ∈ {0…4}. Present `logs[]`: each log has a 20-byte `address`, ≤4 topics of 32 bytes; log `transactionHash` if set must match; log `blockHash` if set must match the receipt. Logs are **not** MPT-verified (no receiptsRoot proof) |
 | Fee-oracle junk | Opt-in `eth_gasPrice` / tip / blob base fee must be a hex quantity; `eth_feeHistory` must be an object |
 | `eth_sendRawTransaction` drop / MEV | Labeled unverified broadcast; garbage/empty/oversized hex is rejected locally. **chainId must be 56** (no unprotected legacy). Wallet hash is local keccak256(raw); mismatch vs upstream is fail-closed |

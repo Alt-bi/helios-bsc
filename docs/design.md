@@ -4,8 +4,8 @@
 |-------|-------|
 | **Document** | BSC Verified Local JSON-RPC (Parlia Light Client) |
 | **Author** | helios-bsc maintainers |
-| **Date** | 2026-08-20 |
-| **Status** | **Active** — Demo Slice closed; MVP-1 methods+docs in tree; 24h soak remains the GA live gate; MVP-2 `eth_call` slice 1 started (`eth_estimateGas` / FF still open) |
+| **Date** | 2026-08-21 |
+| **Status** | **Active** — Demo Slice closed; MVP-1 methods+docs in tree; 24h soak remains the GA live gate; MVP-2 constrained `eth_call` + best-effort `eth_estimateGas` in tree (FF still open) |
 | **Working name** | **helios-bsc** (crate/binary: `helios-bsc`) |
 | **License** | Dual Apache-2.0 OR MIT |
 | **Repo** | https://github.com/Alt-bi/helios-bsc |
@@ -86,7 +86,7 @@ Honest conclusion: **execution-proof reuse is high; consensus path is a new Parl
 #### MVP-2 (after Demo Slice / when data available)
 
 7. Fast Finality BLS verification when Phase 0 fixtures prove RPC fields suffice.
-8. Constrained `eth_call` / best-effort `eth_estimateGas` (historically large; deferred past Demo Slice). Slice 1: Safe-only revm + iterative proofs; estimateGas still open.
+8. Constrained `eth_call` / best-effort `eth_estimateGas` (historically large; deferred past Demo Slice). **In tree:** Safe-only revm + iterative proofs; estimateGas is proof-backed binary search (best-effort; gas is not consensus).
 
 ### Non-Goals (explicit)
 
@@ -126,8 +126,7 @@ Honest conclusion: **execution-proof reuse is high; consensus path is a new Parl
 ### MVP-2 DoD (optional track)
 
 - [ ] FF verification feature-flagged; enabled only when fixtures + live RPC expose verifiable aggregates.
-- [ ] Constrained `eth_call` with gas/proof budgets; estimateGas explicitly best-effort.
-  - [x] Slice 1: Safe-only revm + iterative proofs; estimateGas still open.
+- [x] Constrained `eth_call` with gas/proof budgets; estimateGas explicitly best-effort.
 
 ---
 
@@ -338,12 +337,13 @@ For each new header `H` extending the verified chain:
    - Request `eth_getProof` from upstream for the **verified block tag/hash**.
    - Verify account trie proof → `stateRoot`; storage trie proof → account `storageRoot`; code hash if needed.
    - Return value only if proof verifies; else hard error `proof_verification_failed` (do not silently passthrough).
-3. For `eth_call` (**MVP-2 slice 1**):
+3. For `eth_call` / `eth_estimateGas` (**MVP-2**):
    - Safe only (`latest`→Safe); `to` + optional `data`; **no create**; **no state overrides**.
    - Helios-style iterative `eth_getProof` at Safe hash/number; execute in **revm** with proven state.
-   - Gas cap **50_000_000**; max **8** proof rounds.
+   - Gas cap **50_000_000**; max **8** proof rounds (shared across an estimate's cap run + binary search).
    - Unproven SLOAD/account → `-32001` (fail-closed, **not** zero).
-   - Never proxy upstream `eth_call`. `eth_estimateGas` stays **unsupported** (`-32601`) until labeled best-effort.
+   - Never proxy upstream `eth_call` or `eth_estimateGas`.
+   - `eth_estimateGas` is **best-effort** (gas is not consensus): geth/reth binary search over `TX_GAS..=min(user, 50M, block.gasLimit)`, not a single `gas_used`. MethodPolicy **Verified**.
 4. **Provider capability (Phase 0 exit criterion — blocking for PR 9):**
 
 #### Phase 0 exit: `eth_getProof` provider matrix
@@ -466,8 +466,8 @@ Canonical design lives in `docs/design.md` in this repository.
 | `eth_getTransactionCount` | Stretch | Verified | | |
 | `eth_getCode` | — | Verified | | |
 | `eth_getStorageAt` | — | Verified | | |
-| `eth_call` | — | — | Constrained verified (slice 1) | Safe-only revm + iterative proofs; no overrides/create |
-| `eth_estimateGas` | — | — | Best-effort (still open) | Stays `-32601` until labeled |
+| `eth_call` | — | — | Constrained verified | Safe-only revm + iterative proofs; no overrides/create |
+| `eth_estimateGas` | — | — | Best-effort (Verified policy) | Proof-backed binary search; never proxied; gas is not consensus |
 | `eth_sendRawTransaction` | Stretch | Unverified broadcast | | |
 | `eth_getBlockByNumber/Hash` | Header-verified | Header-verified | | |
 | `eth_getTransactionReceipt` | Unsupported/err | Unverified opt-in | Verified later | |
@@ -721,7 +721,7 @@ Prefer a dedicated spare volume or small VPS for any Alt F full/fast node. Avoid
 12. **Max checkpoint age driven by header-walk cost** — Default ≤24h strict; not Helios’s week-scale window.
 13. **Required upstream proof capability for Demo Slice / GA** — At least one reproducible **`eth_getProof` by block hash or number**. **Order (operator-decided):** measure **public/paid RPC provider matrix first**; stand up **Alt F only if that matrix fails**. Tag-only degraded mode does not satisfy wallet-mode Safe proofs.
 14. **Independent public repo `helios-bsc`** (dual MIT/Apache) — not starting inside a16z/helios workspace; optional upstream discussion only after Demo Slice.
-15. **Development in this repo (2026-08-20)** — Demo Slice closed; MVP-1 verified reads + unverified `sendRaw` + operator docs in tree. **24h soak remains the GA live gate.** MVP-2 slice 1: constrained Safe-only `eth_call` (revm + iterative proofs); `eth_estimateGas` still open. **FF not implemented.** Out-of-turn backoff, Maxwell FF recents prune, and EIP-1559 parent `baseFee` formulas are **not implemented**. Pasteur 2026-08-25 is scheduled, not live.
+15. **Development in this repo (2026-08-21)** — Demo Slice closed; MVP-1 verified reads + unverified `sendRaw` + operator docs in tree. **24h soak remains the GA live gate.** MVP-2: constrained Safe-only `eth_call` + best-effort proof-backed `eth_estimateGas`. **FF not implemented.** Out-of-turn backoff, Maxwell FF recents prune, and EIP-1559 parent `baseFee` formulas are **not implemented**. Pasteur 2026-08-25 is scheduled, not live.
 
 ### Operator decisions (2026-08-18)
 
@@ -731,7 +731,7 @@ Settled by operator; treat as final (not open for re-debate in this doc):
 |---|----------|
 | A | **OSS home:** independent public repo **`helios-bsc`**, dual MIT/Apache. No initial a16z/helios workspace membership; optional upstream chat **only after Demo Slice**. |
 | B | **`eth_getProof` path:** **first** fill/measure the public/paid provider matrix for hash/number proofs; **Alt F only if the matrix fails**. |
-| C | **Near-term work:** keep milestones honest — Demo Slice closed; 24h soak still blocks MVP-1 GA; Pasteur 2026-08-25 is scheduled, not live. MVP-2 `eth_call` slice 1 landing; FF not started. |
+| C | **Near-term work:** keep milestones honest — Demo Slice closed; 24h soak still blocks MVP-1 GA; Pasteur 2026-08-25 is scheduled, not live. MVP-2 `eth_call` / `eth_estimateGas` in tree; FF not started. |
 
 This file is the canonical design document for the public repository.
 
@@ -866,7 +866,7 @@ Incremental, independently reviewable PRs. Rough **engineer-days** assume one pr
 
 - **Title:** `feat(execution): revm-backed eth_call with iterative proofs`
 - **Dependencies:** PR 11
-- **Description:** Slice 1: Safe-only revm + iterative proofs (`eth_call` verified-or-error). `eth_estimateGas` still open (`-32601`). Never proxy upstream `eth_call`. Historically Helios-hard; not on Demo Slice critical path.
+- **Description:** Safe-only revm + iterative proofs (`eth_call` verified-or-error). Best-effort `eth_estimateGas` is proof-backed binary search (MethodPolicy Verified; gas is not consensus). Never proxy upstream `eth_call` / `eth_estimateGas`. Historically Helios-hard; not on Demo Slice critical path.
 
 ### PR 13 — CLI UX: checkpoints, freshness, bind defaults (~3–5 d)
 
@@ -907,3 +907,5 @@ _Rev 5 (2026-08-18): Operator decisions locked — independent `helios-bsc` repo
 _Rev 6 (2026-08-20): Honest close-out — Demo Slice closed; tick MVP-1 DoD for verified nonce/code/storageAt, unverified sendRaw, fail-closed unsupported methods, and operator docs (threat model / rpc-matrix / checkpointing / proof-fail runbook / SLOs). Leave 24h soak and MVP-2 FF/`eth_call` unchecked. Pasteur 2026-08-25 is not live._
 
 _Rev 7 (2026-08-20): MVP-2 slice 1 — constrained verified `eth_call` (Safe-only revm + iterative proofs; gas cap 50_000_000; max 8 proof rounds; unproven SLOAD/account fail-closed). Combined MVP-2 `eth_call`/estimateGas DoD remains open; `eth_estimateGas` still `-32601`. FF not started. 24h soak still the GA live gate. Pasteur 2026-08-25 is not live._
+
+_Rev 8 (2026-08-21): MVP-2 slice 2 — proof-backed best-effort `eth_estimateGas` (geth/reth binary search; MethodPolicy Verified; never proxied). Tick MVP-2 `eth_call`/estimateGas DoD; leave FF unchecked. 24h soak still the GA live gate. Pasteur 2026-08-25 is not live._

@@ -15,10 +15,10 @@ use helios_bsc_consensus::{
     checkpoint_at_snapshot, header_hash, proof_lag, within_proof_window, Snapshot, VerifiedBlock,
 };
 use helios_bsc_execution::{
-    encode_data32, encode_qty, eth_call_verified, pad32, retain_requested_storage,
-    validate_bsc_raw_tx, verify_account_code, verify_eth_get_proof, verify_storage_slot, CallBlock,
-    CallError, CallTx, EthAccountProof, ProofError, ProveAtSafe, VerifiedAccount, CALL_GAS_CAP,
-    EMPTY_CODE_HASH, MAX_CALL_DATA, MAX_CODE_SIZE, MAX_RAW_TX,
+    encode_data32, encode_qty, eth_call_verified, eth_estimate_gas_verified, pad32,
+    retain_requested_storage, validate_bsc_raw_tx, verify_account_code, verify_eth_get_proof,
+    verify_storage_slot, CallBlock, CallError, CallTx, EthAccountProof, ProofError, ProveAtSafe,
+    VerifiedAccount, CALL_GAS_CAP, EMPTY_CODE_HASH, MAX_CALL_DATA, MAX_CODE_SIZE, MAX_RAW_TX,
 };
 use helios_bsc_rpc::{
     jsonrpc_id_ok, jsonrpc_is_v2, jsonrpc_params_len, jsonrpc_params_ok, method_policy, rpc_err,
@@ -447,6 +447,7 @@ impl Node {
             "eth_getTransactionCount" => self.account_field(id, req, AccountField::Nonce),
             "eth_getCode" => self.get_code(id, req),
             "eth_call" => self.eth_call(id, req),
+            "eth_estimateGas" => self.eth_estimate_gas(id, req),
             "eth_getStorageAt" => self.get_storage(id, req),
             "eth_getProof" => self.get_eth_proof(id, req),
             "eth_getBlockByNumber" => self.get_block_by_number(id, req),
@@ -644,47 +645,60 @@ impl Node {
         }
     }
 
-    fn eth_call(&self, id: Value, req: &Value) -> Value {
+    fn prepare_verified_call(&self, id: Value, req: &Value) -> Result<(CallTx, CallBlock), Value> {
         let tx = match parse_eth_call_tx(req) {
             Ok(t) => t,
-            Err(e) => return rpc_err(id, ERR_PARAMS, &e),
+            Err(e) => return Err(rpc_err(id, ERR_PARAMS, &e)),
         };
-        let tag = req
-            .get("params")
-            .and_then(Value::as_array)
-            .and_then(|p| p.get(1))
-            .and_then(Value::as_str);
+        let tag = match req.get("params").and_then(Value::as_array).and_then(|p| p.get(1)) {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(s.as_str()),
+            Some(_) => {
+                return Err(rpc_err(
+                    id,
+                    ERR_PARAMS,
+                    "block id must be a string tag or hex",
+                ))
+            }
+        };
         let (tip, safe) = match self.refresh() {
             Ok(v) => v,
-            Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
+            Err(e) => return Err(rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}"))),
         };
         if !wallet_tag_is_safe(tag, safe.number, &safe.hash) {
-            return rpc_err(
+            return Err(rpc_err(
                 id,
                 ERR_NOT_SYNCED,
                 "wallet mode only serves the local Safe head (latest→Safe)",
-            );
+            ));
         }
         let lag = proof_lag(tip, safe.number);
         if lag > PROVIDER_PROOF_LOOKBACK {
-            return rpc_err(
+            return Err(rpc_err(
                 id,
                 ERR_NOT_SYNCED,
                 &format!("proof window exceeded: lag {lag} > {PROVIDER_PROOF_LOOKBACK}"),
-            );
+            ));
         }
         let local = {
             let chain = self.chain.lock().expect("chain lock");
             chain.iter().find(|b| b.number == safe.number).cloned()
         };
         let Some(local) = local else {
-            return rpc_err(
+            return Err(rpc_err(
                 id,
                 ERR_NOT_SYNCED,
                 "wallet mode only serves the local Safe head (latest→Safe)",
-            );
+            ));
         };
-        let block = call_block_from_verified(&local);
+        Ok((tx, call_block_from_verified(&local)))
+    }
+
+    fn eth_call(&self, id: Value, req: &Value) -> Value {
+        let (tx, block) = match self.prepare_verified_call(id.clone(), req) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
         let prover = UpstreamProve {
             up: self.up.as_ref(),
         };
@@ -692,6 +706,23 @@ impl Node {
             Ok(out) => {
                 self.bump_proof_ok();
                 rpc_ok(id, json!(format!("0x{}", hex::encode(out))))
+            }
+            Err(e) => self.map_call_error(id, e),
+        }
+    }
+
+    fn eth_estimate_gas(&self, id: Value, req: &Value) -> Value {
+        let (tx, block) = match self.prepare_verified_call(id.clone(), req) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let prover = UpstreamProve {
+            up: self.up.as_ref(),
+        };
+        match eth_estimate_gas_verified(&prover, &block, &tx) {
+            Ok(gas) => {
+                self.bump_proof_ok();
+                rpc_ok(id, json!(format!("0x{gas:x}")))
             }
             Err(e) => self.map_call_error(id, e),
         }
@@ -1149,7 +1180,7 @@ impl Node {
     }
 }
 
-/// Untrusted Safe proofs/code only — never proxies `eth_call`.
+/// Untrusted Safe proofs/code only — never proxies `eth_call` / `eth_estimateGas`.
 struct UpstreamProve<'a> {
     up: &'a dyn RpcUpstream,
 }

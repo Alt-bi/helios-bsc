@@ -1,7 +1,8 @@
-//! Constrained verified `eth_call` (revm + iterative EIP-1186 proofs).
+//! Constrained verified `eth_call` / best-effort `eth_estimateGas`.
 //!
 //! Unproven accounts/slots are `CallError::Missing`, never a fake empty account
-//! or zero slot. Does not proxy upstream `eth_call`.
+//! or zero slot. Does not proxy upstream `eth_call` or `eth_estimateGas`.
+//! Estimate is a geth/reth-style binary search (not a single `gas_used`).
 
 use crate::mpt::EMPTY_CODE_HASH;
 use crate::proof::{
@@ -28,6 +29,10 @@ pub const MAX_CALL_ACCOUNTS: usize = 32;
 pub const MAX_CALL_DATA: usize = 128 * 1024;
 /// Max proven storage keys per account (DoS / upstream proof size).
 pub const MAX_PROOF_STORAGE_KEYS: usize = 64;
+/// Intrinsic gas for a simple transaction (estimate floor / cap check).
+pub const TX_GAS: u64 = 21_000;
+/// Binary-search iteration cap for [`eth_estimate_gas_verified`].
+pub const MAX_ESTIMATE_ITERS: u32 = 64;
 
 #[derive(Debug, Clone)]
 pub struct CallTx {
@@ -340,16 +345,13 @@ fn fetch_and_load<P: ProveAtSafe>(
     load_proven_account(db, &block.state_root, address, &proof, &code)
 }
 
-/// Run `eth_call` against an already-populated [`ProofDb`] (no proof fetch).
-pub fn eth_call_with_db(
+/// Execute `tx` at `gas` against `db`. Does not fetch proofs.
+fn transact_call(
     db: &mut ProofDb,
     block: &CallBlock,
     tx: &CallTx,
-) -> Result<Vec<u8>, CallError> {
-    if tx.data.len() > MAX_CALL_DATA {
-        return Err(CallError::Invalid("calldata too large"));
-    }
-    let gas = call_gas(tx, block);
+    gas: u64,
+) -> Result<ExecutionResult, CallError> {
     let mut evm = Evm::builder()
         .with_db(&mut *db)
         .with_spec_id(SpecId::CANCUN)
@@ -380,17 +382,91 @@ pub fn eth_call_with_db(
         .build();
 
     match evm.transact() {
-        Ok(res) => match res.result {
-            ExecutionResult::Success { output, .. } => Ok(output.into_data().to_vec()),
-            ExecutionResult::Revert { output, .. } => Err(CallError::Revert(output.to_vec())),
-            ExecutionResult::Halt { reason, .. } => Err(CallError::Halt(halt_str(reason))),
-        },
+        Ok(res) => Ok(res.result),
         Err(EVMError::Database(e)) => Err(e),
         Err(EVMError::Transaction(_)) => Err(CallError::Invalid("transaction")),
         Err(EVMError::Header(_)) => Err(CallError::Invalid("header")),
         Err(EVMError::Custom(_)) => Err(CallError::Halt("custom")),
         Err(EVMError::Precompile(_)) => Err(CallError::Halt("precompile")),
     }
+}
+
+fn execution_output(res: ExecutionResult) -> Result<Vec<u8>, CallError> {
+    match res {
+        ExecutionResult::Success { output, .. } => Ok(output.into_data().to_vec()),
+        ExecutionResult::Revert { output, .. } => Err(CallError::Revert(output.to_vec())),
+        ExecutionResult::Halt { reason, .. } => Err(CallError::Halt(halt_str(reason))),
+    }
+}
+
+fn seed_call_accounts<P: ProveAtSafe>(
+    prover: &P,
+    db: &mut ProofDb,
+    block: &CallBlock,
+    tx: &CallTx,
+    rounds: &mut u32,
+) -> Result<(), CallError> {
+    let mut seen: Vec<[u8; 20]> = Vec::with_capacity(3);
+    for address in [tx.to, tx.from, block.beneficiary] {
+        if is_precompile(Address::from(address)) {
+            continue;
+        }
+        if seen.iter().any(|a| a == &address) {
+            continue;
+        }
+        seen.push(address);
+        fetch_and_load(prover, db, block, &address, &[])?;
+        *rounds += 1;
+    }
+    Ok(())
+}
+
+/// Fetch proofs for Missing account/slot and retry the same `gas`. One `rounds`
+/// counter for the whole call/estimate (not per mid).
+fn transact_call_proven<P: ProveAtSafe>(
+    prover: &P,
+    db: &mut ProofDb,
+    block: &CallBlock,
+    tx: &CallTx,
+    gas: u64,
+    rounds: &mut u32,
+) -> Result<ExecutionResult, CallError> {
+    loop {
+        match transact_call(db, block, tx, gas) {
+            Ok(res) => return Ok(res),
+            Err(CallError::Missing(Miss::BlockHash(n))) => {
+                return Err(CallError::Missing(Miss::BlockHash(n)));
+            }
+            Err(CallError::Missing(miss)) => {
+                if *rounds >= MAX_PROOF_ROUNDS {
+                    return Err(CallError::Budget);
+                }
+                *rounds += 1;
+                match miss {
+                    Miss::Account(address) => {
+                        fetch_and_load(prover, db, block, &address, &[])?;
+                    }
+                    Miss::Storage { address, slot } => {
+                        fetch_and_load(prover, db, block, &address, &[slot])?;
+                    }
+                    Miss::BlockHash(_) => unreachable!(),
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Run `eth_call` against an already-populated [`ProofDb`] (no proof fetch).
+pub fn eth_call_with_db(
+    db: &mut ProofDb,
+    block: &CallBlock,
+    tx: &CallTx,
+) -> Result<Vec<u8>, CallError> {
+    if tx.data.len() > MAX_CALL_DATA {
+        return Err(CallError::Invalid("calldata too large"));
+    }
+    execution_output(transact_call(db, block, tx, call_gas(tx, block))?)
 }
 
 /// Verified `eth_call`: iterative proofs at `block.state_root`, then revm.
@@ -405,47 +481,79 @@ pub fn eth_call_verified<P: ProveAtSafe>(
 
     let mut db = ProofDb::new();
     let mut rounds = 0u32;
+    seed_call_accounts(prover, &mut db, block, tx, &mut rounds)?;
+    execution_output(transact_call_proven(
+        prover,
+        &mut db,
+        block,
+        tx,
+        call_gas(tx, block),
+        &mut rounds,
+    )?)
+}
 
-    if !is_precompile(Address::from(tx.to)) {
-        fetch_and_load(prover, &mut db, block, &tx.to, &[])?;
-        rounds += 1;
-    }
-    if tx.from != tx.to && !is_precompile(Address::from(tx.from)) {
-        fetch_and_load(prover, &mut db, block, &tx.from, &[])?;
-        rounds += 1;
-    }
-    if block.beneficiary != tx.to
-        && block.beneficiary != tx.from
-        && !is_precompile(Address::from(block.beneficiary))
-    {
-        fetch_and_load(prover, &mut db, block, &block.beneficiary, &[])?;
-        rounds += 1;
+fn estimate_gas_search<P: ProveAtSafe>(
+    prover: &P,
+    db: &mut ProofDb,
+    block: &CallBlock,
+    tx: &CallTx,
+    rounds: &mut u32,
+) -> Result<u64, CallError> {
+    let hi_cap = call_gas(tx, block);
+    if hi_cap < TX_GAS {
+        return Err(CallError::Halt("out of gas"));
     }
 
-    loop {
-        match eth_call_with_db(&mut db, block, tx) {
-            Ok(out) => return Ok(out),
-            Err(CallError::Missing(Miss::BlockHash(n))) => {
-                return Err(CallError::Missing(Miss::BlockHash(n)));
+    let cap_res = transact_call_proven(prover, db, block, tx, hi_cap, rounds)?;
+    let mut lo = match cap_res {
+        ExecutionResult::Success { gas_used, .. } => gas_used.saturating_sub(1),
+        ExecutionResult::Revert { output, .. } => {
+            return Err(CallError::Revert(output.to_vec()));
+        }
+        ExecutionResult::Halt { reason, .. } => {
+            return Err(CallError::Halt(halt_str(reason)));
+        }
+    };
+
+    let mut hi = hi_cap;
+    let mut iters = 0u32;
+    while lo.saturating_add(1) < hi && iters < MAX_ESTIMATE_ITERS {
+        iters += 1;
+        let mid = lo + (hi - lo) / 2;
+        match transact_call_proven(prover, db, block, tx, mid, rounds) {
+            Ok(ExecutionResult::Success { gas_used, .. }) => {
+                hi = mid;
+                let hint = gas_used.saturating_sub(1);
+                if hint > lo && hint < hi {
+                    lo = hint;
+                }
             }
-            Err(CallError::Missing(miss)) => {
-                if rounds >= MAX_PROOF_ROUNDS {
-                    return Err(CallError::Budget);
-                }
-                rounds += 1;
-                match miss {
-                    Miss::Account(address) => {
-                        fetch_and_load(prover, &mut db, block, &address, &[])?;
-                    }
-                    Miss::Storage { address, slot } => {
-                        fetch_and_load(prover, &mut db, block, &address, &[slot])?;
-                    }
-                    Miss::BlockHash(_) => unreachable!(),
-                }
+            Ok(ExecutionResult::Revert { .. })
+            | Ok(ExecutionResult::Halt { .. })
+            | Err(CallError::Invalid("transaction"))
+            | Err(CallError::Halt(_)) => {
+                lo = mid;
             }
             Err(e) => return Err(e),
         }
     }
+    Ok(hi)
+}
+
+/// Proof-backed best-effort `eth_estimateGas` (binary search, not `gas_used`).
+pub fn eth_estimate_gas_verified<P: ProveAtSafe>(
+    prover: &P,
+    block: &CallBlock,
+    tx: &CallTx,
+) -> Result<u64, CallError> {
+    if tx.data.len() > MAX_CALL_DATA {
+        return Err(CallError::Invalid("calldata too large"));
+    }
+
+    let mut db = ProofDb::new();
+    let mut rounds = 0u32;
+    seed_call_accounts(prover, &mut db, block, tx, &mut rounds)?;
+    estimate_gas_search(prover, &mut db, block, tx, &mut rounds)
 }
 
 #[cfg(test)]
@@ -462,6 +570,38 @@ mod tests {
     const SLOAD0_RETURN: [u8; 11] = [
         0x60, 0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
     ];
+    // PUSH1 0x00; PUSH1 0x00; REVERT
+    const ALWAYS_REVERT: [u8; 5] = [0x60, 0x00, 0x60, 0x00, 0xfd];
+
+    struct DenyProver;
+
+    impl ProveAtSafe for DenyProver {
+        fn get_proof(
+            &self,
+            address: &[u8; 20],
+            slots: &[[u8; 32]],
+            _block_hash: &[u8; 32],
+            _block_number: u64,
+        ) -> Result<EthAccountProof, CallError> {
+            if slots.is_empty() {
+                Err(CallError::Missing(Miss::Account(*address)))
+            } else {
+                Err(CallError::Missing(Miss::Storage {
+                    address: *address,
+                    slot: slots[0],
+                }))
+            }
+        }
+
+        fn get_code(
+            &self,
+            address: &[u8; 20],
+            _block_hash: &[u8; 32],
+            _block_number: u64,
+        ) -> Result<Vec<u8>, CallError> {
+            Err(CallError::Missing(Miss::Account(*address)))
+        }
+    }
 
     fn sample_block(state_root: [u8; 32]) -> CallBlock {
         CallBlock {
@@ -548,6 +688,90 @@ mod tests {
         )
         .expect("sload 0");
         assert_eq!(out, vec![0u8; 32]);
+    }
+
+    #[test]
+    fn estimate_gas_constant_return() {
+        let from = [0x11u8; 20];
+        let to = [0x22u8; 20];
+        let mut db = ProofDb::new();
+        insert_eoa(&mut db, from);
+        insert_eoa(&mut db, [0u8; 20]);
+        db.insert_account(to, 1, [0u8; 32], EMPTY_TRIE_ROOT, &RETURN_42_FULL);
+        let block = sample_block([0u8; 32]);
+        let tx = call_tx(from, to, vec![]);
+        let mut rounds = 0;
+        let gas =
+            estimate_gas_search(&DenyProver, &mut db, &block, &tx, &mut rounds).expect("estimate");
+        assert!(gas >= TX_GAS, "{gas}");
+        assert!(gas <= CALL_GAS_CAP, "{gas}");
+        let mut funded = tx.clone();
+        funded.gas = Some(gas);
+        eth_call_with_db(&mut db, &block, &funded).expect("call at estimate");
+    }
+
+    #[test]
+    fn estimate_gas_unproven_sload_is_missing() {
+        let from = [0x11u8; 20];
+        let to = [0x22u8; 20];
+        let mut db = ProofDb::new();
+        insert_eoa(&mut db, from);
+        insert_eoa(&mut db, [0u8; 20]);
+        db.insert_account(to, 1, [0u8; 32], [0x01u8; 32], &SLOAD0_RETURN);
+        let err = estimate_gas_search(
+            &DenyProver,
+            &mut db,
+            &sample_block([0u8; 32]),
+            &call_tx(from, to, vec![]),
+            &mut 0,
+        )
+        .unwrap_err();
+        match err {
+            CallError::Missing(_) => {}
+            other => panic!("expected Missing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn estimate_gas_empty_trie_sload_ok() {
+        let from = [0x11u8; 20];
+        let to = [0x22u8; 20];
+        let mut db = ProofDb::new();
+        insert_eoa(&mut db, from);
+        insert_eoa(&mut db, [0u8; 20]);
+        db.insert_account(to, 1, [0u8; 32], EMPTY_TRIE_ROOT, &SLOAD0_RETURN);
+        let gas = estimate_gas_search(
+            &DenyProver,
+            &mut db,
+            &sample_block([0u8; 32]),
+            &call_tx(from, to, vec![]),
+            &mut 0,
+        )
+        .expect("estimate");
+        assert!(gas >= TX_GAS, "{gas}");
+        assert!(gas <= CALL_GAS_CAP, "{gas}");
+    }
+
+    #[test]
+    fn estimate_gas_always_revert_is_revert() {
+        let from = [0x11u8; 20];
+        let to = [0x22u8; 20];
+        let mut db = ProofDb::new();
+        insert_eoa(&mut db, from);
+        insert_eoa(&mut db, [0u8; 20]);
+        db.insert_account(to, 1, [0u8; 32], EMPTY_TRIE_ROOT, &ALWAYS_REVERT);
+        let err = estimate_gas_search(
+            &DenyProver,
+            &mut db,
+            &sample_block([0u8; 32]),
+            &call_tx(from, to, vec![]),
+            &mut 0,
+        )
+        .unwrap_err();
+        match err {
+            CallError::Revert(_) => {}
+            other => panic!("expected Revert, not a gas qty, got {other:?}"),
+        }
     }
 
     #[derive(Deserialize)]
@@ -764,5 +988,67 @@ mod tests {
             }
             Err(_) => {}
         }
+    }
+
+    #[test]
+    fn wbnb_totalsupply_estimate_gas() {
+        let f = load_tip();
+        let root = decode_hex_fixed::<32>(&f.state_root).unwrap();
+        let addr = decode_hex_fixed::<20>(&f.address).unwrap();
+        let prover = StaticProver {
+            address: addr,
+            proof: f.proof.clone(),
+            code: load_wbnb_code(),
+            allow_slots: false,
+        };
+        let mut block = sample_block(root);
+        block.beneficiary = addr;
+        let data = decode_hex("0x18160ddd").unwrap();
+        let gas = eth_estimate_gas_verified(&prover, &block, &call_tx(addr, addr, data))
+            .expect("estimate");
+        assert!(gas >= TX_GAS, "{gas}");
+        assert!(gas <= CALL_GAS_CAP, "{gas}");
+    }
+
+    #[test]
+    fn wbnb_name_estimate_unproven_slot_fail_closed() {
+        let f = load_tip();
+        let root = decode_hex_fixed::<32>(&f.state_root).unwrap();
+        let addr = decode_hex_fixed::<20>(&f.address).unwrap();
+        let prover = StaticProver {
+            address: addr,
+            proof: f.proof,
+            code: load_wbnb_code(),
+            allow_slots: false,
+        };
+        let data = decode_hex("0x06fdde03").unwrap();
+        let mut block = sample_block(root);
+        block.beneficiary = addr;
+        let err =
+            eth_estimate_gas_verified(&prover, &block, &call_tx(addr, addr, data)).unwrap_err();
+        match err {
+            CallError::Missing(_) | CallError::Proof(_) => {}
+            other => panic!("expected Missing/Proof, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wbnb_name_estimate_with_slot0() {
+        let f = load_slot0();
+        let root = decode_hex_fixed::<32>(&f.state_root).unwrap();
+        let addr = decode_hex_fixed::<20>(&f.address).unwrap();
+        let prover = StaticProver {
+            address: addr,
+            proof: f.proof,
+            code: load_wbnb_code(),
+            allow_slots: true,
+        };
+        let data = decode_hex("0x06fdde03").unwrap();
+        let mut block = sample_block(root);
+        block.beneficiary = addr;
+        let gas = eth_estimate_gas_verified(&prover, &block, &call_tx(addr, addr, data))
+            .expect("estimate");
+        assert!(gas >= TX_GAS, "{gas}");
+        assert!(gas <= CALL_GAS_CAP, "{gas}");
     }
 }

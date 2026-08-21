@@ -1,6 +1,6 @@
 # helios-bsc status
 
-**Updated:** 2026-08-20
+**Updated:** 2026-08-21
 
 | Milestone | State |
 |-----------|--------|
@@ -20,7 +20,8 @@
 | Filters / subscribe | **Done** — `eth_newFilter` / `eth_subscribe` / filter RPCs stay `-32601` (no log index). |
 | Parent-linked header walk | **Done** — consecutive numbers + `parentHash` vs previous **computed** hash (including append stitch). `catch_up` resyncs lookback after a parent mismatch **only if** the new window overlaps the old chain within **21** blocks (`max_reorg_depth = N_seal`). Deeper reorg → fail-closed. |
 | Adversarial mock (PR 10) | **Done** — `helios-bsc-mock` + `RpcUpstream` trait; `Node::handle` fail-closed on lying seals/proofs/parent/`stateRoot`; 14-sealer ≠ Safe. Unproven `eth_call` SLOAD/account is fail-closed (`-32001`), not zero. |
-| Constrained `eth_call` (MVP-2 slice 1) | **Done** — Safe only (`latest`→Safe); `to` + optional `data`; iterative `eth_getProof` at Safe hash/number; **revm 19.7**; unproven SLOAD/account → `-32001`; gas cap **50_000_000**; max **8** proof rounds; no state overrides; no create; never proxy upstream `eth_call`. WBNB `totalSupply` + `name`(slot0) fixtures. `eth_estimateGas` stays `-32601`. Fast Finality is **not** this slice. |
+| Constrained `eth_call` (MVP-2 slice 1) | **Done** — Safe only (`latest`→Safe); `to` + optional `data`; iterative `eth_getProof` at Safe hash/number; **revm 19.7**; unproven SLOAD/account → `-32001`; gas cap **50_000_000**; max **8** proof rounds; no state overrides; no create; never proxy upstream `eth_call`. WBNB `totalSupply` + `name`(slot0) fixtures. Fast Finality is **not** this slice. |
+| Best-effort `eth_estimateGas` (MVP-2 slice 2) | **Done** — same Safe-only constraints as `eth_call`; proof-backed revm **binary search** (geth/reth; not Helios raw `gas_used`); `TX_GAS..=min(user, 50M, block.gasLimit)`; max **8** proof rounds for the whole estimate. Unproven SLOAD/account → `-32001`. Never proxy upstream `eth_estimateGas` / `eth_call`. MethodPolicy **Verified**. Gas is **not consensus** (best-effort). Fast Finality is **not** this slice. |
 | Checkpoint / sealing-set (PR 13 slice) | **Done** — `--checkpoint` + persist + multisource + `verify-checkpoint`. Persist is **tmp+rename**. Sealing-set addresses must be unique 20-byte values; hash/parentHash/stateRoot 32 bytes. `--max-sync` 16000 (~2h) for restart from last-verified. Lookback 130 is the no-checkpoint Safe window only. Reorg/link-break resyncs lookback or replays the origin checkpoint. |
 | Soak (PR 14) | **Done (code + live ≥10 + 1h re-diff)** — unique recatch/retry; nonce vs oracle when historical nonce exists. Duration soak **re-diffs the full list** after unique is full (`visit_all`; re-matches are not empty bursts). Live 2026-08-19 Ankr vs BlastAPI: smoke **unique=10**; idle 1h **unique=19 / compared=19**; re-diff 1h **GATE PASS unique=19 compared=214 match=214 mismatch=0 skip=38** (13 rounds; Ankr window skips, not mismatches). |
 | Bind policy | **Done** — default loopback; `--allow-non-loopback` for LAN (warns: no in-process auth). Docker: `Dockerfile` + `compose.yaml` publish **127.0.0.1:8545** only (`docs/deploy.md`). JSON-RPC HTTP is **POST-only**, body capped at 1 MiB. Loopback `Host` required (403 on DNS-rebinding Host); no CORS `*`. Content-Type missing/JSON ok; `text/html` / form → **415**. |
@@ -45,7 +46,7 @@
 1. **≥24h** mainnet differential soak, mismatch=0 — still the **MVP-1 GA live gate**. 1h re-diff 2026-08-19 is closed (Ankr vs BlastAPI: unique=19, compared=214, match=214, mismatch=0, skip=38 Ankr window, not false-accept). **Not claimed done.**
 2. Re-pin after Pasteur (**2026-08-25**, scheduled, **not live**) if extraData / epoch / turnLength change.
 3. Remaining header-verify items that still lack fixtures: **out-of-turn backoff**, **Maxwell FF recents prune**, **EIP-1559 parent `baseFee` formulas**. Not implemented — do not invent from prose.
-4. `eth_estimateGas` best-effort — **later** (still `-32601` this slice).
+4. `eth_estimateGas` best-effort — **closed** (proof-backed binary search; MethodPolicy Verified; never proxied).
 5. Fast Finality BLS — **not implemented**; later. Deeper RPC (≥128) still helps if proofs start failing.
 
 ## Live pins (do not assume design-doc 16)
