@@ -40,13 +40,34 @@
 | SignRecently (Bohr recents) | **Done** — `seenTimes >= turnLength` in `minerHistoryCheckLen`; recents cleared on set switch. No Maxwell FF prune. |
 | Unsealed header fields | **Done** — empty uncles, gasUsed/gasLimit, Lorentz mixDigest ms, Bohr zero `parentBeaconRoot`, extraData ≤100KiB, empty `withdrawalsRoot`, `header.Time ≤ now+15s`, Parlia nonce empty. Epoch extraData must parse (n≥1 **unique** validators, Bohr `turnLength` 1..=64); membership still needs `--checkpoint`. |
 | Cascading parent fields | **Done** — `MilliTimestamp ≥ parent + BlockInterval` (Ramanujan floor, no out-of-turn backoff); Lorentz+ gasLimit bound `parent/1024`, min 5000. Fixture 998→999 is exactly 450ms. |
-| Header-verify remaining | **Not implemented** (no fixtures; do not claim done): **out-of-turn backoff**, **Maxwell FF recents prune**, **EIP-1559 parent `baseFee` formulas**. |
+| Header-verify remaining | **Not implemented** (no fixtures; do not claim done): **out-of-turn backoff**, **Maxwell FF recents prune**, **EIP-1559 parent `baseFee` formulas**. See *Why these are still open* below — a 2026-08-21 mainnet scan says the fixtures do not exist to capture, not that the work was skipped. |
+| Fixture authenticity | **Done** — `scripts/verify_fixtures.py` re-checks every fixture against live mainnet (headers field-by-field, proof `stateRoot`+`blockHash`, WBNB bytecode). Verified 2026-08-21: all pass. |
+| Real sealing-set tests | **Done** — `header_116663000.json` is the epoch that *governs* the fixture blocks, so `LightEngine` tests run with the genuine 21-validator set and `enforce_inturn` **on** (padded sets could not reach that path). In-turn offset `(parent+1)/turnLength % N` confirmed against **40/40** live blocks. |
 
 ## Next engineering steps
 
 1. **≥24h** mainnet differential soak, mismatch=0 — still the **MVP-1 GA live gate**. 1h re-diff 2026-08-19 is closed (Ankr vs BlastAPI: unique=19, compared=214, match=214, mismatch=0, skip=38 Ankr window, not false-accept). **Not claimed done.**
 2. Re-pin after Pasteur (**2026-08-25**, scheduled, **not live**) if extraData / epoch / turnLength change.
-3. Remaining header-verify items that still lack fixtures: **out-of-turn backoff**, **Maxwell FF recents prune**, **EIP-1559 parent `baseFee` formulas**. Not implemented — do not invent from prose.
+3. Remaining header-verify items that still lack fixtures: **out-of-turn backoff**, **Maxwell FF recents prune**, **EIP-1559 parent `baseFee` formulas**. Not implemented — do not invent from prose. See *Why these are still open*.
+
+## Why these are still open (mainnet scan 2026-08-21)
+
+Sampled **2400 headers** across ~1.8M blocks of history (115.4M → 117.24M, `bsc-dataseed.bnbchain.org`), plus **600 consecutive** at the tip:
+
+| Observed | Count |
+|----------|-------|
+| `difficulty` = `0x2` (in-turn) | **2400 / 2400** — no out-of-turn block found |
+| `baseFeePerGas` = `0x0` | **2400 / 2400** |
+| `gasLimit` = `0x3473bc0` | **2400 / 2400** (never moved) |
+| MilliTimestamp gap | **exactly 450 ms**, 599 / 599 consecutive pairs |
+
+What this means for each item:
+
+- **Out-of-turn backoff** only constrains `difficulty == 1` headers, and the scan found none — the rule cannot be fixture-tested against real data today. Implementing it from prose would be a **fail-closed** check that fires first during a validator outage, i.e. it would break the client exactly when out-of-turn blocks finally appear. Capture a real out-of-turn run before writing it.
+- **EIP-1559 `baseFee`** is identically `0` on BSC in every sampled block, so the Ethereum formula is *not* the rule here. Note `baseFeePerGas` is inside the sealed header (`EncodeSigHeader`), so an upstream cannot restate it without breaking the seal — re-deriving it adds no defence against a lying RPC.
+- **Maxwell FF recents prune** depends on Fast Finality / BLS, which is not implemented at all. It cannot land in isolation.
+
+General point: these three are *protocol well-formedness* rules that the sealing set already enforces. Against a lying **RPC** they add nothing (all three fields are seal-protected — confirmed by `live_epoch_set_rejects_restated_difficulty_via_seal`). They only bind a malicious **validator**, which already requires 15-of-21 collusion — at which point the light client is outside its stated trust model anyway. Treat them as low-priority hardening, not GA blockers.
 4. `eth_estimateGas` best-effort — **closed** (proof-backed binary search; MethodPolicy Verified; never proxied). Local `BLOCKHASH` — **closed**. Revert/Halt JSON-RPC **code 3** — **closed** (geth; not `-32001`).
 5. Fast Finality BLS — **not implemented**; later. Deeper RPC (≥128) still helps if proofs start failing.
 6. `receiptsRoot` RPC proofs on mined receipts/logs; `eth_getLogs` — **closed** (`bin/helios-bsc/src/rpc_server.rs`: untrusted receipt JSON re-encoded to consensus RLP and bound to the sealed `receiptsRoot` via `verify_receipt_list`; `eth_getLogs` is single-block only — `fromBlock==toBlock` or `blockHash` — adversarial-tested against omitted/lying logs). `transactionsRoot` hashes in `eth_getBlock*` — **closed** (raw-RLP DeriveSha; empty root or no envelopes → `[]`; lying list → `-32001`). Count/ByIndex **Verified**. Opt-in `eth_getRawTransactionByHash` — **closed** (keccak-bound). `accessList` prefetch — **closed**. Historical `n≤Safe` — **closed**. Keep `SpecId::CANCUN` on revm 19.7 (not Mendel).

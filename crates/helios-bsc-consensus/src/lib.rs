@@ -541,6 +541,98 @@ mod tests {
         );
     }
 
+    /// End-to-end against **real** mainnet consensus data: epoch 116663000 is the
+    /// epoch that *governs* the fixture blocks (activates at +87 = 116663087), so its
+    /// extraData supplies the genuine 21-validator sealing set. Unlike [`padded_set`],
+    /// a real set can satisfy in-turn difficulty, so `enforce_inturn` stays **on** here.
+    #[test]
+    fn live_epoch_set_verifies_fixtures_with_inturn_enforced() {
+        let epoch = load_header("header_116663000.json");
+        let headers = fixture_headers();
+        let first = decode_u64(&headers[0].number).unwrap();
+
+        let epoch_number = decode_u64(&epoch.number).unwrap();
+        assert_eq!(epoch_number, 116_663_000);
+        assert!(
+            first >= epoch_number + epoch_delay_mainnet(),
+            "fixtures must sit at or past the activation height"
+        );
+
+        let set = sealing_set_from_activated_epoch(&epoch, first).unwrap();
+        assert_eq!(set.len(), 21, "live mainnet sealing set");
+
+        let cp = Checkpoint::from_rpc_header(&headers[0], set, "fermi", Some("live epoch".into()))
+            .unwrap();
+        let mut eng = LightEngine::from_checkpoint_and_header(cp, &headers[0]).unwrap();
+        assert!(
+            eng.snapshot.enforce_inturn,
+            "real set must not need the in-turn escape hatch"
+        );
+        assert_eq!(eng.snapshot.turn_length, 8);
+
+        eng.apply_headers(&headers[1..]).unwrap();
+        assert_eq!(eng.tip_number(), 116_664_002);
+        assert_eq!(eng.n_seal(), 21);
+    }
+
+    /// `difficulty` is inside the sealed header, so an upstream cannot restate it: the
+    /// seal breaks before the in-turn rule is consulted. Rejection must still happen.
+    #[test]
+    fn live_epoch_set_rejects_restated_difficulty_via_seal() {
+        let epoch = load_header("header_116663000.json");
+        let headers = fixture_headers();
+        let first = decode_u64(&headers[0].number).unwrap();
+        let set = sealing_set_from_activated_epoch(&epoch, first).unwrap();
+        let cp = Checkpoint::from_rpc_header(&headers[0], set, "fermi", None).unwrap();
+        let mut eng = LightEngine::from_checkpoint_and_header(cp, &headers[0]).unwrap();
+
+        let mut lying = headers[1].clone();
+        assert_eq!(lying.difficulty, "0x2", "fixture block is in-turn");
+        lying.difficulty = "0x1".into();
+        let err = eng.apply_header(&lying).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConsensusError::Snapshot(SnapshotError::Seal(SealError::CoinbaseMismatch { .. }))
+            ),
+            "restated difficulty must break the seal, got: {err}"
+        );
+    }
+
+    /// In-turn expectation on the **real** set: `offset = (parent+1)/turnLength % N`
+    /// picks the sealer the chain actually used, and every other member is out-of-turn.
+    #[test]
+    fn live_epoch_set_inturn_matches_real_sealers() {
+        let epoch = load_header("header_116663000.json");
+        let headers = fixture_headers();
+        let first = decode_u64(&headers[0].number).unwrap();
+        let set = sealing_set_from_activated_epoch(&epoch, first).unwrap();
+        let cp = Checkpoint::from_rpc_header(&headers[0], set, "fermi", None).unwrap();
+        let mut eng = LightEngine::from_checkpoint_and_header(cp, &headers[0]).unwrap();
+
+        for h in &headers[1..] {
+            let want = eng.snapshot.inturn_validator().expect("in-turn sealer");
+            let miner = decode_hex_fixed::<20>(&h.miner).unwrap();
+            assert_eq!(
+                format_address(&want),
+                format_address(&miner),
+                "block {} in-turn sealer",
+                h.number
+            );
+            assert_eq!(eng.snapshot.expected_difficulty(&miner), 2);
+            // Any other set member is out-of-turn at this height.
+            let other = eng
+                .snapshot
+                .validators
+                .iter()
+                .find(|v| **v != miner)
+                .copied()
+                .expect("set has >1 validator");
+            assert_eq!(eng.snapshot.expected_difficulty(&other), 1);
+            eng.apply_header(h).unwrap();
+        }
+    }
+
     #[test]
     fn checkpoint_header_hash_mismatch() {
         let headers = fixture_headers();
