@@ -18,7 +18,8 @@ use helios_bsc_execution::{
     encode_data32, encode_qty, eth_call_verified, eth_estimate_gas_verified, pad32,
     retain_requested_storage, validate_bsc_raw_tx, verify_account_code, verify_eth_get_proof,
     verify_storage_slot, CallBlock, CallError, CallTx, EthAccountProof, ProofError, ProveAtSafe,
-    VerifiedAccount, CALL_GAS_CAP, EMPTY_CODE_HASH, MAX_CALL_DATA, MAX_CODE_SIZE, MAX_RAW_TX,
+    VerifiedAccount, CALL_GAS_CAP, EMPTY_CODE_HASH, MAX_CALL_ACCOUNTS, MAX_CALL_DATA,
+    MAX_CODE_SIZE, MAX_RAW_TX,
 };
 use helios_bsc_rpc::{
     jsonrpc_id_ok, jsonrpc_is_v2, jsonrpc_params_len, jsonrpc_params_ok, method_policy, rpc_err,
@@ -1358,13 +1359,67 @@ fn parse_eth_call_tx(req: &Value) -> Result<CallTx, String> {
         Some(Value::String(s)) => Some(decode_u64(s).map_err(|e| format!("invalid gas: {e}"))?),
         Some(_) => return Err("gas is not hex".into()),
     };
+    let access_list = parse_access_list(map)?;
     Ok(CallTx {
         from,
         to,
         data,
         value,
         gas,
+        access_list,
     })
+}
+
+type CallAccessList = Vec<([u8; 20], Vec<[u8; 32]>)>;
+
+fn parse_access_list(map: &serde_json::Map<String, Value>) -> Result<CallAccessList, String> {
+    match map.get("accessList") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => {
+            if items.len() > MAX_CALL_ACCOUNTS {
+                return Err("accessList too large".into());
+            }
+            let mut out = Vec::with_capacity(items.len());
+            let mut total_keys = 0usize;
+            for item in items {
+                let obj = item
+                    .as_object()
+                    .ok_or_else(|| "accessList entry is not an object".to_string())?;
+                let address = match obj.get("address") {
+                    None | Some(Value::Null) => return Err("accessList address required".into()),
+                    Some(Value::String(s)) => require_rpc_address(s)?,
+                    Some(_) => return Err("accessList address is not an address".into()),
+                };
+                let slots = match obj.get("storageKeys") {
+                    None | Some(Value::Null) => Vec::new(),
+                    Some(Value::Array(keys)) => {
+                        if keys.len() > MAX_PROOF_STORAGE_KEYS {
+                            return Err("accessList too large".into());
+                        }
+                        let mut slots = Vec::with_capacity(keys.len());
+                        for k in keys {
+                            let s = k
+                                .as_str()
+                                .ok_or_else(|| "accessList storage key is not hex".to_string())?;
+                            slots
+                                .push(parse_slot(s).map_err(|_| {
+                                    "accessList storage key is not hex".to_string()
+                                })?);
+                        }
+                        slots
+                    }
+                    Some(_) => return Err("accessList storageKeys must be an array".into()),
+                };
+                total_keys = total_keys.saturating_add(slots.len());
+                if total_keys > MAX_PROOF_STORAGE_KEYS {
+                    return Err("accessList too large".into());
+                }
+                out.push((address, slots));
+            }
+            Ok(out)
+        }
+        Some(_) => Err("accessList must be an array".into()),
+    }
 }
 
 fn parse_call_data(map: &serde_json::Map<String, Value>) -> Result<Vec<u8>, String> {
@@ -2460,5 +2515,56 @@ mod tests {
         assert_eq!(code, ERR_PARAMS);
         assert_eq!(msg, "calldata too large");
         assert!(data.is_none());
+    }
+
+    fn sample_call_req(tx: Value) -> Value {
+        json!({"params": [tx]})
+    }
+
+    #[test]
+    fn parse_eth_call_tx_access_list() {
+        let to = "0x0000000000000000000000000000000000000001";
+        let omitted = parse_eth_call_tx(&sample_call_req(json!({"to": to}))).unwrap();
+        assert!(omitted.access_list.is_empty());
+
+        let with = parse_eth_call_tx(&sample_call_req(json!({
+            "to": to,
+            "accessList": [{
+                "address": "0x0000000000000000000000000000000000000002",
+                "storageKeys": ["0x0", "0x1"]
+            }]
+        })))
+        .unwrap();
+        assert_eq!(with.access_list.len(), 1);
+        assert_eq!(with.access_list[0].0[19], 2);
+        assert_eq!(with.access_list[0].1.len(), 2);
+        assert_eq!(with.access_list[0].1[0], [0u8; 32]);
+
+        let junk = parse_eth_call_tx(&sample_call_req(json!({
+            "to": to,
+            "accessList": [{"address": "not-an-address", "storageKeys": []}]
+        })));
+        assert!(junk.is_err(), "{junk:?}");
+
+        let mut huge = Vec::new();
+        for i in 0..=MAX_CALL_ACCOUNTS {
+            huge.push(json!({
+                "address": format!("0x{:040x}", i + 1),
+                "storageKeys": []
+            }));
+        }
+        let err =
+            parse_eth_call_tx(&sample_call_req(json!({"to": to, "accessList": huge}))).unwrap_err();
+        assert!(err.contains("accessList too large"), "{err}");
+
+        let too_many_keys: Vec<Value> = (0..=MAX_PROOF_STORAGE_KEYS)
+            .map(|i| json!(format!("0x{i:x}")))
+            .collect();
+        let err = parse_eth_call_tx(&sample_call_req(json!({
+            "to": to,
+            "accessList": [{"address": to, "storageKeys": too_many_keys}]
+        })))
+        .unwrap_err();
+        assert!(err.contains("accessList too large"), "{err}");
     }
 }

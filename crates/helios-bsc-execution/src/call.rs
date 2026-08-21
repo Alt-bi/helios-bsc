@@ -23,7 +23,7 @@ use thiserror::Error;
 
 /// geth RPC gas cap used for `eth_call`.
 pub const CALL_GAS_CAP: u64 = 50_000_000;
-/// Max miss-retry proof fetches. Seed of `to`/`from`/coinbase is not charged.
+/// Max miss-retry proof fetches. Seed of `to`/`from`/coinbase/`accessList` is not charged.
 pub const MAX_PROOF_ROUNDS: u32 = 8;
 /// Max distinct accounts loaded into [`ProofDb`] for one call.
 pub const MAX_CALL_ACCOUNTS: usize = 32;
@@ -45,6 +45,8 @@ pub struct CallTx {
     pub data: Vec<u8>,
     pub value: [u8; 32],
     pub gas: Option<u64>,
+    /// EIP-2930 access list: prefetch these accounts/slots as seed (not miss-retries).
+    pub access_list: Vec<([u8; 20], Vec<[u8; 32]>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -444,6 +446,7 @@ fn seed_call_accounts<P: ProveAtSafe>(
     block: &CallBlock,
     tx: &CallTx,
 ) -> Result<(), CallError> {
+    access_list_within_caps(tx)?;
     let mut seen: Vec<[u8; 20]> = Vec::with_capacity(3);
     for address in [tx.to, tx.from, block.beneficiary] {
         if is_precompile(Address::from(address)) {
@@ -454,6 +457,44 @@ fn seed_call_accounts<P: ProveAtSafe>(
         }
         seen.push(address);
         fetch_and_load(prover, db, block, &address, &[])?;
+    }
+    seed_access_list(prover, db, block, tx)
+}
+
+/// Access-list size caps (parse uses the same numbers as [`CallError::Invalid`]).
+fn access_list_within_caps(tx: &CallTx) -> Result<(), CallError> {
+    if tx.access_list.len() > MAX_CALL_ACCOUNTS {
+        return Err(CallError::Invalid("accessList too large"));
+    }
+    let mut total_keys = 0usize;
+    for (_address, slots) in &tx.access_list {
+        if slots.len() > MAX_PROOF_STORAGE_KEYS {
+            return Err(CallError::Invalid("accessList too large"));
+        }
+        total_keys = total_keys.saturating_add(slots.len());
+        if total_keys > MAX_PROOF_STORAGE_KEYS {
+            return Err(CallError::Invalid("accessList too large"));
+        }
+    }
+    Ok(())
+}
+
+/// Prefetch EIP-2930 `accessList` into [`ProofDb`]. Seed — does not consume miss rounds.
+/// Exceeding remaining ProofDb caps during load is [`CallError::Budget`].
+fn seed_access_list<P: ProveAtSafe>(
+    prover: &P,
+    db: &mut ProofDb,
+    block: &CallBlock,
+    tx: &CallTx,
+) -> Result<(), CallError> {
+    if tx.access_list.is_empty() {
+        return Ok(());
+    }
+    for (address, slots) in &tx.access_list {
+        if is_precompile(Address::from(*address)) {
+            continue;
+        }
+        fetch_and_load(prover, db, block, address, slots)?;
     }
     Ok(())
 }
@@ -699,6 +740,7 @@ mod tests {
             data,
             value: [0u8; 32],
             gas: Some(100_000),
+            access_list: Vec::new(),
         }
     }
 
@@ -943,6 +985,7 @@ mod tests {
             data: vec![],
             value: [0u8; 32],
             gas: Some(1_000_000),
+            access_list: Vec::new(),
         };
         eth_call_verified(&prover, &block, &tx).expect("8 miss-retries after seed");
         assert_eq!(
@@ -1499,5 +1542,125 @@ mod tests {
             .expect("estimate");
         assert!(gas >= TX_GAS, "{gas}");
         assert!(gas <= CALL_GAS_CAP, "{gas}");
+    }
+
+    #[test]
+    fn wbnb_name_prefetch_access_list_slot0() {
+        let f = load_slot0();
+        let root = decode_hex_fixed::<32>(&f.state_root).unwrap();
+        let addr = decode_hex_fixed::<20>(&f.address).unwrap();
+        let prover = StaticProver {
+            address: addr,
+            proof: f.proof,
+            code: load_wbnb_code(),
+            allow_slots: true,
+        };
+        let data = decode_hex("0x06fdde03").unwrap();
+        let mut block = sample_block(root);
+        block.beneficiary = addr;
+        let mut tx = call_tx(addr, addr, data);
+        tx.access_list = vec![(addr, vec![[0u8; 32]])];
+        let out = eth_call_verified(&prover, &block, &tx).expect("name");
+        assert!(
+            out.windows(b"Wrapped BNB".len())
+                .any(|w| w == b"Wrapped BNB"),
+            "ABI name missing Wrapped BNB: 0x{}",
+            hex::encode(&out)
+        );
+    }
+
+    #[test]
+    fn wbnb_name_estimate_prefetch_access_list_slot0() {
+        let f = load_slot0();
+        let root = decode_hex_fixed::<32>(&f.state_root).unwrap();
+        let addr = decode_hex_fixed::<20>(&f.address).unwrap();
+        let prover = StaticProver {
+            address: addr,
+            proof: f.proof,
+            code: load_wbnb_code(),
+            allow_slots: true,
+        };
+        let data = decode_hex("0x06fdde03").unwrap();
+        let mut block = sample_block(root);
+        block.beneficiary = addr;
+        let mut tx = call_tx(addr, addr, data);
+        tx.access_list = vec![(addr, vec![[0u8; 32]])];
+        let gas = eth_estimate_gas_verified(&prover, &block, &tx).expect("estimate");
+        assert!(gas >= TX_GAS, "{gas}");
+        assert!(gas <= CALL_GAS_CAP, "{gas}");
+    }
+
+    #[test]
+    fn access_list_seed_does_not_reduce_miss_retry_budget() {
+        let from = [0x11u8; 20];
+        let to = [0x22u8; 20];
+        let beneficiary = [0x33u8; 20];
+        let code = call_n_addrs(MAX_PROOF_ROUNDS as u8);
+        let (root, proof) = single_leaf_account(to, &code, EMPTY_TRIE_ROOT);
+        let prover = CountingProver {
+            to,
+            proof,
+            code,
+            fetches: std::cell::Cell::new(0),
+        };
+        let mut block = sample_block(root);
+        block.beneficiary = beneficiary;
+        let extra = miss_addr(0xff);
+        let mut tx = call_tx(from, to, vec![]);
+        tx.gas = Some(1_000_000);
+        tx.access_list = vec![(extra, vec![])];
+        eth_call_verified(&prover, &block, &tx).expect("8 miss-retries after accessList seed");
+        assert_eq!(
+            prover.fetches.get(),
+            3 + 1 + MAX_PROOF_ROUNDS,
+            "3 seed + 1 accessList + 8 miss fetches"
+        );
+    }
+
+    #[test]
+    fn access_list_too_large_is_invalid() {
+        let from = [0x11u8; 20];
+        let to = [0x22u8; 20];
+        let (root, proof) = single_leaf_account(to, &RETURN_42_FULL, EMPTY_TRIE_ROOT);
+        let prover = CountingProver {
+            to,
+            proof,
+            code: RETURN_42_FULL.to_vec(),
+            fetches: std::cell::Cell::new(0),
+        };
+        let mut tx = call_tx(from, to, vec![]);
+        tx.access_list = (0..=MAX_CALL_ACCOUNTS)
+            .map(|i| (miss_addr(i as u8), Vec::new()))
+            .collect();
+        let err = eth_call_verified(&prover, &sample_block(root), &tx).unwrap_err();
+        match err {
+            CallError::Invalid(msg) => assert!(msg.contains("accessList too large"), "{msg}"),
+            other => panic!("expected Invalid accessList too large, got {other:?}"),
+        }
+        assert_eq!(prover.fetches.get(), 0, "oversized list must not fetch");
+    }
+
+    #[test]
+    fn access_list_new_accounts_over_proofdb_cap_is_budget() {
+        let from = [0x11u8; 20];
+        let to = [0x22u8; 20];
+        let beneficiary = [0x33u8; 20];
+        let (root, proof) = single_leaf_account(to, &RETURN_42_FULL, EMPTY_TRIE_ROOT);
+        let prover = CountingProver {
+            to,
+            proof,
+            code: RETURN_42_FULL.to_vec(),
+            fetches: std::cell::Cell::new(0),
+        };
+        let mut block = sample_block(root);
+        block.beneficiary = beneficiary;
+        let mut tx = call_tx(from, to, vec![]);
+        // 3 seed accounts + 30 new exclusion addresses → 33rd insert is Budget.
+        tx.access_list = (0..30).map(|i| (miss_addr(i), Vec::new())).collect();
+        let err = eth_call_verified(&prover, &block, &tx).unwrap_err();
+        match err {
+            CallError::Budget => {}
+            other => panic!("expected Budget, got {other:?}"),
+        }
     }
 }

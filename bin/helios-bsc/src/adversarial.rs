@@ -7,7 +7,9 @@ use crate::sync::{
 use crate::{Node, RpcUpstream};
 use anyhow::{anyhow, Result};
 use helios_bsc_consensus::{header_hash, newest_safe, Snapshot, VerifiedBlock};
-use helios_bsc_execution::{encode_data32, encode_qty, EMPTY_TRIE_ROOT, MAX_RAW_TX, TX_GAS};
+use helios_bsc_execution::{
+    encode_data32, encode_qty, EMPTY_TRIE_ROOT, MAX_CALL_ACCOUNTS, MAX_RAW_TX, TX_GAS,
+};
 use helios_bsc_mock::{
     cycling_sealer_chain, distinct_sealer_chain, headers_from_chain, n_seal, relink_dummy_chain,
     MockRpc, Scenario, WBNB_ADDRESS, WRONG_STATE_ROOT,
@@ -1776,4 +1778,67 @@ fn get_balance_and_eth_call_object_block_id_rejected() {
         json!([{"to": WBNB_ADDRESS}, {"blockNumber": "0x0"}]),
     ));
     assert_eq!(err_code(&call), ERR_PARAMS, "{call}");
+}
+
+#[test]
+fn eth_call_access_list_junk_address_is_invalid_params() {
+    let (chain, rpc) = safe_chain_with_fixture_root();
+    let node = node_from_chain(chain, rpc.proof_json());
+    for method in ["eth_call", "eth_estimateGas"] {
+        let v = node.handle(&req(
+            method,
+            json!([
+                {
+                    "to": WBNB_ADDRESS,
+                    "accessList": [{"address": "not-an-address", "storageKeys": []}]
+                },
+                "latest"
+            ]),
+        ));
+        assert_eq!(err_code(&v), ERR_PARAMS, "{method} junk: {v}");
+        assert_eq!(err_code(&v), -32602, "{method} junk: {v}");
+    }
+}
+
+#[test]
+fn eth_call_access_list_too_large_is_invalid_params() {
+    let (chain, rpc) = safe_chain_with_fixture_root();
+    let node = node_from_chain(chain, rpc.proof_json());
+    let huge: Vec<Value> = (0..=MAX_CALL_ACCOUNTS)
+        .map(|i| {
+            json!({
+                "address": format!("0x{:040x}", i + 1),
+                "storageKeys": []
+            })
+        })
+        .collect();
+    let too_many_keys: Vec<Value> = (0..=MAX_PROOF_STORAGE_KEYS)
+        .map(|i| json!(format!("0x{i:x}")))
+        .collect();
+    for method in ["eth_call", "eth_estimateGas"] {
+        let v = node.handle(&req(
+            method,
+            json!([{"to": WBNB_ADDRESS, "accessList": huge}, "latest"]),
+        ));
+        assert_eq!(err_code(&v), ERR_PARAMS, "{method} huge: {v}");
+        let msg = v["error"]["message"].as_str().unwrap_or("");
+        assert!(msg.contains("accessList too large"), "{method} huge: {v}");
+
+        let keys = node.handle(&req(
+            method,
+            json!([
+                {
+                    "to": WBNB_ADDRESS,
+                    "accessList": [{"address": WBNB_ADDRESS, "storageKeys": too_many_keys}]
+                },
+                "latest"
+            ]),
+        ));
+        assert_eq!(err_code(&keys), ERR_PARAMS, "{method} keys: {keys}");
+        let msg = keys["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("accessList too large"),
+            "{method} keys: {keys}"
+        );
+    }
 }
