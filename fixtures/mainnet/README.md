@@ -30,8 +30,11 @@ python scripts/verify_fixtures.py --rpc https://bsc-dataseed.bnbchain.org
 ```
 
 Last verified **2026-08-21**: all 6 headers, 3 proofs and `wbnb_code.hex` match live
-BSC mainnet. Note `bsc-mainnet.public.blastapi.io` now answers **403** without a key —
-use `bsc-dataseed.bnbchain.org` (or your own upstream) to re-verify.
+BSC mainnet (via `bsc-dataseed.bnbchain.org`; header data only, no `eth_getProof`).
+
+Send a **`User-Agent`** if you probe by hand: BlastAPI / publicnode / meowrpc answer
+**403** to a bare `Python-urllib` or `curl` default. Every `scripts/*.py` already sets
+one, as does the client (`helios-bsc`), so this only bites ad-hoc one-liners.
 
 Refresh:
 
