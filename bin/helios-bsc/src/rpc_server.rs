@@ -11,6 +11,8 @@ use helios_bsc_config::{
     expected_safe_lag_blocks, mainnet_current_fork, mainnet_n_seal, max_reorg_depth,
     safe_lag_seconds, safe_lag_within_slo, PROVIDER_PROOF_LOOKBACK,
 };
+#[cfg(test)]
+use helios_bsc_consensus::VoteData;
 use helios_bsc_consensus::{
     checkpoint_age_secs, checkpoint_at_snapshot, header_hash, proof_lag, unix_now,
     within_proof_window, Snapshot, VerifiedBlock,
@@ -66,12 +68,18 @@ pub struct Node {
     /// take the chain lock. [`NO_BLOCK`] means "not known yet".
     last_tip: AtomicU64,
     last_safe: AtomicU64,
+    /// Last observed fast-finality heads (BEP-126): the newest attestation's target
+    /// (justified) and source (finalized). Published on the same path as `last_tip` /
+    /// `last_safe` for the same reason — a scrape must never take the chain lock.
+    /// [`NO_BLOCK`] means "no attestation seen yet", which is a normal state.
+    last_justified: AtomicU64,
+    last_finalized: AtomicU64,
     allow_unverified_passthrough: bool,
     backup_transport: bool,
     metrics_enabled: bool,
 }
 
-/// Sentinel for an unpublished `last_tip` / `last_safe` gauge.
+/// Sentinel for an unpublished `last_tip` / `last_safe` / finality gauge.
 const NO_BLOCK: u64 = u64::MAX;
 
 impl Node {
@@ -99,6 +107,9 @@ impl Node {
             upstream_errors: AtomicU64::new(0),
             last_tip: AtomicU64::new(tip),
             last_safe: AtomicU64::new(safe.number),
+            // Lookback bootstrap carries no snapshot, so no attestation is known yet.
+            last_justified: AtomicU64::new(NO_BLOCK),
+            last_finalized: AtomicU64::new(NO_BLOCK),
             allow_unverified_passthrough: false,
             backup_transport: false,
             metrics_enabled: false,
@@ -124,6 +135,8 @@ impl Node {
             walk_from_checkpoint(up.as_ref(), checkpoint.clone(), tip, max_sync)?;
         let safe = safe_of(&chain)?;
         let n = chain.len() as u64;
+        let justified = snapshot.justified().map(|(b, _)| b);
+        let finalized = snapshot.finalized().map(|(b, _)| b);
         Ok(Self {
             up,
             lookback,
@@ -141,6 +154,8 @@ impl Node {
             upstream_errors: AtomicU64::new(0),
             last_tip: AtomicU64::new(tip),
             last_safe: AtomicU64::new(safe.number),
+            last_justified: AtomicU64::new(justified.unwrap_or(NO_BLOCK)),
+            last_finalized: AtomicU64::new(finalized.unwrap_or(NO_BLOCK)),
             allow_unverified_passthrough: false,
             backup_transport: false,
             metrics_enabled: false,
@@ -167,6 +182,8 @@ impl Node {
             upstream_errors: AtomicU64::new(0),
             last_tip: AtomicU64::new(NO_BLOCK),
             last_safe: AtomicU64::new(NO_BLOCK),
+            last_justified: AtomicU64::new(NO_BLOCK),
+            last_finalized: AtomicU64::new(NO_BLOCK),
             allow_unverified_passthrough: false,
             backup_transport: false,
             metrics_enabled: false,
@@ -198,6 +215,8 @@ impl Node {
             upstream_errors: AtomicU64::new(0),
             last_tip: AtomicU64::new(NO_BLOCK),
             last_safe: AtomicU64::new(NO_BLOCK),
+            last_justified: AtomicU64::new(NO_BLOCK),
+            last_finalized: AtomicU64::new(NO_BLOCK),
             allow_unverified_passthrough: false,
             backup_transport: false,
             metrics_enabled: false,
@@ -235,6 +254,31 @@ impl Node {
         self.chain.lock().expect("chain lock")
     }
 
+    /// Publish a fast-finality pair exactly as a successful `refresh` would.
+    ///
+    /// The mock chain has no real BLS attestations, and forging one here would prove
+    /// nothing: whether a signature is genuine is settled in `helios-bsc-consensus`
+    /// against live mainnet fixtures. What these tests cover instead is the reporting
+    /// path — that a known head reaches `/metrics` and `syncStatus`, and that an unknown
+    /// one reads as `-1` / `null` rather than zero.
+    #[cfg(test)]
+    pub fn publish_finality_for_test(
+        &self,
+        justified: (u64, [u8; 32]),
+        finalized: (u64, [u8; 32]),
+    ) {
+        if let Some(snap) = self.snapshot.lock().expect("snapshot lock").as_mut() {
+            snap.attestation = Some(VoteData {
+                source_number: finalized.0,
+                source_hash: finalized.1,
+                target_number: justified.0,
+                target_hash: justified.1,
+            });
+        }
+        self.last_justified.store(justified.0, Ordering::Relaxed);
+        self.last_finalized.store(finalized.0, Ordering::Relaxed);
+    }
+
     /// Prometheus text exposition (`docs/slo.md`).
     ///
     /// **Lock-free by construction.** It reads only atomics published by the last
@@ -247,11 +291,19 @@ impl Node {
     pub fn metrics_text(&self) -> String {
         let raw_tip = self.last_tip.load(Ordering::Relaxed);
         let raw_safe = self.last_safe.load(Ordering::Relaxed);
+        let raw_justified = self.last_justified.load(Ordering::Relaxed);
+        let raw_finalized = self.last_finalized.load(Ordering::Relaxed);
         let tip = (raw_tip != NO_BLOCK).then_some(raw_tip);
         let safe = (raw_safe != NO_BLOCK).then_some(raw_safe);
+        let justified = (raw_justified != NO_BLOCK).then_some(raw_justified);
+        let finalized = (raw_finalized != NO_BLOCK).then_some(raw_finalized);
         let interval_ms = mainnet_current_fork().block_interval_ms;
         let lag = match (tip, safe) {
             (Some(t), Some(s)) => Some(proof_lag(t, s)),
+            _ => None,
+        };
+        let finalized_lag = match (tip, finalized) {
+            (Some(t), Some(f)) => Some(proof_lag(t, f)),
             _ => None,
         };
         let checkpoint_age = self
@@ -333,9 +385,24 @@ impl Node {
             checkpoint_age.map_or_else(|| "-1".into(), |a| a.to_string()),
         );
         gauge(
+            "helios_bsc_finalized_block",
+            "Fast-finality finalized head: the newest attestation's source (-1 when no attestation has been seen).",
+            finalized.map_or_else(|| "-1".into(), |f| f.to_string()),
+        );
+        gauge(
+            "helios_bsc_finalized_lag_blocks",
+            "Tip minus the fast-finality finalized head, in blocks (-1 when no attestation has been seen).",
+            finalized_lag.map_or_else(|| "-1".into(), |l| l.to_string()),
+        );
+        gauge(
+            "helios_bsc_justified_block",
+            "Fast-finality justified head: the newest attestation's target (-1 when no attestation has been seen).",
+            justified.map_or_else(|| "-1".into(), |j| j.to_string()),
+        );
+        gauge(
             "helios_bsc_finality_mode",
-            "0 = confirmation-depth, 1 = fast finality (BLS, not implemented).",
-            "0".into(),
+            "0 = confirmation-depth, 1 = fast finality (BLS attestation, finalized head known).",
+            u8::from(finalized.is_some()).to_string(),
         );
         gauge(
             "helios_bsc_sealing_set_enforced",
@@ -456,12 +523,22 @@ impl Node {
                 return Err(e);
             }
         };
+        // Read the fast-finality heads while the snapshot is still locked; they are
+        // published as plain numbers below so a scrape never needs the lock at all.
+        let (justified, finalized) = match snapshot.as_ref() {
+            Some(s) => (s.justified().map(|(b, _)| b), s.finalized().map(|(b, _)| b)),
+            None => (None, None),
+        };
         drop(chain);
         drop(snapshot);
         self.bump_headers(verified_this);
         // Publish for /metrics so a scrape never contends with this sync.
         self.last_tip.store(tip, Ordering::Relaxed);
         self.last_safe.store(safe.number, Ordering::Relaxed);
+        self.last_justified
+            .store(justified.unwrap_or(NO_BLOCK), Ordering::Relaxed);
+        self.last_finalized
+            .store(finalized.unwrap_or(NO_BLOCK), Ordering::Relaxed);
         if grew {
             self.persist_verified_tip();
         }
@@ -718,12 +795,29 @@ impl Node {
     }
 
     fn status_fields(&self, tip: u64, safe: &SafeHead) -> Value {
-        let sealing = self.snapshot.lock().expect("snapshot lock").is_some();
+        // One lock, three answers: whether a sealing set is enforced and, if the
+        // snapshot carries a BEP-126 attestation, the justified/finalized pair.
+        // `fast_finality_available` is false until the BLS vote keys are known — a
+        // normal state at a checkpoint before the first epoch activation, not an error.
+        let (sealing, fast_available, justified, finalized) = {
+            let snapshot = self.snapshot.lock().expect("snapshot lock");
+            match snapshot.as_ref() {
+                Some(s) => (
+                    true,
+                    s.fast_finality_available(),
+                    s.justified(),
+                    s.finalized(),
+                ),
+                None => (false, false, None, None),
+            }
+        };
         let lag = proof_lag(tip, safe.number);
         let interval_ms = mainnet_current_fork().block_interval_ms;
+        // `safe` / `safeLagBlocks` / `lag` keep meaning confirmation depth; the
+        // fast-finality fields are reported alongside them, not instead of them.
         json!({
             "trustClass": "verified",
-            "finality": "confirmation-depth",
+            "finality": if finalized.is_some() { "fast-finality" } else { "confirmation-depth" },
             "forkId": self.fork_id,
             "tip": tip,
             "safe": safe.number,
@@ -746,6 +840,12 @@ impl Node {
             "backupTransport": self.backup_transport,
             "expectedSafeLagBlocks": expected_safe_lag_blocks(),
             "safeLagWithinBound": safe_lag_within_slo(lag),
+            "fastFinalityAvailable": fast_available,
+            "justifiedBlock": justified.map(|(b, _)| b),
+            "justifiedHash": justified.map(|(_, h)| format!("0x{}", hex::encode(h))),
+            "finalizedBlock": finalized.map(|(b, _)| b),
+            "finalizedHash": finalized.map(|(_, h)| format!("0x{}", hex::encode(h))),
+            "finalizedLagBlocks": finalized.map(|(b, _)| proof_lag(tip, b)),
         })
     }
 

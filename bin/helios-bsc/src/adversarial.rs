@@ -1212,9 +1212,140 @@ fn snapshot_for_chain(chain: &[VerifiedBlock]) -> Snapshot {
         timestamp: 1_768_357_801,
         fork_id: "fermi".into(),
         sealing_set: set,
+        vote_keys: None,
         attestation: None,
     };
     Snapshot::from_checkpoint(&cp).unwrap()
+}
+
+/// Node with a sealing-set snapshot, so the fast-finality fields have somewhere to live.
+fn node_with_snapshot() -> Node {
+    let chain = distinct_sealer_chain(15);
+    let snap = snapshot_for_chain(&chain);
+    let up = MockUpstream::for_chain(&chain, json!({}));
+    Node::from_parts_with_snapshot(Box::new(up), 130, chain, snap, "fermi")
+}
+
+#[test]
+fn finality_is_confirmation_depth_until_an_attestation_is_seen() {
+    let node = node_with_snapshot();
+
+    let m = node.metrics_text();
+    // `-1`, never `0`: a dashboard must not read "no finalized head yet" as "lag zero".
+    assert!(m.contains("helios_bsc_finalized_block -1"), "{m}");
+    assert!(m.contains("helios_bsc_finalized_lag_blocks -1"), "{m}");
+    assert!(m.contains("helios_bsc_justified_block -1"), "{m}");
+    assert!(m.contains("helios_bsc_finality_mode 0"), "{m}");
+
+    let st = node.handle(&req("helios_bsc_syncStatus", json!([])));
+    assert_eq!(st["result"]["finality"], json!("confirmation-depth"));
+    assert_eq!(st["result"]["finalizedBlock"], Value::Null);
+    assert_eq!(st["result"]["finalizedHash"], Value::Null);
+    assert_eq!(st["result"]["justifiedBlock"], Value::Null);
+    assert_eq!(st["result"]["finalizedLagBlocks"], Value::Null);
+    // A snapshot without BLS vote keys is a normal state, not an error.
+    assert_eq!(st["result"]["fastFinalityAvailable"], json!(false));
+}
+
+#[test]
+fn published_finality_reaches_metrics_and_sync_status() {
+    let node = node_with_snapshot();
+    let tip = node.handle(&req("helios_bsc_syncStatus", json!([])))["result"]["tip"]
+        .as_u64()
+        .expect("tip");
+
+    // Live mainnet lag: justified = tip-1, finalized = tip-2.
+    let justified_hash = [0xa1u8; 32];
+    let finalized_hash = [0xb2u8; 32];
+    node.publish_finality_for_test((tip - 1, justified_hash), (tip - 2, finalized_hash));
+
+    let m = node.metrics_text();
+    assert!(
+        m.contains(&format!("helios_bsc_finalized_block {}", tip - 2)),
+        "{m}"
+    );
+    assert!(
+        m.contains(&format!("helios_bsc_justified_block {}", tip - 1)),
+        "{m}"
+    );
+    assert!(m.contains("helios_bsc_finalized_lag_blocks 2"), "{m}");
+    assert!(m.contains("helios_bsc_finality_mode 1"), "{m}");
+
+    let st = node.handle(&req("helios_bsc_syncStatus", json!([])));
+    let r = &st["result"];
+    assert_eq!(r["finality"], json!("fast-finality"));
+    assert_eq!(r["finalizedBlock"], json!(tip - 2));
+    assert_eq!(r["justifiedBlock"], json!(tip - 1));
+    assert_eq!(r["finalizedLagBlocks"], json!(2));
+    assert_eq!(
+        r["finalizedHash"],
+        json!(format!("0x{}", hex::encode(finalized_hash)))
+    );
+    assert_eq!(
+        r["justifiedHash"],
+        json!(format!("0x{}", hex::encode(justified_hash)))
+    );
+
+    // Confirmation-depth reporting must be untouched — this change is additive, and no
+    // block tag resolves to the finalized head.
+    assert_eq!(r["safe"], json!(tip - 15));
+    assert_eq!(r["safeLagBlocks"], r["lag"]);
+    assert_eq!(r["requiredSealers"], json!(15));
+}
+
+#[test]
+fn finality_gauges_do_not_take_the_chain_lock() {
+    let node = node_with_snapshot();
+    let tip = node.handle(&req("helios_bsc_syncStatus", json!([])))["result"]["tip"]
+        .as_u64()
+        .expect("tip");
+    node.publish_finality_for_test((tip - 1, [0xa1u8; 32]), (tip - 2, [0xb2u8; 32]));
+
+    let held = node.lock_chain_for_test();
+    // Would deadlock (std Mutex is not reentrant) if a finality gauge touched the chain.
+    let m = node.metrics_text();
+    drop(held);
+
+    assert!(m.contains("helios_bsc_finalized_block "), "{m}");
+    assert!(m.contains("helios_bsc_finalized_lag_blocks "), "{m}");
+    assert!(m.contains("helios_bsc_justified_block "), "{m}");
+}
+
+#[test]
+fn sync_status_keeps_every_pre_existing_key() {
+    // Wallets and `scripts/soak_vs_oracle.py` read these by name; a later refactor must
+    // not be able to drop one silently while the new finality keys distract review.
+    let node = node_with_snapshot();
+    let st = node.handle(&req("helios_bsc_syncStatus", json!([])));
+    let r = st["result"].as_object().expect("status object");
+    for key in [
+        "trustClass",
+        "finality",
+        "forkId",
+        "tip",
+        "safe",
+        "safeHash",
+        "lag",
+        "safeLagBlocks",
+        "safeLagSeconds",
+        "blockIntervalMs",
+        "distinctSealers",
+        "requiredSealers",
+        "nSeal",
+        "proofWindow",
+        "inProofWindow",
+        "sealingSetEnforced",
+        "originCheckpoint",
+        "proofOk",
+        "proofFail",
+        "headersVerified",
+        "unverifiedPassthrough",
+        "backupTransport",
+        "expectedSafeLagBlocks",
+        "safeLagWithinBound",
+    ] {
+        assert!(r.contains_key(key), "syncStatus lost key {key}: {st}");
+    }
 }
 
 #[test]
