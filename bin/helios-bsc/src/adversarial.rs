@@ -1411,6 +1411,13 @@ fn receipt_header_bound_with_flag() {
 #[test]
 fn gas_price_passthrough_with_flag() {
     let chain = distinct_sealer_chain(15);
+    let off = Node::from_parts(
+        Box::new(MockUpstream::for_chain(&chain, json!({}))),
+        130,
+        chain.clone(),
+    );
+    let off_hist = off.handle(&req("eth_feeHistory", json!(["0x4", "latest", []])));
+    assert_eq!(err_code(&off_hist), ERR_METHOD, "{off_hist}");
     let mut up = MockUpstream::for_chain(&chain, json!({}));
     up.unverified = json!("0x12a05f200");
     let mut node = Node::from_parts(Box::new(up), 130, chain.clone());
@@ -1428,11 +1435,35 @@ fn gas_price_passthrough_with_flag() {
     let obj = obj_node.handle(&req("eth_gasPrice", json!([])));
     assert_eq!(err_code(&obj), ERR_PARAMS, "{obj}");
     let mut hist_up = MockUpstream::for_chain(&chain, json!({}));
-    hist_up.unverified = json!({"oldestBlock": "0x1", "baseFeePerGas": ["0x1"]});
+    hist_up.unverified = json!({"oldestBlock": "0x0", "baseFeePerGas": ["0x1"]});
     let mut hist_node = Node::from_parts(Box::new(hist_up), 130, chain.clone());
     hist_node.set_allow_unverified_passthrough(true);
     let hist = hist_node.handle(&req("eth_feeHistory", json!(["0x4", "latest", []])));
-    assert_eq!(hist["result"]["oldestBlock"], json!("0x1"), "{hist}");
+    assert_eq!(hist["result"]["oldestBlock"], json!("0x0"), "{hist}");
+    let mut no_ob_up = MockUpstream::for_chain(&chain, json!({}));
+    no_ob_up.unverified = json!({"baseFeePerGas": ["0x1"]});
+    let mut no_ob = Node::from_parts(Box::new(no_ob_up), 130, chain.clone());
+    no_ob.set_allow_unverified_passthrough(true);
+    let no = no_ob.handle(&req("eth_feeHistory", json!(["0x4", "latest", []])));
+    assert_eq!(no["result"]["baseFeePerGas"], json!(["0x1"]), "{no}");
+    let mut junk_up = MockUpstream::for_chain(&chain, json!({}));
+    junk_up.unverified = json!({"oldestBlock": "latest", "baseFeePerGas": ["0x1"]});
+    let mut junk_node = Node::from_parts(Box::new(junk_up), 130, chain.clone());
+    junk_node.set_allow_unverified_passthrough(true);
+    let junk = junk_node.handle(&req("eth_feeHistory", json!(["0x4", "latest", []])));
+    assert_eq!(err_code(&junk), ERR_PARAMS, "{junk}");
+    let mut above_up = MockUpstream::for_chain(&chain, json!({}));
+    above_up.unverified = json!({"oldestBlock": "0x1", "baseFeePerGas": ["0x1"]});
+    let mut above_node = Node::from_parts(Box::new(above_up), 130, chain.clone());
+    above_node.set_allow_unverified_passthrough(true);
+    let above = above_node.handle(&req("eth_feeHistory", json!(["0x4", "latest", []])));
+    assert_eq!(err_code(&above), ERR_NOT_SYNCED, "{above}");
+    let mut miss_up = MockUpstream::for_chain(&chain, json!({}));
+    miss_up.unverified = json!({"oldestBlock": "0xff", "baseFeePerGas": ["0x1"]});
+    let mut miss_node = Node::from_parts(Box::new(miss_up), 130, chain.clone());
+    miss_node.set_allow_unverified_passthrough(true);
+    let miss = miss_node.handle(&req("eth_feeHistory", json!(["0x4", "latest", []])));
+    assert_eq!(err_code(&miss), ERR_NOT_SYNCED, "{miss}");
     let mut bad_hist_up = MockUpstream::for_chain(&chain, json!({}));
     bad_hist_up.unverified = json!({"oldestBlock": "0x1", "baseFeePerGas": "0x1"});
     let mut bad_hist = Node::from_parts(Box::new(bad_hist_up), 130, chain);

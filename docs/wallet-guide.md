@@ -25,7 +25,7 @@ Safe lag on mainnet is ~106–112 blocks (~50s), not “the last mined block”.
 
 **Unverified broadcast (always on):** `eth_sendRawTransaction`. Local checks: hex, empty/512 KiB cap, **chainId 56** (typed 0x01–0x04 or EIP-155; no unprotected txs). The returned hash is local `keccak256(raw)`, not the upstream’s word.
 
-**Unverified opt-in** (`run --allow-unverified-passthrough`): receipts / tx-by-hash **header-bound to Safe** and to the requested 32-byte hash; `eth_gasPrice` / `eth_maxPriorityFeePerGas` / `eth_blobBaseFee` hex quantities; `eth_feeHistory` object. Default is `-32601`.
+**Unverified opt-in** (`run --allow-unverified-passthrough`): receipts / tx-by-hash **header-bound to Safe** and to the requested 32-byte hash; `eth_gasPrice` / `eth_maxPriorityFeePerGas` / `eth_blobBaseFee` hex quantities; `eth_feeHistory` object (`oldestBlock` if present is a local verified header ≤ Safe). Default is `-32601`.
 
 **Unsupported (no index / no keys / later):** `eth_getLogs`, filters, `eth_subscribe`, `eth_sendTransaction`, `eth_sign*`, `personal_*`, `debug_*`, `txpool_*`. Fast Finality is **not** implemented.
 

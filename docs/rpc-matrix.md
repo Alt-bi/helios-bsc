@@ -34,7 +34,7 @@ Default bind: `127.0.0.1:8545` (`--allow-non-loopback` required for LAN; no RPC 
 | `eth_getRawTransactionByHash` | Unverified opt-in | Default `-32601`. Flag on: raw hex, `keccak256(raw)` must equal the 32-byte query hash; size cap 512 KiB. Lying payload → `-32001`. |
 | `eth_gasPrice` | Unverified opt-in | Default `-32601`. Flag on: hex quantity only (not an object) |
 | `eth_maxPriorityFeePerGas` | Unverified opt-in | Same flag as `eth_gasPrice` (EIP-1559 tip). Hex quantity. |
-| `eth_feeHistory` | Unverified opt-in | Same flag. JSON object; `oldestBlock` hex qty if present; `baseFeePerGas` / `gasUsedRatio` / `reward` arrays ≤1024; `reward` rows of hex qty if present. Unbound fee oracle. |
+| `eth_feeHistory` | Unverified opt-in | Same flag. JSON object; `oldestBlock` if present is a hex qty of a local verified header number ≤ Safe (`-32602` if not hex, `-32003` if not in chain / above Safe); omit `oldestBlock` keeps array caps only. `baseFeePerGas` / `gasUsedRatio` / `reward` arrays ≤1024; `reward` rows of hex qty if present. |
 | `eth_blobBaseFee` | Unverified opt-in | Same flag. Hex quantity. |
 | `helios_bsc_syncStatus` | Verified | tip, safe, `lag` / `safeLagBlocks` / `safeLagSeconds`, `safeLagWithinBound`, `unverifiedPassthrough`, `backupTransport`, sealers, proof window, `finality=confirmation-depth`, `sealingSetEnforced`, `proofOk` / `proofFail` / `headersVerified` |
 | `helios_bsc_getVerificationStatus` | Verified | same status body (`trustClass`, `finality`, lag fields) |

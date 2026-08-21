@@ -1146,10 +1146,23 @@ impl Node {
         }
         let params = req.get("params").cloned().unwrap_or(json!([]));
         match self.up.unverified_call(method, &params) {
-            Ok(v) => match bind_fee_result(method, &v) {
-                Ok(()) => rpc_ok(id, v),
-                Err(msg) => rpc_err(id, ERR_PARAMS, &msg),
-            },
+            Ok(v) => {
+                if let Err(msg) = bind_fee_result(method, &v) {
+                    return rpc_err(id, ERR_PARAMS, &msg);
+                }
+                if method == "eth_feeHistory" && v.get("oldestBlock").is_some_and(|x| !x.is_null())
+                {
+                    let (_, safe) = match self.refresh() {
+                        Ok(x) => x,
+                        Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
+                    };
+                    let chain = self.chain.lock().expect("chain lock");
+                    if let Err((code, msg)) = bind_fee_oldest_block(&v, &safe, &chain) {
+                        return rpc_err(id, code, &msg);
+                    }
+                }
+                rpc_ok(id, v)
+            }
             Err(e) => rpc_err(id, -32000, &format!("unverified_upstream: {e}")),
         }
     }
@@ -1897,6 +1910,7 @@ fn bind_optional_status(v: Option<&Value>) -> Result<(), String> {
 }
 
 /// Unverified fee oracles: known methods only; hex qty or `eth_feeHistory` object.
+/// `oldestBlock` if present is a hex qty; local chain bind is `bind_fee_oldest_block`.
 fn bind_fee_result(method: &str, v: &Value) -> Result<(), String> {
     match method {
         "eth_gasPrice" | "eth_maxPriorityFeePerGas" | "eth_blobBaseFee" => {
@@ -1947,6 +1961,38 @@ fn bind_fee_result(method: &str, v: &Value) -> Result<(), String> {
             Ok(())
         }
         _ => Err(format!("unknown fee method: {method}")),
+    }
+}
+
+/// `oldestBlock` if present must equal a local `VerifiedBlock.number` ≤ Safe.
+fn bind_fee_oldest_block(
+    v: &Value,
+    safe: &SafeHead,
+    chain: &[VerifiedBlock],
+) -> Result<(), (i64, String)> {
+    let Some(o) = v.as_object() else {
+        return Ok(());
+    };
+    match o.get("oldestBlock") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(s)) => {
+            let n = decode_u64(s)
+                .map_err(|_| (ERR_PARAMS, "oldestBlock is not a hex quantity".to_string()))?;
+            let Some(local) = chain.iter().find(|b| b.number == n) else {
+                return Err((
+                    ERR_NOT_SYNCED,
+                    "feeHistory oldestBlock not in local verified chain".into(),
+                ));
+            };
+            if local.number > safe.number {
+                return Err((
+                    ERR_NOT_SYNCED,
+                    "feeHistory oldestBlock is above local Safe".into(),
+                ));
+            }
+            Ok(())
+        }
+        Some(_) => Err((ERR_PARAMS, "oldestBlock not a hex quantity".into())),
     }
 }
 
@@ -2604,6 +2650,29 @@ mod tests {
         assert!(err.contains("too many"), "{err}");
         let err = bind_fee_result("eth_unknownFee", &json!("0x1")).unwrap_err();
         assert!(err.contains("unknown"), "{err}");
+        assert!(bind_fee_result("eth_feeHistory", &json!({"baseFeePerGas": ["0x1"]})).is_ok());
+        let err = bind_fee_result("eth_feeHistory", &json!({"oldestBlock": "latest"})).unwrap_err();
+        assert!(err.contains("oldestBlock"), "{err}");
+        let chain = vec![blk(1, 1), blk(100, 100), blk(110, 110)];
+        let safe = SafeHead {
+            number: 100,
+            hash: hash_hex(&chain[1]),
+            state_root: format!("0x{}", hex::encode(chain[1].state_root)),
+            distinct_sealers: 15,
+            required_sealers: 15,
+        };
+        assert!(bind_fee_oldest_block(&json!({"baseFeePerGas": ["0x1"]}), &safe, &chain).is_ok());
+        assert!(bind_fee_oldest_block(&json!({"oldestBlock": "0x64"}), &safe, &chain).is_ok());
+        assert!(bind_fee_oldest_block(&json!({"oldestBlock": "0x1"}), &safe, &chain).is_ok());
+        let (code, msg) =
+            bind_fee_oldest_block(&json!({"oldestBlock": "0x6e"}), &safe, &chain).unwrap_err();
+        assert_eq!(code, ERR_NOT_SYNCED, "{msg}");
+        let (code, msg) =
+            bind_fee_oldest_block(&json!({"oldestBlock": "0xff"}), &safe, &chain).unwrap_err();
+        assert_eq!(code, ERR_NOT_SYNCED, "{msg}");
+        let (code, msg) =
+            bind_fee_oldest_block(&json!({"oldestBlock": "latest"}), &safe, &chain).unwrap_err();
+        assert_eq!(code, ERR_PARAMS, "{msg}");
     }
 
     #[test]
