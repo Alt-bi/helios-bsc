@@ -7,7 +7,7 @@ Wallet RPC treats the upstream as an **untrusted data plane**. Integrity comes f
 | Lying balance / nonce / code / storage | `eth_getProof` vs Safe `stateRoot`; claimed fields must match trie; bytecode keccak vs `codeHash` |
 | Lying / unverified `eth_call` | **Verified-or-error**, never passthrough and never proxied to upstream `eth_call`. Safe only (`latest`→Safe); `to` + optional `data`; revm on iterative `eth_getProof` at Safe hash/number. No state overrides; no create. Calldata ≤ **128 KiB**; at most **32** accounts; gas cap **50_000_000**; max **8** proof rounds. Revert and Halt currently share RPC `-32001` with proof failure (wallets cannot distinguish). |
 | Lying / unverified `eth_estimateGas` | **Verified-or-error**, never passthrough and never proxied to upstream `eth_estimateGas` / `eth_call`. Same Safe-only constraints as `eth_call` (including 128 KiB / 32-account caps). Binary-search estimate is **best-effort** (gas is not consensus). |
-| Unproven `eth_call` SLOAD / account | Fail-closed `-32001` (**not** zero / empty). Missing proof is not empty storage. `BLOCKHASH` is currently fail-closed `Missing`/`-32001` (always). |
+| Unproven `eth_call` SLOAD / account | Fail-closed `-32001` (**not** zero / empty). Missing proof is not empty storage. In-window `BLOCKHASH` without a local verified header is `-32001` (not zero); out-of-window/current is protocol `0`. |
 | Valid proof for the wrong root | Bind to consensus-verified `stateRoot` (`-32002` / `-32001`) |
 | Mutated trie node | MPT walker rejects; CI adversarial tests |
 | Disconnected / reordered headers | Consecutive numbers + `parentHash`; append stitches to the existing tip |

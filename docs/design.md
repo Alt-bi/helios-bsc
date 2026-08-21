@@ -726,7 +726,7 @@ Prefer a dedicated spare volume or small VPS for any Alt F full/fast node. Avoid
 12. **Max checkpoint age driven by header-walk cost** — Default ≤24h strict; not Helios’s week-scale window.
 13. **Required upstream proof capability for Demo Slice / GA** — At least one reproducible **`eth_getProof` by block hash or number**. **Order (operator-decided):** measure **public/paid RPC provider matrix first**; stand up **Alt F only if that matrix fails**. Tag-only degraded mode does not satisfy wallet-mode Safe proofs.
 14. **Independent public repo `helios-bsc`** (dual MIT/Apache) — not starting inside a16z/helios workspace; optional upstream discussion only after Demo Slice.
-15. **Development in this repo (2026-08-21)** — Demo Slice closed; MVP-1 verified reads + unverified `sendRaw` + operator docs in tree. **24h soak remains the GA live gate.** MVP-2: constrained Safe-only `eth_call` + best-effort proof-backed `eth_estimateGas` (DoD ticked). **FF not implemented.** **BLOCKHASH not implemented** (may land separately; not in `STATUS.md` at 70f5aed). `--allow-unsafe-head-reads` **not implemented**. Out-of-turn backoff, Maxwell FF recents prune, and EIP-1559 parent `baseFee` formulas are **not implemented**. Pasteur 2026-08-25 is scheduled, not live.
+15. **Development in this repo (2026-08-21)** — Demo Slice closed; MVP-1 verified reads + unverified `sendRaw` + operator docs in tree. **24h soak remains the GA live gate.** MVP-2: constrained Safe-only `eth_call` + best-effort proof-backed `eth_estimateGas` (DoD ticked); `BLOCKHASH` from local verified headers (in-window unknown fail-closed). Revert/Halt map to JSON-RPC **code 3**, not `-32001`. **FF not implemented.** `--allow-unsafe-head-reads` **not implemented**. Out-of-turn backoff, Maxwell FF recents prune, and EIP-1559 parent `baseFee` formulas are **not implemented**. Pasteur 2026-08-25 is scheduled, not live.
 
 ### Operator decisions (2026-08-18)
 
@@ -736,7 +736,7 @@ Settled by operator; treat as final (not open for re-debate in this doc):
 |---|----------|
 | A | **OSS home:** independent public repo **`helios-bsc`**, dual MIT/Apache. No initial a16z/helios workspace membership; optional upstream chat **only after Demo Slice**. |
 | B | **`eth_getProof` path:** **first** fill/measure the public/paid provider matrix for hash/number proofs; **Alt F only if the matrix fails**. |
-| C | **Near-term work:** keep milestones honest — Demo Slice closed; 24h soak still blocks MVP-1 GA; Pasteur 2026-08-25 is scheduled, not live. MVP-2 `eth_call` / `eth_estimateGas` in tree; FF not started. Live Parlia pins: T=**8**, Safe lag ~106–112, proof window 112. `--allow-unsafe-head-reads` not implemented. BLOCKHASH not done. |
+| C | **Near-term work:** keep milestones honest — Demo Slice closed; 24h soak still blocks MVP-1 GA; Pasteur 2026-08-25 is scheduled, not live. MVP-2 `eth_call` / `eth_estimateGas` / local `BLOCKHASH` in tree; FF not started. Live Parlia pins: T=**8**, Safe lag ~106–112, proof window 112. `--allow-unsafe-head-reads` not implemented. |
 
 This file is the canonical design document for the public repository.
 
@@ -916,3 +916,5 @@ _Rev 7 (2026-08-20): MVP-2 slice 1 — constrained verified `eth_call` (Safe-onl
 _Rev 8 (2026-08-21): MVP-2 slice 2 — proof-backed best-effort `eth_estimateGas` (geth/reth binary search; MethodPolicy Verified; never proxied). Tick MVP-2 `eth_call`/estimateGas DoD; leave FF unchecked. 24h soak still the GA live gate. Pasteur 2026-08-25 is not live._
 
 _Rev 9 (2026-08-21): Docs honesty — `--allow-unsafe-head-reads` / `BlockTagMode::AllowUnsafeHead` are **not implemented** (unused enum; no CLI flag; default remains wallet `latest`→Safe). Live JSON-RPC server is **tiny_http** (`bin/helios-bsc/src/rpc_server.rs`), not jsonrpsee. Qualify turnLength≈16 / Safe lag ~240 as historical; live pins (`STATUS.md`): epochLength=1000, turnLength=**8**, N_seal=21, Safe=15, proof window 112, Safe lag ~106–112. MVP-2 DoD: `eth_call` + `eth_estimateGas` ticked; FF still unchecked. **BLOCKHASH not done** (may land separately; do not claim it at 70f5aed)._
+
+_Rev 10 (2026-08-21): Local verified `BLOCKHASH` (in-window unknown fail-closed; out-of-window/current → 0). `eth_call`/`eth_estimateGas` Revert/Halt map to JSON-RPC code 3, not `-32001`. Drop unused `BlockTagMode`. FF still unchecked. 24h soak still the GA live gate. Pasteur 2026-08-25 is not live._
