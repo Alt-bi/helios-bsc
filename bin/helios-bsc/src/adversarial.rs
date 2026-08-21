@@ -1672,3 +1672,34 @@ fn eth_call_blockhash_of_safe_parent() {
     );
     assert_eq!(got.len(), 2 + 64, "{v}");
 }
+
+#[test]
+fn eth_call_unproven_name_still_proof_failed() {
+    let (chain, rpc) = safe_chain_with_fixture_root();
+    let node = node_wbnb_eth_call(chain, rpc.proof_json());
+    let v = node.handle(&req(
+        "eth_call",
+        json!([
+            {"to": WBNB_ADDRESS, "from": WBNB_ADDRESS, "data": "0x06fdde03"},
+            "latest"
+        ]),
+    ));
+    assert_eq!(err_code(&v), ERR_PROOF_FAILED, "{v}");
+    assert_ne!(err_code(&v), 3, "{v}");
+    let msg = v["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("proof_verification_failed"), "{v}");
+}
+
+#[test]
+fn eth_estimate_gas_unproven_name_still_proof_failed() {
+    let (chain, rpc) = safe_chain_with_fixture_root();
+    let node = node_wbnb_eth_call(chain, rpc.proof_json());
+    let v = node.handle(&req(
+        "eth_estimateGas",
+        json!([call_object(Some("0x06fdde03")), "latest"]),
+    ));
+    assert_eq!(err_code(&v), ERR_PROOF_FAILED, "{v}");
+    assert_ne!(err_code(&v), 3, "{v}");
+    let msg = v["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("proof_verification_failed"), "{v}");
+}

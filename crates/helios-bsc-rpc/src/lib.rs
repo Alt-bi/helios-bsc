@@ -7,9 +7,9 @@ use helios_bsc_types::TrustClass;
 
 pub mod wire;
 pub use wire::{
-    jsonrpc_id_ok, jsonrpc_is_v2, jsonrpc_params_len, jsonrpc_params_ok, rpc_err, rpc_ok,
-    wallet_block_number_allowed, wallet_tag_is_safe, BlockId, ERR_INVALID, ERR_METHOD,
-    ERR_NOT_SYNCED, ERR_PARAMS, ERR_PARSE, ERR_PROOF_FAILED, ERR_STATE_ROOT,
+    jsonrpc_id_ok, jsonrpc_is_v2, jsonrpc_params_len, jsonrpc_params_ok, rpc_err, rpc_err_data,
+    rpc_ok, wallet_block_number_allowed, wallet_tag_is_safe, BlockId, ERR_EXECUTION, ERR_INVALID,
+    ERR_METHOD, ERR_NOT_SYNCED, ERR_PARAMS, ERR_PARSE, ERR_PROOF_FAILED, ERR_STATE_ROOT,
     MAX_PROOF_STORAGE_KEYS, MAX_RPC_BATCH, MAX_RPC_ID, MAX_RPC_METHOD, MAX_RPC_PARAMS,
 };
 
@@ -175,6 +175,8 @@ mod tests {
         assert_eq!(ERR_INVALID, -32600);
         assert_eq!(ERR_METHOD, -32601);
         assert_eq!(ERR_PARAMS, -32602);
+        assert_eq!(ERR_PROOF_FAILED, -32001);
+        assert_eq!(ERR_EXECUTION, 3);
     }
 
     #[test]

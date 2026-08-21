@@ -9,6 +9,8 @@ pub const ERR_STATE_ROOT: i64 = -32002;
 pub const ERR_NOT_SYNCED: i64 = -32003;
 pub const ERR_METHOD: i64 = -32601;
 pub const ERR_PARAMS: i64 = -32602;
+/// geth `eth_call` / `eth_estimateGas` execution revert or halt (not proof failure).
+pub const ERR_EXECUTION: i64 = 3;
 
 pub fn rpc_ok(id: Value, result: Value) -> Value {
     json!({"jsonrpc":"2.0","id":id,"result":result})
@@ -16,6 +18,10 @@ pub fn rpc_ok(id: Value, result: Value) -> Value {
 
 pub fn rpc_err(id: Value, code: i64, msg: &str) -> Value {
     json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":msg}})
+}
+
+pub fn rpc_err_data(id: Value, code: i64, msg: &str, data: Value) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":msg,"data":data}})
 }
 
 /// JSON-RPC 2.0 requires `"jsonrpc":"2.0"`. Missing / other versions are invalid request.
@@ -181,6 +187,10 @@ mod tests {
         assert_eq!(v["result"], "0x38");
         let e = rpc_err(json!(1), ERR_METHOD, "method_unsupported");
         assert_eq!(e["error"]["code"], ERR_METHOD);
+        assert!(e["error"].get("data").is_none());
+        let d = rpc_err_data(json!(1), ERR_EXECUTION, "execution reverted", json!("0x"));
+        assert_eq!(d["error"]["code"], ERR_EXECUTION);
+        assert_eq!(d["error"]["data"], json!("0x"));
     }
 
     #[test]

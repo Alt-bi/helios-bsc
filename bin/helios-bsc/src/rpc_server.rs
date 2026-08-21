@@ -22,9 +22,10 @@ use helios_bsc_execution::{
 };
 use helios_bsc_rpc::{
     jsonrpc_id_ok, jsonrpc_is_v2, jsonrpc_params_len, jsonrpc_params_ok, method_policy, rpc_err,
-    rpc_ok, unverified_passthrough_ok, wallet_block_number_allowed, wallet_tag_is_safe, BlockId,
-    MethodPolicy, ERR_INVALID, ERR_METHOD, ERR_NOT_SYNCED, ERR_PARAMS, ERR_PARSE, ERR_PROOF_FAILED,
-    ERR_STATE_ROOT, MAX_PROOF_STORAGE_KEYS, MAX_RPC_BATCH, MAX_RPC_METHOD, MAX_RPC_PARAMS,
+    rpc_err_data, rpc_ok, unverified_passthrough_ok, wallet_block_number_allowed,
+    wallet_tag_is_safe, BlockId, MethodPolicy, ERR_EXECUTION, ERR_INVALID, ERR_METHOD,
+    ERR_NOT_SYNCED, ERR_PARAMS, ERR_PARSE, ERR_PROOF_FAILED, ERR_STATE_ROOT,
+    MAX_PROOF_STORAGE_KEYS, MAX_RPC_BATCH, MAX_RPC_METHOD, MAX_RPC_PARAMS,
 };
 use helios_bsc_types::{
     decode_hex, decode_hex_fixed, decode_u64, keccak256, Checkpoint, RpcBlockHeader, SafeHead,
@@ -736,27 +737,16 @@ impl Node {
     }
 
     fn map_call_error(&self, id: Value, e: CallError) -> Value {
-        match e {
-            CallError::Missing(_) | CallError::Proof(_) | CallError::Budget => {
-                self.bump_proof_fail();
-                rpc_err(
-                    id,
-                    ERR_PROOF_FAILED,
-                    &format!("proof_verification_failed: {e}"),
-                )
-            }
-            CallError::Invalid(msg) => rpc_err(id, ERR_PARAMS, msg),
-            CallError::Revert(data) => {
-                let msg = if data.len() <= 256 {
-                    format!("execution_reverted: 0x{}", hex::encode(&data))
-                } else {
-                    "execution_reverted".into()
-                };
-                rpc_err(id, ERR_PROOF_FAILED, &msg)
-            }
-            CallError::Halt(reason) => {
-                rpc_err(id, ERR_PROOF_FAILED, &format!("execution_halt: {reason}"))
-            }
+        if matches!(
+            &e,
+            CallError::Missing(_) | CallError::Proof(_) | CallError::Budget
+        ) {
+            self.bump_proof_fail();
+        }
+        let (code, msg, data) = call_error_rpc(e);
+        match data {
+            Some(d) => rpc_err_data(id, code, &msg, json!(d)),
+            None => rpc_err(id, code, &msg),
         }
     }
 
@@ -1185,6 +1175,45 @@ impl Node {
         self.bump_proof_ok();
         Ok((acc, proof))
     }
+}
+
+/// Hex in the revert *message* is capped (existing); full bytes go in `error.data`.
+const REVERT_MSG_HEX_CAP: usize = 256;
+/// JSON-RPC `error.data` revert payload cap (bytes, not hex chars).
+const REVERT_DATA_CAP: usize = 32 * 1024;
+
+/// Map a verified-call error to JSON-RPC `(code, message, optional error.data hex)`.
+fn call_error_rpc(e: CallError) -> (i64, String, Option<String>) {
+    match e {
+        CallError::Missing(_) | CallError::Proof(_) | CallError::Budget => (
+            ERR_PROOF_FAILED,
+            format!("proof_verification_failed: {e}"),
+            None,
+        ),
+        CallError::Invalid(msg) => (ERR_PARAMS, msg.to_string(), None),
+        CallError::Revert(data) => revert_rpc(&data),
+        CallError::Halt(reason) => (ERR_EXECUTION, format!("execution_halt: {reason}"), None),
+    }
+}
+
+fn revert_rpc(data: &[u8]) -> (i64, String, Option<String>) {
+    let truncated = data.len() > REVERT_DATA_CAP;
+    let data_bytes = if truncated {
+        &data[..REVERT_DATA_CAP]
+    } else {
+        data
+    };
+    let data_hex = format!("0x{}", hex::encode(data_bytes));
+    let msg = if truncated {
+        "execution reverted (data truncated)".into()
+    } else if data.is_empty() {
+        "execution reverted".into()
+    } else if data.len() <= REVERT_MSG_HEX_CAP {
+        format!("execution reverted: 0x{}", hex::encode(data))
+    } else {
+        "execution reverted".into()
+    };
+    (ERR_EXECUTION, msg, Some(data_hex))
 }
 
 /// Untrusted Safe proofs/code only — never proxies `eth_call` / `eth_estimateGas`.
@@ -2368,5 +2397,67 @@ mod tests {
         assert!(!wants_full_txs(Some(&vec![json!("latest")])));
         assert!(!wants_full_txs(Some(&vec![json!("latest"), json!(false)])));
         assert!(wants_full_txs(Some(&vec![json!("latest"), json!(true)])));
+    }
+
+    #[test]
+    fn call_error_rpc_revert_halt_are_execution_not_proof_failed() {
+        use helios_bsc_execution::Miss;
+
+        let (code, msg, data) = call_error_rpc(CallError::Revert(vec![0x08, 0xc3, 0x79, 0xa0]));
+        assert_eq!(code, ERR_EXECUTION);
+        assert_eq!(code, 3);
+        assert!(msg.starts_with("execution reverted"), "{msg}");
+        assert!(!msg.contains("proof"), "{msg}");
+        assert_eq!(data.as_deref(), Some("0x08c379a0"));
+
+        let (code, msg, data) = call_error_rpc(CallError::Revert(vec![]));
+        assert_eq!(code, ERR_EXECUTION);
+        assert_eq!(msg, "execution reverted");
+        assert_eq!(data.as_deref(), Some("0x"));
+
+        let mid = vec![0xab; REVERT_MSG_HEX_CAP + 1];
+        let (code, msg, data) = call_error_rpc(CallError::Revert(mid.clone()));
+        assert_eq!(code, ERR_EXECUTION);
+        assert_eq!(msg, "execution reverted");
+        let want = format!("0x{}", hex::encode(&mid));
+        assert_eq!(data.as_deref(), Some(want.as_str()));
+
+        let big = vec![0xcd; REVERT_DATA_CAP + 8];
+        let (code, msg, data) = call_error_rpc(CallError::Revert(big));
+        assert_eq!(code, ERR_EXECUTION);
+        assert!(msg.contains("truncated"), "{msg}");
+        assert!(!msg.contains("proof"), "{msg}");
+        let hex = data.expect("data");
+        assert!(hex.starts_with("0x"));
+        assert_eq!(hex.len(), 2 + REVERT_DATA_CAP * 2);
+
+        let (code, msg, data) = call_error_rpc(CallError::Halt("out of gas"));
+        assert_eq!(code, ERR_EXECUTION);
+        assert_eq!(msg, "execution_halt: out of gas");
+        assert!(data.is_none());
+        assert!(!msg.contains("proof"), "{msg}");
+
+        let (code, msg, data) = call_error_rpc(CallError::Halt("precompile"));
+        assert_eq!(code, ERR_EXECUTION);
+        assert_eq!(msg, "execution_halt: precompile");
+        assert!(data.is_none());
+
+        let (code, msg, data) = call_error_rpc(CallError::Missing(Miss::Account([1u8; 20])));
+        assert_eq!(code, ERR_PROOF_FAILED);
+        assert!(msg.contains("proof_verification_failed"), "{msg}");
+        assert!(data.is_none());
+
+        let (code, _, data) = call_error_rpc(CallError::Budget);
+        assert_eq!(code, ERR_PROOF_FAILED);
+        assert!(data.is_none());
+
+        let (code, _, data) = call_error_rpc(CallError::Proof(ProofError::Json("x".into())));
+        assert_eq!(code, ERR_PROOF_FAILED);
+        assert!(data.is_none());
+
+        let (code, msg, data) = call_error_rpc(CallError::Invalid("calldata too large"));
+        assert_eq!(code, ERR_PARAMS);
+        assert_eq!(msg, "calldata too large");
+        assert!(data.is_none());
     }
 }
