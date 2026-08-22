@@ -606,6 +606,93 @@ mod tests {
         assert_eq!(eng.tip_number(), 116_664_002);
     }
 
+    /// The header-field checks must fire on the **production** entry point, not only on
+    /// a test-only helper.
+    ///
+    /// `LightEngine::apply_header` is the live path: it goes through
+    /// `Snapshot::apply_header` -> `verify_seal_coinbase` -> `verify_unsealed_fields`,
+    /// which is where `verify_base_fee` and the rest of the unsealed-field rules live.
+    /// `LightEngine::apply_verified` deliberately skips seals ("used by tests without
+    /// real seals"), so a check reachable only from *there* would be dead in production.
+    /// This pins the difference so a future refactor cannot quietly move one.
+    #[test]
+    fn unsealed_field_checks_run_on_the_production_apply_path() {
+        let headers = fixture_headers();
+        let set = padded_set(headers.iter().map(|h| h.miner.clone()));
+        let cp =
+            Checkpoint::from_rpc_header(&headers[0], set, "fermi", Some("fixture".into())).unwrap();
+
+        // BSC's `CalcBaseFee` returns the constant `InitialBaseFeeForBSC = 0`, so any
+        // other value is a forgery. Note this fires *before* the seal and hash checks,
+        // so the reported error is the field, not a signature mismatch.
+        let mut forged = headers[1].clone();
+        forged.base_fee_per_gas = Some("0x1".into());
+        let mut eng = LightEngine::from_checkpoint_and_header(cp.clone(), &headers[0]).unwrap();
+        eng.snapshot.enforce_inturn = false;
+        let err = eng.apply_header(&forged).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConsensusError::Snapshot(SnapshotError::Seal(SealError::InvalidBaseFee { .. }))
+            ),
+            "baseFee check did not run on the live path: {err}"
+        );
+
+        // Same for a missing baseFee after London, and for the empty-uncles rule, so the
+        // whole `verify_unsealed_fields` block is demonstrably on this path.
+        let mut no_fee = headers[1].clone();
+        no_fee.base_fee_per_gas = None;
+        let mut eng = LightEngine::from_checkpoint_and_header(cp.clone(), &headers[0]).unwrap();
+        eng.snapshot.enforce_inturn = false;
+        assert!(matches!(
+            eng.apply_header(&no_fee).unwrap_err(),
+            ConsensusError::Snapshot(SnapshotError::Seal(SealError::MissingBaseFee { .. }))
+        ));
+
+        let mut uncles = headers[1].clone();
+        uncles.sha3_uncles = format!("0x{}", "11".repeat(32));
+        let mut eng = LightEngine::from_checkpoint_and_header(cp.clone(), &headers[0]).unwrap();
+        eng.snapshot.enforce_inturn = false;
+        assert!(matches!(
+            eng.apply_header(&uncles).unwrap_err(),
+            ConsensusError::Snapshot(SnapshotError::Seal(SealError::InvalidUncles))
+        ));
+
+        // And the untouched header still applies through the same path.
+        let mut eng = LightEngine::from_checkpoint_and_header(cp, &headers[0]).unwrap();
+        eng.snapshot.enforce_inturn = false;
+        eng.apply_header(&headers[1]).expect("real header accepted");
+    }
+
+    /// The epoch block in the fixture set must actually arm a pending validator switch.
+    ///
+    /// Guards the rotation itself, not a hand-set field: an earlier test assigned
+    /// `snap.pending` directly, so it would have stayed green even if production stopped
+    /// arming it. Here nothing is assigned — the epoch header does the work.
+    #[test]
+    fn epoch_header_arms_rotation_through_the_production_path() {
+        let headers = fixture_headers();
+        let set = padded_set(headers.iter().map(|h| h.miner.clone()));
+        let cp =
+            Checkpoint::from_rpc_header(&headers[0], set, "fermi", Some("fixture".into())).unwrap();
+        let mut eng = LightEngine::from_checkpoint_and_header(cp, &headers[0]).unwrap();
+        eng.snapshot.enforce_inturn = false;
+        assert!(eng.snapshot.pending.is_none());
+
+        // 116663998, 116663999, then the epoch block 116664000.
+        eng.apply_headers(&headers[1..3]).unwrap();
+        let pending = eng
+            .snapshot
+            .pending
+            .as_ref()
+            .expect("epoch header did not arm a pending set");
+        assert_eq!(pending.epoch_block, 116_664_000);
+        assert_eq!(pending.validators.len(), 21);
+        assert_eq!(pending.vote_keys.len(), pending.validators.len());
+        // Activation waits `minerHistoryCheckLen`, not the epoch block itself.
+        assert!(pending.activate_at > pending.epoch_block);
+    }
+
     #[test]
     fn fixture_engine_rejects_unauthorized_sealer() {
         let headers = fixture_headers();
