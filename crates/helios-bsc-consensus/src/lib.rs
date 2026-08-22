@@ -328,11 +328,15 @@ impl LightEngine {
     }
 
     pub fn apply_header(&mut self, header: &RpcBlockHeader) -> Result<(), ConsensusError> {
-        let signer = self.snapshot.apply_header(header)?;
+        // Before `snapshot.apply_header`, which mutates. Rejecting *after* it advanced
+        // would leave the snapshot one block ahead of `chain`, and every later sync
+        // would then fail `apply_verified`'s parent-link check against a hash the chain
+        // never recorded — a fail-closed check turning into a permanent wedge.
         let number = decode_u64(&header.number)?;
         if let Some(prev) = self.chain.last() {
             verify_cascading_vs_parent(prev.milli_timestamp, prev.gas_limit, header)?;
         }
+        let signer = self.snapshot.apply_header(header)?;
         self.chain.push(VerifiedBlock {
             number,
             hash: decode_hex_fixed::<32>(&header.hash)?,
@@ -550,6 +554,56 @@ mod tests {
         eng.apply_headers(&headers[1..]).unwrap();
         assert_eq!(eng.tip_number(), 116_664_002);
         assert_ne!(eng.chain[0].miner, [0u8; 20]);
+    }
+
+    /// A rejected header must leave the engine exactly where it was.
+    ///
+    /// `snapshot.apply_header` mutates; `verify_cascading_vs_parent` used to run after
+    /// it. A header that passed every snapshot check but failed the Ramanujan floor or
+    /// the gasLimit bound therefore advanced `snapshot` while `chain` stayed put, and
+    /// from then on `apply_verified`'s parent-link check compared against a hash the
+    /// chain never recorded — so **every** later header failed too. A fail-closed check
+    /// that wedges the client instead of rejecting one block.
+    ///
+    /// Reaching it needs a valid seal on a header that violates a parent rule, i.e. a
+    /// dishonest validator rather than a lying RPC. That is inside the threat model:
+    /// the client must reject the block and keep running.
+    #[test]
+    fn cascading_rejection_leaves_snapshot_and_chain_in_step() {
+        let headers = fixture_headers();
+        let set = padded_set(headers.iter().map(|h| h.miner.clone()));
+        let cp =
+            Checkpoint::from_rpc_header(&headers[0], set, "fermi", Some("fixture".into())).unwrap();
+        let mut eng = LightEngine::from_checkpoint_and_header(cp, &headers[0]).unwrap();
+        eng.snapshot.enforce_inturn = false;
+
+        // Doctor the recorded parent so the *real* next header violates the gasLimit
+        // bound (|Δ| < parent/1024) against it. The header itself is untouched, so its
+        // seal and hash still verify and every snapshot check still passes.
+        let real_gas = eng.chain.last().unwrap().gas_limit;
+        eng.chain.last_mut().unwrap().gas_limit = real_gas / 2;
+        let before_snapshot = eng.snapshot.number;
+        let before_chain = eng.chain.last().unwrap().number;
+        assert_eq!(before_snapshot, before_chain);
+
+        let err = eng.apply_header(&headers[1]).unwrap_err();
+        assert!(
+            matches!(err, ConsensusError::Seal(SealError::GasLimitBound { .. })),
+            "{err}"
+        );
+        assert_eq!(eng.snapshot.number, before_snapshot, "snapshot advanced");
+        assert_eq!(
+            eng.chain.last().unwrap().number,
+            before_chain,
+            "chain advanced"
+        );
+
+        // The real proof: with the parent restored, the engine still works. Before the
+        // reorder this failed with a parent-hash mismatch, permanently.
+        eng.chain.last_mut().unwrap().gas_limit = real_gas;
+        eng.apply_headers(&headers[1..])
+            .expect("engine still usable");
+        assert_eq!(eng.tip_number(), 116_664_002);
     }
 
     #[test]

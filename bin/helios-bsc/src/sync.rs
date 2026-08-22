@@ -272,13 +272,17 @@ pub fn append_new_with_snapshot(
     let headers = up.headers_range(last + 1, new_tip)?;
     if let Some(snap) = snapshot.as_mut() {
         for h in &headers {
-            let signer = snap
-                .apply_header(h)
-                .with_context(|| format!("snapshot {}", h.number))?;
+            // Ordered before `apply_header`, which mutates the snapshot: a rejection
+            // after it advanced would strand the snapshot one block ahead of `chain`,
+            // and every later sync would fail the parent-link check for good. Same
+            // ordering as `LightEngine::apply_header`.
             if let Some(prev) = chain.last() {
                 verify_cascading_vs_parent(prev.milli_timestamp, prev.gas_limit, h)
                     .with_context(|| format!("cascading {}", h.number))?;
             }
+            let signer = snap
+                .apply_header(h)
+                .with_context(|| format!("snapshot {}", h.number))?;
             chain.push(VerifiedBlock {
                 number: decode_u64(&h.number)?,
                 hash: decode_hex_fixed::<32>(&h.hash)?,
@@ -425,29 +429,87 @@ pub fn write_checkpoint_file(path: &std::path::Path, cp: &Checkpoint) -> Result<
     atomic_write(path, json.as_bytes())
 }
 
-/// Write to a unique sibling temp file then rename, so a crash cannot leave a truncated
-/// checkpoint.
+/// Write to a unique sibling temp file, flush it to disk, then rename over the target.
 ///
 /// The temp name carries the pid and a per-process counter rather than being a fixed
 /// `path.tmp`: two writers sharing one name can interleave a partial write with the other's
 /// rename, which is exactly the truncated-checkpoint outcome the rename is meant to prevent.
+///
+/// There is deliberately **no `remove_file` before the rename**. It used to be there, and
+/// it gave away the only property this function exists for: between the remove and the
+/// rename the checkpoint did not exist at all, so a crash — or a failing rename — left the
+/// operator with *no* trust anchor rather than a stale one. `std::fs::rename` replaces an
+/// existing file on Windows too (std calls `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`),
+/// verified on this platform, so the remove bought nothing.
+///
+/// `sync_all` before the rename matters for the same reason: without it the rename can
+/// publish a name whose contents are still in the page cache, which is the truncated file
+/// the temp-then-rename dance is supposed to rule out.
 fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut tmp = path.as_os_str().to_os_string();
     tmp.push(format!(".tmp.{}.{seq}", std::process::id()));
     let tmp = std::path::PathBuf::from(tmp);
-    std::fs::write(&tmp, bytes).with_context(|| format!("write {tmp:?}"))?;
-    if path.exists() {
-        std::fs::remove_file(path).with_context(|| format!("replace {path:?}"))?;
+
+    let write_then_sync = || -> Result<()> {
+        let mut f = std::fs::File::create(&tmp).with_context(|| format!("create {tmp:?}"))?;
+        f.write_all(bytes)
+            .with_context(|| format!("write {tmp:?}"))?;
+        f.sync_all().with_context(|| format!("sync {tmp:?}"))?;
+        Ok(())
+    };
+    if let Err(e) = write_then_sync() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    std::fs::rename(&tmp, path).with_context(|| format!("rename {tmp:?} → {path:?}"))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // Leave the previous checkpoint in place; drop our partial one.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow::Error::new(e).context(format!("rename {tmp:?} → {path:?}")));
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The point of temp-then-rename is that the target is *never* absent and never
+    /// partial. An earlier version removed the target first, so a crash between the
+    /// remove and the rename destroyed the operator's trust anchor outright.
+    #[test]
+    fn atomic_write_replaces_without_ever_unlinking() {
+        let dir =
+            std::env::temp_dir().join(format!("helios_atomic_{}_{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("checkpoint.json");
+
+        atomic_write(&path, b"first").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+
+        // Replacing an existing file must succeed (this is the Windows-sensitive part:
+        // `rename` has to overwrite, which is why the `remove_file` was there).
+        atomic_write(&path, b"second").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+
+        // No temp files survive a successful write.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+
+        // A failing write leaves the previous checkpoint intact rather than no file.
+        let unwritable = dir.join("nope").join("deep").join("checkpoint.json");
+        assert!(atomic_write(&unwritable, b"third").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
     use serde_json::Value;
     use std::path::PathBuf;
 
