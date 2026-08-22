@@ -2166,6 +2166,14 @@ fn call_error_rpc(e: CallError) -> (i64, String, Option<String>) {
             None,
         ),
         CallError::Invalid(msg) => (ERR_PARAMS, msg.to_string(), None),
+        // Fail-closed, not a proof failure: the upstream did nothing wrong, the local
+        // EVM simply cannot reproduce this chain precompile. Same -32001 the other
+        // "cannot answer this verifiably" cases use.
+        CallError::UnsupportedPrecompile(a) => (
+            ERR_PROOF_FAILED,
+            format!("unsupported_precompile: 0x{}", hex::encode(a)),
+            None,
+        ),
         CallError::Revert(data) => revert_rpc(&data),
         CallError::Halt(reason) => (ERR_EXECUTION, format!("execution_halt: {reason}"), None),
     }
@@ -2261,6 +2269,7 @@ fn call_block_from_verified(local: &VerifiedBlock, chain: &[VerifiedBlock]) -> C
         difficulty: [0u8; 32],
         prevrandao: [0u8; 32],
         basefee: 0,
+        excess_blob_gas: 0,
         historical_hashes: historical_hashes_at_safe(chain, local.number),
     };
     if let Some(h) = &local.header {
@@ -2282,6 +2291,11 @@ fn call_block_from_verified(local: &VerifiedBlock, chain: &[VerifiedBlock]) -> C
         if let Some(bf) = &h.base_fee_per_gas {
             if let Ok(n) = decode_u64(bf) {
                 block.basefee = n;
+            }
+        }
+        if let Some(eb) = &h.excess_blob_gas {
+            if let Ok(n) = decode_u64(eb) {
+                block.excess_blob_gas = n;
             }
         }
     }

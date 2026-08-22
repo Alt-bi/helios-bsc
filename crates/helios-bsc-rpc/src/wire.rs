@@ -123,14 +123,61 @@ pub fn wallet_block_number_allowed(
     }
 }
 
+/// A wallet-supplied `0x…` block height, canonical spellings only.
+///
+/// The previous body was
+/// `u64::from_str_radix(t.trim_start_matches("0x").trim_start_matches("0X"), 16)`, which
+/// accepted two things it should not. `trim_start_matches` strips **every** leading
+/// occurrence, so `0x0x0x10` became `10`; and `from_str_radix` accepts a sign, so `0x+10`
+/// became `16`. Both then flowed on as an ordinary height. Nothing unverified came back —
+/// the number still had to be at or below Safe and present in the local chain — but a
+/// malformed tag deserves `-32602`, not a guess, and `rpc_server`'s own `decode_qty_pad32`
+/// already checks its digits this way.
 fn parse_hex_u64(t: &str) -> Option<u64> {
-    u64::from_str_radix(t.trim_start_matches("0x").trim_start_matches("0X"), 16).ok()
+    let digits = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X"))?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(digits, 16).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// `trim_start_matches` strips every leading occurrence and `from_str_radix` takes a
+    /// sign, so these used to parse as ordinary heights instead of being rejected.
+    #[test]
+    fn malformed_hex_heights_are_rejected_not_guessed() {
+        // Canonical spellings still work, upper- and lower-case prefix.
+        assert_eq!(
+            wallet_block_number_allowed(Some("0x10"), 100, "0xabc"),
+            Some(BlockId::Number(16))
+        );
+        assert_eq!(
+            wallet_block_number_allowed(Some("0X10"), 100, "0xabc"),
+            Some(BlockId::Number(16))
+        );
+        assert_eq!(
+            wallet_block_number_allowed(Some("0x0000000a"), 100, "0xabc"),
+            Some(BlockId::Number(10))
+        );
+
+        for bad in [
+            "0x0x10", "0x0X10", "0x+10", "0x-10", "0x 10", "0x1_0", "0x", "0xzz",
+        ] {
+            assert_eq!(
+                wallet_block_number_allowed(Some(bad), 100, "0xabc"),
+                None,
+                "{bad} accepted"
+            );
+            assert!(
+                !wallet_tag_is_safe(Some(bad), 100, "0xabc"),
+                "{bad} == Safe"
+            );
+        }
+    }
 
     #[test]
     fn latest_maps_to_safe() {

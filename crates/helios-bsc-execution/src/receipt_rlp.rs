@@ -8,7 +8,7 @@ use thiserror::Error;
 
 /// Same cap as header-bound receipt `logs[]`.
 pub const MAX_RECEIPT_LOGS: usize = 1024;
-/// EIP-778 log topics.
+/// `LOG0`..`LOG4` — the EVM cannot emit a log with more than four topics.
 pub const MAX_LOG_TOPICS: usize = 4;
 
 #[derive(Debug, Error, PartialEq, Eq)]
