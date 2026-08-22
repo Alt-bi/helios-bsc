@@ -7,7 +7,14 @@ use crate::mpt::{bytes_to_nibbles, EMPTY_TRIE_ROOT};
 use crate::rlp::{encode_bytes, encode_list, encode_uint};
 use helios_bsc_types::keccak256;
 
-/// Intended cap for tx/receipt lists. Extra items are ignored.
+/// Cap for tx/receipt lists.
+///
+/// [`ordered_trie_root`] truncates to this length rather than allocating for an
+/// arbitrarily long untrusted list. Truncation is safe but not silent-by-design: the
+/// root of a prefix cannot equal the sealed root of the full list, so every caller
+/// fails closed. Callers reject the over-long list themselves first
+/// ([`crate::verify_tx_list`], [`crate::verify_receipt_list`]) so the failure names the
+/// real cause instead of surfacing as a root mismatch.
 pub const MAX_ORDERED_TRIE_ITEMS: usize = 4096;
 
 /// Root of the hexary trie of `items[i]` at key `RLP(i)`.
