@@ -13,11 +13,14 @@ use crate::proof::{
 };
 use crate::EMPTY_TRIE_ROOT;
 use helios_bsc_types::BSC_MAINNET_CHAIN_ID;
-use revm::primitives::{
-    AccountInfo, Address, Bytecode, Bytes, EVMError, ExecutionResult, HaltReason, SpecId, TxKind,
-    B256, KECCAK_EMPTY, U256,
-};
-use revm::{Database, Evm};
+use revm::bytecode::Bytecode;
+use revm::context::result::{EVMError, ExecutionResult, HaltReason};
+use revm::context::{BlockEnv, CfgEnv, TxEnv};
+use revm::database_interface::DBErrorMarker;
+use revm::primitives::hardfork::SpecId;
+use revm::primitives::{Address, Bytes, TxKind, B256, KECCAK_EMPTY, U256};
+use revm::state::AccountInfo;
+use revm::{Context, Database, ExecuteEvm, MainBuilder, MainContext};
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -37,6 +40,10 @@ pub const TX_GAS: u64 = 21_000;
 pub const MAX_ESTIMATE_ITERS: u32 = 64;
 /// Yellow-paper / geth `BLOCKHASH` lookback.
 const BLOCKHASH_WINDOW: u64 = 256;
+/// BSC's EIP-4844 `UpdateFraction`, from v1.7.8 `params/config.go`
+/// `DefaultCancunBlobConfig` — which `DefaultPragueBlobConfigBSC` and
+/// `DefaultOsakaBlobConfigBSC` both alias, so it is the fraction at *every* BSC fork.
+pub const BSC_BLOB_UPDATE_FRACTION: u64 = 3_338_477;
 
 #[derive(Debug, Clone)]
 pub struct CallTx {
@@ -102,6 +109,11 @@ pub enum CallError {
     #[error("chain precompile {0:?} is not implemented by the local EVM")]
     UnsupportedPrecompile([u8; 20]),
 }
+
+// revm 42 requires a `Database::Error` to carry this marker. Every variant is fatal to
+// the call it aborts — `Missing` is how a proof round is requested, and the caller retries
+// by fetching the proof, not by resuming the aborted execution — so the default holds.
+impl DBErrorMarker for CallError {}
 
 /// Untrusted proof/code source at a verified Safe block (hash + number).
 pub trait ProveAtSafe {
@@ -179,6 +191,7 @@ impl ProofDb {
             nonce,
             code_hash,
             code: Some(bytecode),
+            ..Default::default()
         };
         self.accounts.insert(
             Address::from(address),
@@ -419,6 +432,7 @@ pub fn load_proven_account(
         nonce: verified.nonce,
         code_hash,
         code: Some(bytecode),
+        ..Default::default()
     };
     db.accounts.insert(
         addr,
@@ -459,49 +473,62 @@ fn transact_call(
     gas: u64,
 ) -> Result<ExecutionResult, CallError> {
     db.seed_block_hashes(block);
-    let mut evm = Evm::builder()
-        .with_db(&mut *db)
-        .with_spec_id(SpecId::CANCUN)
-        .modify_cfg_env(|cfg| {
-            cfg.chain_id = BSC_MAINNET_CHAIN_ID;
-            cfg.disable_base_fee = true;
-            cfg.disable_eip3607 = true;
-        })
-        .modify_block_env(|b| {
-            b.number = U256::from(block.number);
-            b.coinbase = Address::from(block.beneficiary);
-            b.timestamp = U256::from(block.timestamp);
-            b.gas_limit = U256::from(block.gas_limit);
-            b.basefee = U256::from(block.basefee);
-            b.difficulty = U256::from_be_bytes(block.difficulty);
-            b.prevrandao = Some(B256::from(block.prevrandao));
-            // `is_prague = false` is exact here, not an approximation to the CANCUN
-            // spec we execute: v1.7.8 `params/config.go` sets
-            // `DefaultPragueBlobConfigBSC = DefaultCancunBlobConfig` and
-            // `DefaultOsakaBlobConfigBSC = DefaultCancunBlobConfig`, so BSC keeps the
-            // Cancun `UpdateFraction` (3338477) at every fork, which is the fraction
-            // revm's non-Prague branch uses.
-            b.set_blob_excess_gas_and_price(block.excess_blob_gas, false);
-        })
-        .modify_tx_env(|t| {
-            t.caller = Address::from(tx.from);
-            t.gas_limit = gas;
-            t.gas_price = U256::ZERO;
-            t.transact_to = TxKind::Call(Address::from(tx.to));
-            t.value = U256::from_be_bytes(tx.value);
-            t.data = Bytes::copy_from_slice(&tx.data);
-            t.nonce = None;
-            t.chain_id = Some(BSC_MAINNET_CHAIN_ID);
-        })
-        .build();
 
-    match evm.transact() {
+    // revm 42: the `optional_*` cargo features are gone; `disable_base_fee` and
+    // `disable_eip3607` are plain `CfgEnv` fields now. Same two knobs, same meaning —
+    // `eth_call` has no fee payer and no sender-is-EOA requirement.
+    let mut cfg = CfgEnv::new_with_spec(SpecId::CANCUN);
+    cfg.chain_id = BSC_MAINNET_CHAIN_ID;
+    cfg.disable_base_fee = true;
+    cfg.disable_eip3607 = true;
+    // `TxEnv.nonce` is a plain `u64` in 42 where 19.7 took `Option<u64>`; skipping the
+    // check is what `None` meant, so this preserves the behaviour rather than inventing
+    // a nonce for a call that has no sender transaction.
+    cfg.disable_nonce_check = true;
+
+    let mut block_env = BlockEnv {
+        number: U256::from(block.number),
+        beneficiary: Address::from(block.beneficiary),
+        timestamp: U256::from(block.timestamp),
+        gas_limit: block.gas_limit,
+        basefee: block.basefee,
+        difficulty: U256::from_be_bytes(block.difficulty),
+        prevrandao: Some(B256::from(block.prevrandao)),
+        ..Default::default()
+    };
+    // revm 42 takes the update fraction directly where 19.7 took an `is_prague` bool,
+    // so BSC's value is now stated rather than selected by proxy: v1.7.8
+    // `params/config.go` aliases `DefaultPragueBlobConfigBSC` and
+    // `DefaultOsakaBlobConfigBSC` to `DefaultCancunBlobConfig`, keeping
+    // `UpdateFraction = 3338477` at every fork.
+    block_env.set_blob_excess_gas_and_price(block.excess_blob_gas, BSC_BLOB_UPDATE_FRACTION);
+
+    let tx_env = TxEnv {
+        // Legacy envelope: an `eth_call` carries no access list, blob hashes or
+        // authorizations, and typing it otherwise would change intrinsic gas.
+        tx_type: 0,
+        caller: Address::from(tx.from),
+        gas_limit: gas,
+        gas_price: 0,
+        kind: TxKind::Call(Address::from(tx.to)),
+        value: U256::from_be_bytes(tx.value),
+        data: Bytes::copy_from_slice(&tx.data),
+        chain_id: Some(BSC_MAINNET_CHAIN_ID),
+        ..Default::default()
+    };
+
+    let mut evm = Context::mainnet()
+        .with_db(&mut *db)
+        .with_cfg(cfg)
+        .with_block(block_env)
+        .build_mainnet();
+
+    match evm.transact(tx_env) {
         Ok(res) => Ok(res.result),
         Err(EVMError::Database(e)) => Err(e),
         Err(EVMError::Transaction(_)) => Err(CallError::Invalid("transaction")),
         Err(EVMError::Header(_)) => Err(CallError::Invalid("header")),
-        Err(EVMError::Custom(_)) => Err(CallError::Halt("custom")),
-        Err(EVMError::Precompile(_)) => Err(CallError::Halt("precompile")),
+        Err(EVMError::Custom(_)) | Err(EVMError::CustomAny(_)) => Err(CallError::Halt("custom")),
     }
 }
 
@@ -676,7 +703,7 @@ fn estimate_gas_search<P: ProveAtSafe>(
 
     let cap_res = transact_call_proven(prover, db, block, tx, hi_cap, rounds)?;
     let mut lo = match cap_res {
-        ExecutionResult::Success { gas_used, .. } => gas_used.saturating_sub(1),
+        ExecutionResult::Success { gas, .. } => gas.tx_gas_used().saturating_sub(1),
         ExecutionResult::Revert { output, .. } => {
             return Err(CallError::Revert(output.to_vec()));
         }
@@ -691,7 +718,8 @@ fn estimate_gas_search<P: ProveAtSafe>(
         iters += 1;
         let mid = lo + (hi - lo) / 2;
         match transact_call_proven(prover, db, block, tx, mid, rounds) {
-            Ok(ExecutionResult::Success { gas_used, .. }) => {
+            Ok(ExecutionResult::Success { gas, .. }) => {
+                let gas_used = gas.tx_gas_used();
                 hi = mid;
                 let hint = gas_used.saturating_sub(1);
                 if hint > lo && hint < hi {
@@ -876,10 +904,8 @@ mod tests {
         output / denominator
     }
 
-    /// BSC's `UpdateFraction`, from `DefaultCancunBlobConfig` — which
-    /// `DefaultPragueBlobConfigBSC` and `DefaultOsakaBlobConfigBSC` both alias, so it is
-    /// the fraction at *every* BSC fork.
-    const BSC_BLOB_UPDATE_FRACTION: u128 = 3_338_477;
+    /// The production constant, widened for the reference formula below.
+    const BLOB_FRACTION: u128 = super::BSC_BLOB_UPDATE_FRACTION as u128;
 
     // PUSH1 0x00; BLOBBASEFEE(0x4a) ... store and return it
     const BLOBBASEFEE_RETURN: [u8; 8] = [0x4a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00];
@@ -902,14 +928,14 @@ mod tests {
             let out = eth_call_with_db(&mut db, &block, &call_tx([9u8; 20], callee, Vec::new()))
                 .expect("blobbasefee call");
             let got = U256::from_be_slice(&out).to::<u128>();
-            let want = fake_exponential(1, u128::from(excess), BSC_BLOB_UPDATE_FRACTION);
+            let want = fake_exponential(1, u128::from(excess), BLOB_FRACTION);
             assert_eq!(got, want, "excessBlobGas={excess}");
         }
 
         // The specific regression: a non-zero excess no longer reports the `0` price.
-        let zero_price = fake_exponential(1, 0, BSC_BLOB_UPDATE_FRACTION);
+        let zero_price = fake_exponential(1, 0, BLOB_FRACTION);
         assert_eq!(zero_price, 1);
-        assert!(fake_exponential(1, 50_000_000, BSC_BLOB_UPDATE_FRACTION) > zero_price);
+        assert!(fake_exponential(1, 50_000_000, BLOB_FRACTION) > zero_price);
     }
 
     fn sample_block(state_root: [u8; 32]) -> CallBlock {
