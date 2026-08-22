@@ -2269,6 +2269,7 @@ fn call_block_from_verified(local: &VerifiedBlock, chain: &[VerifiedBlock]) -> C
         difficulty: [0u8; 32],
         prevrandao: [0u8; 32],
         basefee: 0,
+        excess_blob_gas: 0,
         historical_hashes: historical_hashes_at_safe(chain, local.number),
     };
     if let Some(h) = &local.header {
@@ -2290,6 +2291,11 @@ fn call_block_from_verified(local: &VerifiedBlock, chain: &[VerifiedBlock]) -> C
         if let Some(bf) = &h.base_fee_per_gas {
             if let Ok(n) = decode_u64(bf) {
                 block.basefee = n;
+            }
+        }
+        if let Some(eb) = &h.excess_blob_gas {
+            if let Ok(n) = decode_u64(eb) {
+                block.excess_blob_gas = n;
             }
         }
     }

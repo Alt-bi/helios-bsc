@@ -60,6 +60,12 @@ pub struct CallBlock {
     pub difficulty: [u8; 32],
     pub prevrandao: [u8; 32],
     pub basefee: u64,
+    /// Sealed `excessBlobGas`, which is what `BLOBBASEFEE` is derived from.
+    ///
+    /// Left at revm's default this was ignored entirely, and the default happens to
+    /// agree with the chain only while the value is `0` — which it is on BSC today, so
+    /// the old behaviour was accidentally right rather than right.
+    pub excess_blob_gas: u64,
     /// Locally verified header hashes at `number` (cap 256). Never invent zeros.
     pub historical_hashes: Vec<(u64, [u8; 32])>,
 }
@@ -469,6 +475,13 @@ fn transact_call(
             b.basefee = U256::from(block.basefee);
             b.difficulty = U256::from_be_bytes(block.difficulty);
             b.prevrandao = Some(B256::from(block.prevrandao));
+            // `is_prague = false` is exact here, not an approximation to the CANCUN
+            // spec we execute: v1.7.8 `params/config.go` sets
+            // `DefaultPragueBlobConfigBSC = DefaultCancunBlobConfig` and
+            // `DefaultOsakaBlobConfigBSC = DefaultCancunBlobConfig`, so BSC keeps the
+            // Cancun `UpdateFraction` (3338477) at every fork, which is the fraction
+            // revm's non-Prague branch uses.
+            b.set_blob_excess_gas_and_price(block.excess_blob_gas, false);
         })
         .modify_tx_env(|t| {
             t.caller = Address::from(tx.from);
@@ -849,6 +862,56 @@ mod tests {
         );
     }
 
+    /// geth v1.7.8 `consensus/misc/eip4844` `fakeExponential`, transcribed so the test
+    /// checks revm against the chain's formula rather than against revm.
+    fn fake_exponential(factor: u128, numerator: u128, denominator: u128) -> u128 {
+        let mut output: u128 = 0;
+        let mut accum: u128 = factor * denominator;
+        let mut i: u128 = 1;
+        while accum > 0 {
+            output += accum;
+            accum = accum * numerator / denominator / i;
+            i += 1;
+        }
+        output / denominator
+    }
+
+    /// BSC's `UpdateFraction`, from `DefaultCancunBlobConfig` — which
+    /// `DefaultPragueBlobConfigBSC` and `DefaultOsakaBlobConfigBSC` both alias, so it is
+    /// the fraction at *every* BSC fork.
+    const BSC_BLOB_UPDATE_FRACTION: u128 = 3_338_477;
+
+    // PUSH1 0x00; BLOBBASEFEE(0x4a) ... store and return it
+    const BLOBBASEFEE_RETURN: [u8; 8] = [0x4a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00];
+
+    /// `BLOBBASEFEE` used to read revm's default rather than the sealed header, which
+    /// is only right while `excessBlobGas` is `0`. It is `0` on BSC today, so the bug
+    /// was invisible; the header carries the real value and now so does the EVM.
+    #[test]
+    fn blobbasefee_comes_from_the_sealed_header() {
+        let code: Vec<u8> = BLOBBASEFEE_RETURN.iter().copied().chain([0xf3]).collect();
+        let callee = [0x77u8; 20];
+        for excess in [0u64, 1, 131_072, 10_000_000, 50_000_000] {
+            let mut db = ProofDb::new();
+            db.insert_account([9u8; 20], 0, [0u8; 32], EMPTY_TRIE_ROOT, &[]);
+            // `sample_block`'s beneficiary; revm loads it to credit fees.
+            db.insert_account([0u8; 20], 0, [0u8; 32], EMPTY_TRIE_ROOT, &[]);
+            db.insert_account(callee, 0, [0u8; 32], EMPTY_TRIE_ROOT, &code);
+            let mut block = sample_block([0u8; 32]);
+            block.excess_blob_gas = excess;
+            let out = eth_call_with_db(&mut db, &block, &call_tx([9u8; 20], callee, Vec::new()))
+                .expect("blobbasefee call");
+            let got = U256::from_be_slice(&out).to::<u128>();
+            let want = fake_exponential(1, u128::from(excess), BSC_BLOB_UPDATE_FRACTION);
+            assert_eq!(got, want, "excessBlobGas={excess}");
+        }
+
+        // The specific regression: a non-zero excess no longer reports the `0` price.
+        let zero_price = fake_exponential(1, 0, BSC_BLOB_UPDATE_FRACTION);
+        assert_eq!(zero_price, 1);
+        assert!(fake_exponential(1, 50_000_000, BSC_BLOB_UPDATE_FRACTION) > zero_price);
+    }
+
     fn sample_block(state_root: [u8; 32]) -> CallBlock {
         CallBlock {
             number: 1,
@@ -860,6 +923,7 @@ mod tests {
             difficulty: [0u8; 32],
             prevrandao: [0u8; 32],
             basefee: 0,
+            excess_blob_gas: 0,
             historical_hashes: Vec::new(),
         }
     }
