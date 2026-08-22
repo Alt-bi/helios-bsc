@@ -928,7 +928,7 @@ fn soak_until(
         ) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("  wait window: {e}");
+                eprintln!("  wait window: {e:#}");
                 report.skipped += 1;
                 empty += 1;
                 if empty >= opts.max_empty {

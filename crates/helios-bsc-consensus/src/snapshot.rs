@@ -5,8 +5,9 @@ use crate::seal::{
 };
 use crate::vote::{decode_vote_attestation, verify_attestation_signature, VoteData, VoteError};
 use helios_bsc_config::{
-    miner_history_check_len, params_at, parse_extra, ExtraDataVersion, ExtraError,
-    SealingValidator, DIFF_IN_TURN, DIFF_NO_TURN, MAXWELL_EPOCH_LENGTH, MAXWELL_TIME,
+    attestation_target_window, miner_history_check_len, params_at, parse_extra, ExtraDataVersion,
+    ExtraError, SealingValidator, DIFF_IN_TURN, DIFF_NO_TURN, K_ANCESTOR_GENERATION_DEPTH,
+    MAXWELL_EPOCH_LENGTH, MAXWELL_TIME,
 };
 use helios_bsc_types::{
     decode_hex, decode_hex_fixed, decode_u64, format_address, Checkpoint, RpcBlockHeader,
@@ -42,7 +43,9 @@ pub enum SnapshotError {
     RecentlySigned(String),
     #[error(transparent)]
     Vote(#[from] VoteError),
-    #[error("attestation targets block {got} but the parent is {want}")]
+    #[error(
+        "attestation targets block {got}, outside the ancestor window ending at parent {want}"
+    )]
     AttestationTarget { want: u64, got: u64 },
     #[error("attestation target hash does not match the parent hash")]
     AttestationTargetHash,
@@ -100,6 +103,13 @@ pub struct Snapshot {
     /// (the walk starts empty at the checkpoint), which is *not* the same as "nobody
     /// sealed there" — see [`Snapshot::recents_window_walked`].
     walk_start: u64,
+    /// `(number, hash)` of the newest blocks applied, oldest first, capped at
+    /// [`K_ANCESTOR_GENERATION_DEPTH`].
+    ///
+    /// geth reads these from the chain database to resolve an attestation's target; a
+    /// light client keeps only the few it can be asked about. The newest entry is always
+    /// `(self.number, self.hash)`.
+    ancestors: Vec<(u64, [u8; 32])>,
 }
 
 impl Snapshot {
@@ -146,6 +156,10 @@ impl Snapshot {
             attestation: None,
             last_milli: None,
             walk_start: cp.number.saturating_add(1),
+            // Only the checkpoint block itself is known here. The two generations below
+            // it are genuinely unknown, and `check_attestation` declines to adopt an
+            // attestation that names one rather than guessing at its hash.
+            ancestors: vec![(cp.number, decode_hex_fixed::<32>(&cp.hash)?)],
         })
     }
 
@@ -246,16 +260,27 @@ impl Snapshot {
         self.recents.retain(|&block, _| block > latest_finalized);
     }
 
-    /// Validator set an attestation in header `number` must be checked against.
+    /// Validator set an attestation with this target must be checked against.
     ///
-    /// geth uses the snapshot at `TargetNumber - 1` = `number - 2`, so the previous
-    /// generation applies while an activation is still that recent.
-    fn attestation_set(&self, number: u64) -> &[SealingValidator] {
-        if self.set_changed_at > number.saturating_sub(2) {
+    /// geth takes the snapshot at `TargetNumber - 1` (step 4 of `verifyVoteAttestation`,
+    /// against the *matched ancestor*), so the previous generation applies while an
+    /// activation is still that recent. Keyed on the target rather than on the header,
+    /// because from Fermi on the two are no longer one block apart.
+    fn attestation_set(&self, target_number: u64) -> &[SealingValidator] {
+        if self.set_changed_at > target_number.saturating_sub(1) {
             &self.prev_vote_set
         } else {
             &self.vote_set
         }
+    }
+
+    /// Hash this snapshot recorded at `number`, if it is still within the ancestor window.
+    fn ancestor_hash(&self, number: u64) -> Option<[u8; 32]> {
+        self.ancestors
+            .iter()
+            .rev()
+            .find(|(n, _)| *n == number)
+            .map(|(_, h)| *h)
     }
 
     /// Chain-state half of `verifyVoteAttestation`, then the signature half.
@@ -268,26 +293,35 @@ impl Snapshot {
         &self,
         raw: &[u8],
         number: u64,
-        parent_hash: [u8; 32],
+        timestamp: u64,
     ) -> Result<Option<VoteData>, SnapshotError> {
         let Some(att) = decode_vote_attestation(raw)? else {
             return Ok(None);
         };
-        let set = self.attestation_set(number);
+        let set = self.attestation_set(att.data.target_number);
         if set.is_empty() {
             return Ok(None);
         }
 
-        // The target must be the direct parent.
-        let want_target = number.saturating_sub(1);
-        if att.data.target_number != want_target {
+        // Step 3 of `verifyVoteAttestation`: walk up to `GetAncestorGenerationDepth`
+        // generations back from the parent looking for the target. Requiring the direct
+        // parent is the **pre-Fermi** rule; on a Fermi chain it rejects honest headers,
+        // and one rejection wedges a client that walks sequentially.
+        let window = attestation_target_window(number, timestamp);
+        if !window.contains(&att.data.target_number) {
             return Err(SnapshotError::AttestationTarget {
-                want: want_target,
+                want: *window.end(),
                 got: att.data.target_number,
             });
         }
-        if att.data.target_hash != parent_hash {
-            return Err(SnapshotError::AttestationTargetHash);
+        match self.ancestor_hash(att.data.target_number) {
+            Some(h) if h == att.data.target_hash => {}
+            Some(_) => return Err(SnapshotError::AttestationTargetHash),
+            // In range, but this snapshot has not walked that block — only possible in
+            // the first generations after a checkpoint. geth would read the hash from its
+            // database; we cannot, so the attestation is left unadopted rather than
+            // accepted on the upstream's word or treated as a protocol violation.
+            None => return Ok(None),
         }
 
         // The source must be the block this client already considers justified. On the
@@ -457,7 +491,7 @@ impl Snapshot {
 
         // Before any mutation: the attestation is checked against the set as it stands
         // for this header, and a bad one rejects the header outright.
-        let adopted = self.check_attestation(&parsed.attestation, number, parent)?;
+        let adopted = self.check_attestation(&parsed.attestation, number, time)?;
 
         if is_epoch {
             if parsed.validators.is_empty() {
@@ -529,6 +563,11 @@ impl Snapshot {
 
         self.number = number;
         self.hash = hash;
+        self.ancestors.push((number, hash));
+        if self.ancestors.len() > K_ANCESTOR_GENERATION_DEPTH as usize {
+            let drop = self.ancestors.len() - K_ANCESTOR_GENERATION_DEPTH as usize;
+            self.ancestors.drain(0..drop);
+        }
         self.last_milli = Some(milli_timestamp(header)?);
         Ok(())
     }
@@ -692,6 +731,34 @@ mod tests {
     /// Walk from the checkpoint's first block.
     fn walk_to(snap: &mut Snapshot, to: u64) {
         walk_inturn(snap, 1001, to);
+    }
+
+    /// An attestation may name any of the three newest ancestors, so the snapshot has to
+    /// be able to answer for all three. Keeping fewer would not reject anything -- it
+    /// would make `check_attestation` return "cannot check" and quietly stop adopting
+    /// finality, dropping reads back to confirmation depth with no error anywhere.
+    #[test]
+    fn ancestor_window_answers_for_three_generations() {
+        let mut snap = Snapshot::from_checkpoint(&cp()).unwrap();
+        // Only the checkpoint block is known before any header is walked.
+        assert_eq!(snap.ancestor_hash(1000), Some(snap.hash));
+        assert_eq!(snap.ancestor_hash(999), None, "below the checkpoint");
+
+        walk_to(&mut snap, 1010);
+        let hash_of = |n: u64| {
+            let mut h = [0u8; 32];
+            h[0..8].copy_from_slice(&n.to_be_bytes());
+            h
+        };
+        assert_eq!(snap.ancestor_hash(1010), Some(hash_of(1010)), "the parent");
+        assert_eq!(snap.ancestor_hash(1009), Some(hash_of(1009)));
+        assert_eq!(snap.ancestor_hash(1008), Some(hash_of(1008)));
+        assert_eq!(
+            snap.ancestor_hash(1007),
+            None,
+            "one past the window geth walks"
+        );
+        assert_eq!(snap.ancestors.len(), K_ANCESTOR_GENERATION_DEPTH as usize);
     }
 
     /// The `countRecents` window reaches back `minerHistoryCheckLen` (87) blocks. Until the

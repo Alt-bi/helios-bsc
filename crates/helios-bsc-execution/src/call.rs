@@ -239,6 +239,12 @@ enum PrecompileKind {
 /// `cometBFTLightBlockValidateHertz`, `0x68` `verifyDoubleSignEvidence`, `0x69`
 /// `secp256k1SignatureRecover`.
 ///
+/// Pasteur (2026-08-25, already in the pin) does not move this boundary:
+/// `PrecompiledContractsPasteur` holds the **same address set** and only swaps
+/// implementations -- `0x64`/`0x65` to their `Deprecated` variants and `0x67` to
+/// `cometBFTLightBlockValidatePasteur`. All three are refused here either way, so the
+/// classification below is correct on both sides of that fork.
+///
 /// Every one of those used to fall through to "ordinary account". The proof for such an
 /// address verifies as *empty*, so revm executed a `CALL` to it as a call to an account
 /// with no code — which succeeds and returns nothing. A contract asking `0x66` to check

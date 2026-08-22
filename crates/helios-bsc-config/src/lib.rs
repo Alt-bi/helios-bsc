@@ -85,7 +85,21 @@ pub enum ExtraDataVersion {
 }
 
 /// Fermi / Pasteur share epochLength, turnLength, interval, extraData family.
-/// Pasteur extraData is **expected** unchanged; re-pin after 2026-08-25 if not.
+///
+/// This is **verified**, not assumed. Pasteur is already present in the pinned
+/// `v1.7.8` tree (`params/config.go` sets mainnet `PasteurTime` to the same
+/// `PASTEUR_TIME` this crate pins), and `IsPasteur` appears nowhere in
+/// `consensus/parlia/{parlia,snapshot,ramanujanfork}.go` -- the fork changes no
+/// Parlia rule, so epoch length, turn length, block interval and the extraData
+/// layout all carry over from Fermi unchanged. Nor does it touch BSC's blob
+/// schedule, which lists only Cancun/Prague/Osaka with the latter two aliased to
+/// `DefaultCancunBlobConfig`.
+///
+/// What Pasteur *does* change is precompile behaviour, at an address set
+/// identical to Osaka's: `0x64` and `0x65` become the `Deprecated` variants and
+/// `0x67` becomes `cometBFTLightBlockValidatePasteur` (per-byte gas). All three
+/// are already refused by `precompile_kind` as chain precompiles the local EVM
+/// does not implement, so none of it is reachable from `eth_call`.
 fn fermi_family(name: &'static str, activation_time: u64) -> ForkParams {
     ForkParams {
         name,
@@ -98,6 +112,47 @@ fn fermi_family(name: &'static str, activation_time: u64) -> ForkParams {
         block_interval_ms: FERMI_BLOCK_INTERVAL_MS,
         extra_data_version: ExtraDataVersion::Bohr,
     }
+}
+
+/// v1.7.8 `consensus/parlia/parlia.go`:
+///
+/// ```text
+/// kAncestorGenerationDepth = 3
+///
+/// func (p *Parlia) GetAncestorGenerationDepth(header *types.Header) uint64 {
+///     if p.chainConfig.IsFermi(header.Number, header.Time) {
+///         return kAncestorGenerationDepth
+///     }
+///     return 1
+/// }
+/// ```
+pub const K_ANCESTOR_GENERATION_DEPTH: u64 = 3;
+
+/// How many generations back from the parent `verifyVoteAttestation` will look for an
+/// attestation's target.
+///
+/// Before Fermi this is 1 -- the target must be the direct parent. From Fermi on it is
+/// [`K_ANCESTOR_GENERATION_DEPTH`], so the target may equally be the parent's parent or
+/// its grandparent. Treating the pre-Fermi rule as universal rejects honest mainnet
+/// headers: BSC produces them routinely, and one is enough to wedge a client that walks
+/// sequentially.
+///
+/// `IsFermi` is `IsLondon(num) && isTimestampForked(FermiTime, time)`; both halves are
+/// kept even though Fermi is far past London, because that is what the source says.
+pub fn ancestor_generation_depth(number: u64, timestamp: u64) -> u64 {
+    if number >= LONDON_BLOCK && timestamp >= FERMI_TIME {
+        K_ANCESTOR_GENERATION_DEPTH
+    } else {
+        1
+    }
+}
+
+/// Target block numbers `verifyVoteAttestation` will accept for a header at `number`:
+/// the parent, down to [`ancestor_generation_depth`] generations counted from it.
+pub fn attestation_target_window(number: u64, timestamp: u64) -> std::ops::RangeInclusive<u64> {
+    let parent = number.saturating_sub(1);
+    let depth = ancestor_generation_depth(number, timestamp);
+    parent.saturating_sub(depth.saturating_sub(1))..=parent
 }
 
 /// Pin-date Parlia profile (`v1.7.8`). For a live header use [`params_at`].
@@ -231,11 +286,12 @@ pub fn pasteur_is_live(now_unix: u64) -> bool {
     now_unix >= PASTEUR_TIME
 }
 
-/// Operator-facing Pasteur line (no secrets). Pin stays v1.7.8 until extraData is re-checked.
+/// Operator-facing Pasteur line (no secrets). The pin already contains the fork, and
+/// it changes no Parlia rule -- see [`fermi_family`] -- so this reports rather than warns.
 pub fn pasteur_status_line(now_unix: u64) -> String {
     if pasteur_is_live(now_unix) {
         format!(
-            "pasteur: LIVE (unix {PASTEUR_TIME}) — pin {BSC_UPSTREAM_TAG}; re-verify extraData/epoch/turnLength"
+            "pasteur: LIVE (unix {PASTEUR_TIME}) — pin {BSC_UPSTREAM_TAG} already covers it; no Parlia rule changes"
         )
     } else {
         let secs = PASTEUR_TIME.saturating_sub(now_unix);
@@ -333,6 +389,58 @@ mod tests {
         assert_eq!(fermi.epoch_length, p.epoch_length);
         assert_eq!(fermi.turn_length, p.turn_length);
         assert_eq!(fermi.block_interval_ms, p.block_interval_ms);
+    }
+
+    /// The fork is not an announcement we are tracking -- it is in the pinned tree.
+    /// `params/config.go` at `v1.7.8` sets mainnet `PasteurTime: newUint64(1787625000)`,
+    /// and `IsPasteur` appears in none of `consensus/parlia/*.go`, so `fermi_family`
+    /// inheriting every Parlia parameter is read off the source rather than assumed.
+    #[test]
+    fn pasteur_time_matches_the_pinned_upstream_config() {
+        assert_eq!(PASTEUR_TIME, 1_787_625_000);
+        let p = params_at(80_000_000, PASTEUR_TIME);
+        let fermi = mainnet_current_fork();
+        assert_eq!(p.epoch_length, fermi.epoch_length);
+        assert_eq!(p.turn_length, fermi.turn_length);
+        assert_eq!(p.block_interval_ms, fermi.block_interval_ms);
+        assert_eq!(p.extra_data_version, fermi.extra_data_version);
+    }
+
+    /// The case that wedged a live walk on 2026-08-22: header 117425792 carried an
+    /// attestation targeting 117425789 while its parent was 117425791. That is legal
+    /// from Fermi on -- `kAncestorGenerationDepth = 3` -- and was rejected by the
+    /// pre-Fermi "target must be the direct parent" rule, which stopped the walk dead.
+    #[test]
+    fn attestation_target_window_covers_three_generations_on_fermi() {
+        let w = attestation_target_window(117_425_792, FERMI_TIME + 1);
+        assert_eq!(*w.end(), 117_425_791, "the parent");
+        assert_eq!(*w.start(), 117_425_789, "two generations below it");
+        assert!(
+            w.contains(&117_425_789),
+            "the target that used to be refused"
+        );
+        assert!(!w.contains(&117_425_788), "one generation too deep");
+        assert!(
+            !w.contains(&117_425_792),
+            "the header is not its own ancestor"
+        );
+    }
+
+    /// Before Fermi the depth really is 1, so the old rule was right for its era. The
+    /// window must not be widened retroactively over pre-Fermi history.
+    #[test]
+    fn attestation_target_window_is_the_parent_alone_before_fermi() {
+        assert_eq!(ancestor_generation_depth(117_425_792, FERMI_TIME - 1), 1);
+        assert_eq!(ancestor_generation_depth(117_425_792, FERMI_TIME), 3);
+        let w = attestation_target_window(117_425_792, FERMI_TIME - 1);
+        assert_eq!(*w.start(), 117_425_791);
+        assert_eq!(*w.end(), 117_425_791);
+        // `IsFermi` is gated on London too: a block below it is pre-Fermi whatever the
+        // clock says.
+        assert_eq!(
+            ancestor_generation_depth(LONDON_BLOCK - 1, FERMI_TIME + 1),
+            1
+        );
     }
 
     #[test]
