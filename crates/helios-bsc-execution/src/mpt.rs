@@ -242,15 +242,33 @@ pub(crate) fn bytes_to_nibbles(b: &[u8]) -> Vec<u8> {
     n
 }
 
+/// Yellow Paper hex-prefix decode, canonical spellings only.
+///
+/// geth's own `trie/encoding.go` comment states the rule: "The high nibble of the first
+/// byte contains the flag; the lowest bit encoding the oddness of the length and the
+/// second-lowest encoding whether the node at the key is a value node. The low nibble of
+/// the first byte is zero in the case of an even number of nibbles."
+///
+/// So only flags 0..=3 exist. `compactToHex` never validates that — it infers leaf-ness
+/// from the terminator nibble instead — and its leniency does not match ours: for flag 4
+/// or 5 geth keeps the terminator and reads a **leaf**, while masking `flag & 2` here
+/// reads an **extension**. Rather than reproduce one arbitrary reading of a byte that
+/// cannot occur, refuse it. Every node reaching this function is hash-bound to a root
+/// taken from a sealed header, so a non-canonical prefix is unreachable in practice;
+/// this removes the divergence rather than picking a side of it.
 pub(crate) fn hex_prefix_decode(path: &[u8]) -> Result<(Vec<u8>, bool), MptError> {
+    let bad = || MptError::PathMismatch {
+        index: 0,
+        remaining: 0,
+        path_len: 0,
+    };
     if path.is_empty() {
-        return Err(MptError::PathMismatch {
-            index: 0,
-            remaining: 0,
-            path_len: 0,
-        });
+        return Err(bad());
     }
     let flag = path[0] >> 4;
+    if flag > 3 {
+        return Err(bad());
+    }
     let odd = flag & 1 == 1;
     let is_leaf = flag & 2 == 2;
     let mut nibs = bytes_to_nibbles(path);
@@ -258,11 +276,11 @@ pub(crate) fn hex_prefix_decode(path: &[u8]) -> Result<(Vec<u8>, bool), MptError
         nibs.remove(0);
     } else {
         if nibs.len() < 2 {
-            return Err(MptError::PathMismatch {
-                index: 0,
-                remaining: 0,
-                path_len: 0,
-            });
+            return Err(bad());
+        }
+        // Even length: the low nibble of the first byte is padding and must be zero.
+        if nibs[1] != 0 {
+            return Err(bad());
         }
         nibs.drain(..2);
     }
@@ -417,6 +435,40 @@ mod tests {
             decode_account(&non_canon),
             Err(MptError::Rlp(RlpError::NonCanonical))
         ));
+    }
+
+    /// Only flags 0..=3 exist per the Yellow Paper. geth's `compactToHex` infers
+    /// leaf-ness from the terminator nibble instead of masking, so for flag 4 or 5 it
+    /// reads a leaf where masking `flag & 2` reads an extension. Refusing the byte is
+    /// the only reading that cannot silently disagree with geth.
+    #[test]
+    fn non_canonical_hex_prefix_refused() {
+        // The four legal spellings still decode.
+        assert_eq!(
+            hex_prefix_decode(&[0x00, 0xab]).unwrap(),
+            (vec![0xa, 0xb], false)
+        );
+        assert_eq!(hex_prefix_decode(&[0x1a]).unwrap(), (vec![0xa], false));
+        assert_eq!(
+            hex_prefix_decode(&[0x20, 0xab]).unwrap(),
+            (vec![0xa, 0xb], true)
+        );
+        assert_eq!(hex_prefix_decode(&[0x3a]).unwrap(), (vec![0xa], true));
+
+        // Flags 4..15: geth would call 0x4_ and 0x5_ leaves, we would have called them
+        // extensions. Neither guess is made.
+        for flag in 4u8..16 {
+            assert!(
+                hex_prefix_decode(&[flag << 4, 0xab]).is_err(),
+                "flag {flag:x} accepted"
+            );
+        }
+
+        // Even length: the low nibble of the first byte is padding and must be zero.
+        assert!(hex_prefix_decode(&[0x07, 0xab]).is_err());
+        assert!(hex_prefix_decode(&[0x27, 0xab]).is_err());
+
+        assert!(hex_prefix_decode(&[]).is_err());
     }
 
     #[test]

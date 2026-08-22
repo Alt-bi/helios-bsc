@@ -217,8 +217,9 @@ impl Upstream {
     }
 
     fn post_json(&self, body: &Value) -> Result<Value> {
+        const ATTEMPTS: u64 = 4;
         let mut last = anyhow!("no attempt");
-        for attempt in 0..4 {
+        for attempt in 0..ATTEMPTS {
             match ureq::post(&self.url)
                 .set("Content-Type", "application/json")
                 .set("User-Agent", "helios-bsc")
@@ -230,7 +231,11 @@ impl Upstream {
                 }
                 Err(e) => {
                     last = anyhow!("upstream HTTP: {e}");
-                    std::thread::sleep(std::time::Duration::from_millis(400 * (attempt + 1)));
+                    // No backoff after the last attempt — the caller is about to see the
+                    // error either way, and 1.6 s of it was pure added latency on failure.
+                    if attempt + 1 < ATTEMPTS {
+                        std::thread::sleep(std::time::Duration::from_millis(400 * (attempt + 1)));
+                    }
                 }
             }
         }

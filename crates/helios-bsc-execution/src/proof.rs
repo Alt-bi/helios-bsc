@@ -254,13 +254,10 @@ pub fn verify_storage_slot(
     let entry = proof
         .storage_proof
         .iter()
-        .find(|e| {
-            decode_qty(&e.key)
-                .ok()
-                .map(|k| pad32(&k) == *slot)
-                .unwrap_or(false)
-                || e.key.eq_ignore_ascii_case(&want)
-        })
+        // `slot_of_key` rather than `pad32`: an over-long key must not alias the
+        // requested slot. The MPT walk below proves `slot` regardless of which entry is
+        // picked, so this is about picking the right one, not about the value.
+        .find(|e| slot_of_key(&e.key) == Some(*slot) || e.key.eq_ignore_ascii_case(&want))
         .ok_or(ProofError::ClaimMismatch("storageProof"))?;
     let nodes: Vec<Vec<u8>> = entry
         .proof
