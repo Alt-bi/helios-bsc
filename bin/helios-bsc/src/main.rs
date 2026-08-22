@@ -888,6 +888,9 @@ struct SoakReport {
     mismatched: u32,
     skipped: u32,
     unique: u32,
+    /// Comparisons that ran at the BLS-finalized head rather than confirmation depth.
+    /// "Asked for fast finality" and "ran at fast finality" are different facts.
+    compared_at_fast: u32,
 }
 
 fn soak_until(
@@ -936,10 +939,18 @@ fn soak_until(
             }
         };
         let lag = proof_lag(tip, safe.number);
+        // Which head this burst *actually* used. `fast_finality_head` falls back to
+        // confirmation depth whenever the snapshot carries no usable attestation, so a
+        // run can ask for fast finality and never touch it. The gate needs the second
+        // fact, not the first. Same derivation the RPC server publishes as
+        // `read_head_is_fast`.
+        let at_fast =
+            opts.fast_finality && safe_of(chain).is_ok_and(|conf| conf.number != safe.number);
         let n = burst.min(pending.len());
         println!(
-            "  burst n={n}  safe={}  tip={tip}  lag={lag}  unique={}/{}",
+            "  burst n={n}  safe={}  tip={tip}  lag={lag}  head={}  unique={}/{}",
             safe.number,
+            if at_fast { "fast" } else { "conf" },
             done.len(),
             opts.min_unique
         );
@@ -951,6 +962,9 @@ fn soak_until(
                     report.compared += 1;
                     report.matched += 1;
                     compared_this += 1;
+                    if at_fast {
+                        report.compared_at_fast += 1;
+                    }
                     if done.insert(addr_key(addr)) {
                         gained += 1;
                     }
@@ -1042,6 +1056,14 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
     }
     println!("oracle   {}", rpc_host(args.oracle));
     println!(
+        "finality {}",
+        if args.fast_finality {
+            "fast (BEP-126 BLS finalized head)"
+        } else {
+            "confirmation-depth"
+        }
+    );
+    println!(
         "rounds   {}  interval {}s  addresses {}  min_unique {}  burst {}  pause {}s  duration {}s",
         args.rounds,
         args.interval,
@@ -1081,7 +1103,22 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
         walk_headers(up.as_ref(), from, tip0)?
     };
 
+    // BLS vote keys only ever arrive with a checkpoint, and without them
+    // `fast_finality_head` returns the confirmation-depth head. That fallback is the
+    // safe direction, but silently: the run would print `GATE: PASS` having never
+    // exercised the finality mode it was asked to gate. Refuse instead.
+    if args.fast_finality
+        && !snap_hold
+            .as_ref()
+            .is_some_and(helios_bsc_consensus::Snapshot::fast_finality_available)
+    {
+        bail!(
+            "--finality fast needs a --checkpoint carrying BLS vote keys (write one with `write-checkpoint --sealing-set-from-epoch`); without them the soak falls back to confirmation depth and gates a mode it never ran"
+        );
+    }
+
     let mut tot = DiffReport::default();
+    let mut fast_compared = 0u32;
     let mut done: HashSet<String> = HashSet::new();
     let mut round = 0u32;
     loop {
@@ -1124,6 +1161,7 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
         tot.matched += report.matched;
         tot.mismatched += report.mismatched;
         tot.skipped += report.skipped;
+        fast_compared += report.compared_at_fast;
         println!(
             "  round unique={}  compared={}  match={}  mismatch={}  skip={}",
             done.len(),
@@ -1147,7 +1185,7 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
     }
     let unique_best = done.len() as u32;
     println!(
-        "# SUMMARY  compared={}  match={}  mismatch={}  skip={}  unique_best={}",
+        "# SUMMARY  compared={}  match={}  mismatch={}  skip={}  unique_best={}  at_fast_head={fast_compared}",
         tot.compared, tot.matched, tot.mismatched, tot.skipped, unique_best
     );
     if tot.mismatched > 0 {
@@ -1162,7 +1200,15 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
             args.min_unique
         );
     }
-    println!("GATE:         PASS  unique={unique_best}");
+    // Vote keys were present at startup, so a zero here means every round fell back for
+    // want of an attestation. Passing on that would certify the wrong head.
+    if args.fast_finality && fast_compared == 0 {
+        bail!(
+            "--finality fast was requested but all {} comparisons ran at confirmation depth — no BLS-finalized head was ever reached",
+            tot.compared
+        );
+    }
+    println!("GATE:         PASS  unique={unique_best}  at_fast_head={fast_compared}");
     Ok(())
 }
 
