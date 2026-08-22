@@ -7,7 +7,7 @@ use helios_bsc::diff::{
     addr_key, diff_one, proof_error_retryable, rotate_front, soak_empty_burst, soak_list,
     soak_repeat_full_list, unmatched, DiffOutcome, DiffReport, SOAK_ADDRESSES,
 };
-use helios_bsc::rpc_server::{self, Node};
+use helios_bsc::rpc_server::{self, FinalityMode, Node};
 use helios_bsc::sync::{
     checkpoint_policy, confirm_checkpoint_with_oracle, doctor_checkpoint_line, env_host_line,
     env_independence_line, independent_rpc_hosts, rpc_host, safe_of, wait_until_in_window,
@@ -43,6 +43,14 @@ const WBNB: &str = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c";
 struct Cli {
     #[command(subcommand)]
     cmd: Commands,
+}
+
+/// `--finality` on `run`. Mirrors [`FinalityMode`]; kept separate so the CLI surface is
+/// not tied to an internal type's naming.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum FinalityArg {
+    ConfirmationDepth,
+    Fast,
 }
 
 #[derive(Subcommand, Debug)]
@@ -127,6 +135,14 @@ enum Commands {
         /// Serve Prometheus metrics on `GET /metrics` (same bind; off by default).
         #[arg(long)]
         metrics: bool,
+        /// Which finality rule `latest` / `safe` / `finalized` resolve to.
+        ///
+        /// `confirmation-depth` (default) is ~106–113 blocks behind the tip. `fast` uses
+        /// the BEP-126 BLS-finalized head, ~2 blocks behind, and falls back to
+        /// confirmation depth whenever no finalized head is known — for instance from a
+        /// checkpoint without BLS vote keys. Opt-in until the ≥24h soak covers it.
+        #[arg(long, value_enum, default_value_t = FinalityArg::ConfirmationDepth)]
+        finality: FinalityArg,
     },
     /// Write a checkpoint JSON from a trusted header + operator sealing set.
     WriteCheckpoint {
@@ -267,6 +283,7 @@ async fn main() -> Result<()> {
             allow_non_loopback,
             allow_unverified_passthrough,
             metrics,
+            finality,
         } => {
             info!(%listen, lookback, max_sync, "starting verified RPC");
             assert_listen_policy(&listen, allow_non_loopback)?;
@@ -310,6 +327,13 @@ async fn main() -> Result<()> {
             if metrics {
                 node.set_metrics_enabled(true);
                 eprintln!("metrics on http://{listen}/metrics");
+            }
+            if finality == FinalityArg::Fast {
+                node.set_finality_mode(FinalityMode::Fast);
+                eprintln!(
+                    "finality: fast (BEP-126 BLS); falls back to confirmation depth \
+                     when no finalized head is known"
+                );
             }
             rpc_server::serve(Arc::new(node), &listen)
         }

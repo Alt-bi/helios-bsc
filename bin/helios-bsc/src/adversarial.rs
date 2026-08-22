@@ -1,6 +1,7 @@
 //! PR 10: lying upstream through `Node::handle` (no network).
 
 use crate::diff::{diff_vs_oracle, soak_list, SOAK_ADDRESSES};
+use crate::rpc_server::FinalityMode;
 use crate::sync::{
     confirm_checkpoint_with_oracle, walk_from_checkpoint, walk_from_checkpoint_inturn, walk_headers,
 };
@@ -1317,6 +1318,91 @@ fn finality_gauges_do_not_take_the_chain_lock() {
     assert!(m.contains("helios_bsc_finalized_block "), "{m}");
     assert!(m.contains("helios_bsc_finalized_lag_blocks "), "{m}");
     assert!(m.contains("helios_bsc_justified_block "), "{m}");
+}
+
+/// A finalized head only moves the read head when the client verified that exact block
+/// itself. An attestation naming a block we never walked is an upstream's word.
+#[test]
+fn fast_finality_head_must_be_in_the_local_chain() {
+    let chain = distinct_sealer_chain(15);
+    let snap = snapshot_for_chain(&chain);
+    let up = MockUpstream::for_chain(&chain, json!({}));
+    let mut node = Node::from_parts_with_snapshot(Box::new(up), 130, chain, snap, "fermi");
+    node.set_finality_mode(FinalityMode::Fast);
+
+    let before = node.handle(&req("helios_bsc_syncStatus", json!([])));
+    let conf_safe = before["result"]["safe"].as_u64().expect("safe");
+    let tip = before["result"]["tip"].as_u64().expect("tip");
+
+    // Real number, hash that is not in the chain.
+    node.publish_finality_for_test((tip, [0x77u8; 32]), (tip - 1, [0x88u8; 32]));
+    let after = node.handle(&req("helios_bsc_syncStatus", json!([])));
+    assert_eq!(
+        after["result"]["safe"].as_u64(),
+        Some(conf_safe),
+        "unverified finalized hash must not move the read head"
+    );
+    assert_eq!(after["result"]["safeSource"], json!("confirmation-depth"));
+}
+
+/// Enabling the flag can only make reads fresher. If BLS finality stalls behind the
+/// confirmation-depth head, tags stay on the confirmation-depth head.
+#[test]
+fn stalled_fast_finality_does_not_move_reads_backwards() {
+    // 21 blocks, not the usual 16: with exactly 15 distinct sealers Safe lands on the
+    // very first block, leaving nothing verified below it to stall on.
+    let chain = distinct_sealer_chain(20);
+    // A block strictly below the confirmation-depth Safe head, taken from the chain so
+    // the hash is one the client really verified — the point is the height, not the hash.
+    let expected_safe = newest_safe(&chain, 21).expect("safe").number;
+    let stale_block = chain
+        .iter()
+        .find(|b| b.number == expected_safe - 1)
+        .expect("a verified block below Safe")
+        .clone();
+
+    let snap = snapshot_for_chain(&chain);
+    let up = MockUpstream::for_chain(&chain, json!({}));
+    let mut node = Node::from_parts_with_snapshot(Box::new(up), 130, chain, snap, "fermi");
+    node.set_finality_mode(FinalityMode::Fast);
+
+    let conf_safe = node.handle(&req("helios_bsc_syncStatus", json!([])))["result"]["safe"]
+        .as_u64()
+        .expect("safe");
+    let stale = stale_block.number;
+    assert!(
+        stale < conf_safe,
+        "fixture must put the stale head below Safe"
+    );
+
+    node.publish_finality_for_test((stale, stale_block.hash), (stale, stale_block.hash));
+    let st = node.handle(&req("helios_bsc_syncStatus", json!([])));
+    assert_eq!(st["result"]["safe"].as_u64(), Some(conf_safe));
+    assert_eq!(st["result"]["safeSource"], json!("confirmation-depth"));
+    // The finality fields still report the stalled head honestly.
+    assert_eq!(st["result"]["finalizedBlock"].as_u64(), Some(stale));
+}
+
+/// Default build must be byte-for-byte the confirmation-depth behaviour even when a
+/// finalized head is known — the flag is the only thing that changes what tags mean.
+#[test]
+fn finality_flag_is_opt_in() {
+    let node = node_with_snapshot();
+    let st0 = node.handle(&req("helios_bsc_syncStatus", json!([])));
+    let conf_safe = st0["result"]["safe"].as_u64().expect("safe");
+    let head = st0["result"]["finalityHead"].as_u64().expect("head");
+    assert_eq!(st0["result"]["finalityMode"], json!("confirmation-depth"));
+
+    node.publish_finality_for_test((head - 1, [0xa1u8; 32]), (head - 2, [0xb2u8; 32]));
+    let st = node.handle(&req("helios_bsc_syncStatus", json!([])));
+    assert_eq!(
+        st["result"]["safe"].as_u64(),
+        Some(conf_safe),
+        "without --finality fast the read head must not move"
+    );
+    assert_eq!(st["result"]["safeSource"], json!("confirmation-depth"));
+    // ...while still *reporting* fast finality.
+    assert_eq!(st["result"]["finality"], json!("fast-finality"));
 }
 
 #[test]

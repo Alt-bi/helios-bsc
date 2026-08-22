@@ -83,6 +83,8 @@ pub struct Node {
     /// the real lag was 2. Numbers, hashes and the head they are measured against have to
     /// come from the same instant.
     finality: Mutex<FinalityView>,
+    /// Which finality rule block tags resolve to. Default is confirmation depth.
+    finality_mode: FinalityMode,
     /// Serialises checkpoint persistence. The background sync thread and any request
     /// thread can both reach `persist_verified_tip`, and two writers racing on the same
     /// file is how a checkpoint ends up truncated — the one outcome tmp+rename exists to
@@ -96,9 +98,23 @@ pub struct Node {
 /// Sentinel for an unpublished `last_tip` / `last_safe` / finality gauge.
 const NO_BLOCK: u64 = u64::MAX;
 
+/// Which rule decides the head that block tags resolve to.
+///
+/// The design doc specifies fast finality as feature-flagged, and it stays that way:
+/// changing what `latest` means for a wallet is a behavioural change, and the ≥24h
+/// differential soak is the gate for making it the default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FinalityMode {
+    /// Newest block with ≥`floor(2N/3)+1` distinct subsequent sealers. ~106–113 blocks.
+    #[default]
+    ConfirmationDepth,
+    /// BLS-finalized head (BEP-126) when one is known, else confirmation depth. ~2 blocks.
+    Fast,
+}
+
 /// Fast-finality heads and the verified head they were measured against, all sampled at
 /// the same instant. See [`Node::finality`].
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct FinalityView {
     /// Verified head at the time of the read; the lags are relative to this, not to a
     /// tip sampled elsewhere.
@@ -106,6 +122,13 @@ struct FinalityView {
     available: bool,
     justified: Option<(u64, [u8; 32])>,
     finalized: Option<(u64, [u8; 32])>,
+    /// Head block tags resolved to at that same instant, and whether fast finality is
+    /// what chose it. Carried here rather than re-derived in `status_fields`, because a
+    /// concurrent sync can publish a newer view between a request's own `refresh` and its
+    /// status read — comparing the two produced a `safeSource` that disagreed with the
+    /// `safe` printed beside it.
+    read_head: Option<SafeHead>,
+    read_head_is_fast: bool,
 }
 
 /// Request threads serving the local JSON-RPC listener.
@@ -148,6 +171,7 @@ impl Node {
             allow_unverified_passthrough: false,
             backup_transport: false,
             finality: Mutex::new(FinalityView::default()),
+            finality_mode: FinalityMode::default(),
             persist_lock: Mutex::new(()),
             metrics_enabled: false,
         })
@@ -196,6 +220,7 @@ impl Node {
             allow_unverified_passthrough: false,
             backup_transport: false,
             finality: Mutex::new(FinalityView::default()),
+            finality_mode: FinalityMode::default(),
             persist_lock: Mutex::new(()),
             metrics_enabled: false,
         })
@@ -226,6 +251,7 @@ impl Node {
             allow_unverified_passthrough: false,
             backup_transport: false,
             finality: Mutex::new(FinalityView::default()),
+            finality_mode: FinalityMode::default(),
             persist_lock: Mutex::new(()),
             metrics_enabled: false,
         }
@@ -261,6 +287,7 @@ impl Node {
             allow_unverified_passthrough: false,
             backup_transport: false,
             finality: Mutex::new(FinalityView::default()),
+            finality_mode: FinalityMode::default(),
             persist_lock: Mutex::new(()),
             metrics_enabled: false,
         }
@@ -285,6 +312,49 @@ impl Node {
 
     pub fn set_metrics_enabled(&mut self, yes: bool) {
         self.metrics_enabled = yes;
+    }
+
+    pub fn set_finality_mode(&mut self, mode: FinalityMode) {
+        self.finality_mode = mode;
+    }
+
+    /// Head that block tags resolve to: `latest` / `safe` / `finalized`, and the ceiling
+    /// on historical reads.
+    ///
+    /// Confirmation depth unless `--finality fast`. In fast mode the BLS-finalized head
+    /// is used only when it is **newer** than confirmation depth and names a block this
+    /// client verified itself — an attestation pointing at a block we never walked is an
+    /// upstream's word, not a head. Taking the newer of the two also means enabling the
+    /// flag can never move reads backwards: both rules are complete finality rules on
+    /// their own, so the head is final under at least one of them either way.
+    fn read_head(
+        &self,
+        chain: &[VerifiedBlock],
+        snapshot: Option<&Snapshot>,
+        conf_safe: &SafeHead,
+    ) -> SafeHead {
+        if self.finality_mode != FinalityMode::Fast {
+            return conf_safe.clone();
+        }
+        let Some((number, hash)) = snapshot.and_then(Snapshot::finalized) else {
+            return conf_safe.clone();
+        };
+        if number <= conf_safe.number {
+            return conf_safe.clone();
+        }
+        let Some(block) = chain.iter().find(|b| b.number == number && b.hash == hash) else {
+            return conf_safe.clone();
+        };
+        SafeHead {
+            number: block.number,
+            hash: format!("0x{}", hex::encode(block.hash)),
+            state_root: format!("0x{}", hex::encode(block.state_root)),
+            // These two always describe the confirmation-depth rule; `safeSource` on
+            // `helios_bsc_syncStatus` says which rule actually chose the head. Reporting
+            // a vote count here would silently retype the field.
+            distinct_sealers: conf_safe.distinct_sealers,
+            required_sealers: conf_safe.required_sealers,
+        }
     }
 
     pub fn metrics_enabled(&self) -> bool {
@@ -566,34 +636,41 @@ impl Node {
                 return Err(e);
             }
         };
-        let (safe, verified_this, grew) = match self.resync_locked(&mut chain, &mut snapshot, tip) {
-            Ok(v) => v,
-            Err(e) => {
-                self.header_verify_fail.fetch_add(1, Ordering::Relaxed);
-                return Err(e);
-            }
-        };
+        let (safe, conf_safe, verified_this, grew) =
+            match self.resync_locked(&mut chain, &mut snapshot, tip) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.header_verify_fail.fetch_add(1, Ordering::Relaxed);
+                    return Err(e);
+                }
+            };
         // Read the fast-finality heads while the snapshot is still locked, and keep them
         // together with the head they are measured against. Everything published below
         // comes from this one sample, so no consumer can mix two instants.
-        let view = match snapshot.as_ref() {
+        let mut view = match snapshot.as_ref() {
             Some(s) => FinalityView {
                 head: tip,
                 available: s.fast_finality_available(),
                 justified: s.justified(),
                 finalized: s.finalized(),
+                ..FinalityView::default()
             },
             None => FinalityView {
                 head: tip,
                 ..FinalityView::default()
             },
         };
+        view.read_head_is_fast = safe.number != conf_safe.number;
+        view.read_head = Some(safe.clone());
         drop(chain);
         drop(snapshot);
         self.bump_headers(verified_this);
         // Publish for /metrics so a scrape never contends with this sync.
         self.last_tip.store(tip, Ordering::Relaxed);
-        self.last_safe.store(safe.number, Ordering::Relaxed);
+        // `last_safe` is the confirmation-depth head, whatever tags resolve to — the SLO
+        // bound and its alerts are defined against that rule, so the gauge must not start
+        // meaning something else when the flag is on.
+        self.last_safe.store(conf_safe.number, Ordering::Relaxed);
         self.last_justified.store(
             view.justified.map_or(NO_BLOCK, |(b, _)| b),
             Ordering::Relaxed,
@@ -615,7 +692,7 @@ impl Node {
         chain: &mut Vec<VerifiedBlock>,
         snapshot: &mut Option<Snapshot>,
         tip: u64,
-    ) -> Result<(SafeHead, u64, bool)> {
+    ) -> Result<(SafeHead, SafeHead, u64, bool)> {
         let last = chain.last().map(|b| b.number).unwrap_or(0);
         let mut grew = false;
         let verified_this;
@@ -670,8 +747,9 @@ impl Node {
                 .map(|b| b.number.saturating_sub(last))
                 .unwrap_or(0);
         }
-        let safe = safe_of(chain)?;
-        Ok((safe, verified_this, grew))
+        let conf_safe = safe_of(chain)?;
+        let head = self.read_head(chain, snapshot.as_ref(), &conf_safe);
+        Ok((head, conf_safe, verified_this, grew))
     }
 
     /// JSON-RPC 2.0 envelope: single object, batch array, or parse error.
@@ -865,11 +943,20 @@ impl Node {
         // normal state at a checkpoint before the first epoch activation, not an error.
         let sealing = self.snapshot.lock().expect("snapshot lock").is_some();
         // One consistent sample published by `refresh` — never a fresh snapshot read, see
-        // [`Node::finality`].
-        let view = *self.finality.lock().expect("finality lock");
+        // [`Node::finality`]. The caller's own `(tip, safe)` are only a fallback for the
+        // window before any view has been published: a concurrent sync can publish a
+        // newer one between a request's `refresh` and this read, and mixing the two is
+        // how the head, its lag and its source end up describing different instants.
+        let view = self.finality.lock().expect("finality lock").clone();
         let (fast_available, justified, finalized) =
             (view.available, view.justified, view.finalized);
         let finality_head = view.head;
+        let safe = view.read_head.as_ref().unwrap_or(safe);
+        let tip = if view.read_head.is_some() {
+            view.head
+        } else {
+            tip
+        };
         let lag = proof_lag(tip, safe.number);
         let interval_ms = mainnet_current_fork().block_interval_ms;
         // `safe` / `safeLagBlocks` / `lag` keep meaning confirmation depth; the
@@ -907,6 +994,13 @@ impl Node {
             "finalizedLagBlocks": finalized.map(|(b, _)| proof_lag(finality_head, b)),
             "justifiedLagBlocks": justified.map(|(b, _)| proof_lag(finality_head, b)),
             "finalityHead": finality_head,
+            // Which rule chose the head that `latest` / `safe` / `finalized` resolve to.
+            // `distinctSealers` / `requiredSealers` always describe confirmation depth.
+            "finalityMode": match self.finality_mode {
+                FinalityMode::Fast => "fast",
+                FinalityMode::ConfirmationDepth => "confirmation-depth",
+            },
+            "safeSource": if view.read_head_is_fast { "fast-finality" } else { "confirmation-depth" },
         })
     }
 
