@@ -150,8 +150,11 @@ pub fn open_data_plane(primary: impl Into<String>, backup: Option<String>) -> Bo
 /// full block's `eth_getBlockReceipts`, a couple of MiB at BSC's gas limit.
 pub const MAX_UPSTREAM_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 
-fn read_capped_json(resp: ureq::Response) -> Result<Value> {
-    read_capped(resp.into_reader())
+fn read_capped_json(resp: ureq::http::Response<ureq::Body>) -> Result<Value> {
+    // ureq 3 can cap the body itself (`with_config().limit()`), but keeping our own
+    // `take` means the bound stays one testable function rather than a call-site
+    // argument — see `oversized_response_body_is_refused_not_buffered`.
+    read_capped(resp.into_body().into_reader())
 }
 
 fn read_capped(r: impl std::io::Read) -> Result<Value> {
@@ -234,9 +237,11 @@ impl Upstream {
         let mut last = anyhow!("no attempt");
         for attempt in 0..ATTEMPTS {
             match ureq::post(&self.url)
-                .set("Content-Type", "application/json")
-                .set("User-Agent", "helios-bsc")
-                .timeout(std::time::Duration::from_secs(30))
+                .config()
+                .timeout_global(Some(std::time::Duration::from_secs(30)))
+                .build()
+                .header("Content-Type", "application/json")
+                .header("User-Agent", "helios-bsc")
                 .send_json(body)
             {
                 Ok(resp) => {
