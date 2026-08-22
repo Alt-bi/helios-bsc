@@ -1320,6 +1320,24 @@ fn finality_gauges_do_not_take_the_chain_lock() {
     assert!(m.contains("helios_bsc_justified_block "), "{m}");
 }
 
+/// Without a checkpoint there is no snapshot, so there are no BLS vote keys and no
+/// attestation — `fast_finality_head` then answers with the confirmation-depth head.
+/// That is the safe direction but a silent one: `soak --finality fast` used to print
+/// `GATE: PASS` having compared at lag ~108, never touching the mode it gates. The soak
+/// now refuses that configuration up front; this pins the fallback it refuses on.
+#[test]
+fn fast_finality_head_without_a_snapshot_is_confirmation_depth() {
+    let chain = distinct_sealer_chain(15);
+    let conf = crate::sync::safe_of(&chain).expect("safe");
+    let head = crate::sync::fast_finality_head(&chain, None, &conf);
+    assert_eq!(
+        head.number, conf.number,
+        "no snapshot must not move the head"
+    );
+    assert_eq!(head.hash, conf.hash);
+    assert_eq!(head.state_root, conf.state_root);
+}
+
 /// A finalized head only moves the read head when the client verified that exact block
 /// itself. An attestation naming a block we never walked is an upstream's word.
 #[test]
