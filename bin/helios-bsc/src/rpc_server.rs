@@ -367,6 +367,27 @@ impl Node {
         self.chain.lock().expect("chain lock")
     }
 
+    /// Run `f` while the finality lock is held, so a test can park a concurrent
+    /// `refresh` exactly at its publish step. See [`Node::finality`].
+    #[cfg(test)]
+    pub fn hold_finality_lock_for_test<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _held = self.finality.lock().expect("finality lock");
+        f()
+    }
+
+    /// Non-blocking probe: is the chain lock held by somebody else right now?
+    #[cfg(test)]
+    pub fn chain_lock_is_held_for_test(&self) -> bool {
+        self.chain.try_lock().is_err()
+    }
+
+    /// Last published tip gauge; `None` is the [`NO_BLOCK`] "no sync yet" sentinel.
+    #[cfg(test)]
+    pub fn published_tip_for_test(&self) -> Option<u64> {
+        let t = self.last_tip.load(Ordering::Relaxed);
+        (t != NO_BLOCK).then_some(t)
+    }
+
     /// Publish a fast-finality pair exactly as a successful `refresh` would.
     ///
     /// The mock chain has no real BLS attestations, and forging one here would prove
@@ -662,10 +683,15 @@ impl Node {
         };
         view.read_head_is_fast = safe.number != conf_safe.number;
         view.read_head = Some(safe.clone());
-        drop(chain);
-        drop(snapshot);
-        self.bump_headers(verified_this);
-        // Publish for /metrics so a scrape never contends with this sync.
+        // Publish **while the chain lock is still held**. `docs/slo.md` promises that
+        // `helios_bsc_tip_block` and the finality gauges are "published together", and
+        // publishing after the drop broke that with four worker threads: the whole sync
+        // is serialised by this lock, so a thread descheduled between `drop(chain)` and
+        // these stores could be overtaken by a newer sync and then overwrite it with its
+        // own older sample — tip, safe and the finality view going *backwards* and
+        // staying there until the next sync. These are plain atomic stores plus one
+        // uncontended mutex, no I/O, so the critical section does not grow measurably.
+        // `/metrics` still reads only atomics and never takes this lock.
         self.last_tip.store(tip, Ordering::Relaxed);
         // `last_safe` is the confirmation-depth head, whatever tags resolve to — the SLO
         // bound and its alerts are defined against that rule, so the gauge must not start
@@ -679,7 +705,13 @@ impl Node {
             view.finalized.map_or(NO_BLOCK, |(b, _)| b),
             Ordering::Relaxed,
         );
+        // Lock order is chain → snapshot → finality everywhere (`status_fields` takes
+        // snapshot then finality and holds neither across the other).
         *self.finality.lock().expect("finality lock") = view;
+        drop(chain);
+        drop(snapshot);
+        self.bump_headers(verified_this);
+        // Must stay outside: `persist_verified_tip` re-takes chain and snapshot.
         if grew {
             self.persist_verified_tip();
         }
@@ -1117,9 +1149,10 @@ impl Node {
             Ok(v) => v,
             Err(e) => return Err(rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}"))),
         };
-        let local = self.resolve_wallet_exec_block(id, tag, tip, &safe)?;
+        // One lock acquisition for both the executing header and its BLOCKHASH window.
         let block = {
             let chain = self.chain.lock().expect("chain lock");
+            let local = self.resolve_wallet_exec_block_in(id, tag, tip, &safe, &chain)?;
             call_block_from_verified(&local, &chain)
         };
         Ok((tx, block))
@@ -1445,7 +1478,7 @@ impl Node {
 
     fn verified_header_json(&self, id: Value, local: &VerifiedBlock) -> Value {
         match self.bound_block_txs(local) {
-            Ok(bound) => rpc_ok(id, rpc_block_json(&bound.header, &bound.hashes)),
+            Ok(bound) => rpc_ok(id, rpc_block_json(&bound.header, bound.txs.hashes())),
             Err((code, msg)) => rpc_err(id, code, &msg),
         }
     }
@@ -1466,7 +1499,7 @@ impl Node {
     }
 
     /// Bind untrusted raw txs to the sealed `transactionsRoot`. Empty root → no fetch.
-    fn bind_tx_hashes(&self, hdr: &RpcBlockHeader) -> Result<Vec<[u8; 32]>, (i64, String)> {
+    fn bind_tx_hashes(&self, hdr: &RpcBlockHeader) -> Result<TxBind, (i64, String)> {
         let root = decode_hex_fixed::<32>(&hdr.transactions_root).map_err(|e| {
             (
                 ERR_PROOF_FAILED,
@@ -1474,24 +1507,26 @@ impl Node {
             )
         })?;
         if root == EMPTY_TRIE_ROOT {
-            return Ok(Vec::new());
+            return Ok(TxBind::Empty);
         }
         let raws = self
             .up
             .block_raw_transactions(&hdr.hash)
             .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))?;
         // No envelopes: omit hashes (do not invent, do not fail the header read).
+        // Distinct from `Empty` — see [`TxBind`].
         if raws.is_empty() {
-            return Ok(Vec::new());
+            return Ok(TxBind::Omitted);
         }
         verify_tx_list(&raws, &root)
+            .map(TxBind::List)
             .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))
     }
 
     fn bound_block_txs(&self, local: &VerifiedBlock) -> Result<BoundTxs, (i64, String)> {
         let header = self.load_verified_header(local)?;
-        let hashes = self.bind_tx_hashes(&header)?;
-        Ok(BoundTxs { header, hashes })
+        let txs = self.bind_tx_hashes(&header)?;
+        Ok(BoundTxs { header, txs })
     }
 
     /// Bind untrusted receipt JSON to sealed `receiptsRoot`. Empty root → no fetch.
@@ -1521,6 +1556,9 @@ impl Node {
         }
         let mut raws = Vec::with_capacity(jsons.len());
         let mut items = Vec::with_capacity(jsons.len());
+        // Block-wide log index, the same counter `eth_getLogs` uses, so the two methods
+        // cannot disagree about `logIndex` for the same block.
+        let mut log_index: u64 = 0;
         for (i, v) in jsons.iter().enumerate() {
             let parsed = parse_consensus_receipt_json(v).map_err(|e| {
                 (
@@ -1535,8 +1573,17 @@ impl Node {
                 )
             })?;
             raws.push(raw);
+            let json = decorate_receipt_json(
+                v.clone(),
+                hdr,
+                i,
+                parsed.tx_hash,
+                &parsed.consensus.logs,
+                log_index,
+            );
+            log_index = log_index.saturating_add(parsed.consensus.logs.len() as u64);
             items.push(BoundReceipt {
-                json: decorate_receipt_json(v.clone(), hdr, i, parsed.tx_hash),
+                json,
                 tx_hash: parsed.tx_hash,
                 logs: parsed.consensus.logs,
             });
@@ -1830,7 +1877,11 @@ impl Node {
 
     fn verified_tx_count(&self, id: Value, local: &VerifiedBlock) -> Value {
         match self.bound_block_txs(local) {
-            Ok(bound) => rpc_ok(id, json!(format!("0x{:x}", bound.hashes.len()))),
+            Ok(bound) => match bound.txs {
+                TxBind::Empty => rpc_ok(id, json!("0x0")),
+                TxBind::List(v) => rpc_ok(id, json!(format!("0x{:x}", v.len()))),
+                TxBind::Omitted => rpc_err(id, ERR_PROOF_FAILED, TX_ENVELOPES_UNAVAILABLE),
+            },
             Err((code, msg)) => rpc_err(id, code, &msg),
         }
     }
@@ -1864,10 +1915,16 @@ impl Node {
             Ok(v) => v,
             Err((code, msg)) => return rpc_err(id, code, &msg),
         };
+        let hashes = match &bound.txs {
+            TxBind::List(v) => v.as_slice(),
+            TxBind::Empty => &[][..],
+            // Non-empty root, no envelopes: `null` would claim "no tx at this index".
+            TxBind::Omitted => return rpc_err(id, ERR_PROOF_FAILED, TX_ENVELOPES_UNAVAILABLE),
+        };
         let Ok(i) = usize::try_from(index) else {
             return rpc_ok(id, Value::Null);
         };
-        let Some(hash) = bound.hashes.get(i) else {
+        let Some(hash) = hashes.get(i) else {
             return rpc_ok(id, Value::Null);
         };
         rpc_ok(
@@ -2008,14 +2065,27 @@ impl Node {
         tip: u64,
         safe: &SafeHead,
     ) -> Result<VerifiedBlock, Value> {
-        let local = {
-            let chain = self.chain.lock().expect("chain lock");
-            wallet_get_block_by_number(tag, safe.number, &safe.hash, &chain)
-                .cloned()
-                .or_else(|| {
-                    tag.and_then(|t| wallet_get_block_by_hash(t, safe.number, &chain).cloned())
-                })
-        };
+        let chain = self.chain.lock().expect("chain lock");
+        self.resolve_wallet_exec_block_in(id, tag, tip, safe, &chain)
+    }
+
+    /// As [`Self::resolve_wallet_exec_block`], against a chain the caller already holds.
+    ///
+    /// `eth_call` needs this: resolving the block under one lock acquisition and then
+    /// re-locking to collect the BLOCKHASH window is two instants, and a reorg landing
+    /// between them executes a block from the old chain against ancestor hashes from the
+    /// new one. Every value stays verified, but they stop describing one chain.
+    fn resolve_wallet_exec_block_in(
+        &self,
+        id: Value,
+        tag: Option<&str>,
+        tip: u64,
+        safe: &SafeHead,
+        chain: &[VerifiedBlock],
+    ) -> Result<VerifiedBlock, Value> {
+        let local = wallet_get_block_by_number(tag, safe.number, &safe.hash, chain)
+            .cloned()
+            .or_else(|| tag.and_then(|t| wallet_get_block_by_hash(t, safe.number, chain).cloned()));
         let Some(local) = local else {
             return Err(rpc_err(
                 id,
@@ -2533,6 +2603,11 @@ fn bind_result_tx_hash(
     Ok(())
 }
 
+/// Non-empty `transactionsRoot` but the upstream served no raw envelopes: a count or an
+/// index lookup has nothing verified to answer with.
+const TX_ENVELOPES_UNAVAILABLE: &str =
+    "proof_verification_failed: upstream served no transaction envelopes";
+
 const MAX_LOG_DATA: usize = 64 * 1024;
 const MAX_FEE_HISTORY_ITEMS: usize = 1024;
 const MAX_GET_LOGS: usize = MAX_RECEIPT_LOGS;
@@ -2861,7 +2936,33 @@ fn wants_full_txs(params: Option<&Vec<Value>>) -> bool {
 
 struct BoundTxs {
     header: RpcBlockHeader,
-    hashes: Vec<[u8; 32]>,
+    txs: TxBind,
+}
+
+/// Outcome of binding a block's transaction hashes to the sealed `transactionsRoot`.
+///
+/// `Empty` and `Omitted` both render as `[]` in `eth_getBlock*` (documented: no raw
+/// envelopes → hashes omitted, never a fabricated list), but they are *not* the same
+/// claim and must not collapse for a count or an index lookup. `Empty` proves the
+/// block has no transactions — the sealed root is the empty-trie root. `Omitted`
+/// proves nothing: the root is non-empty, so the block certainly has transactions,
+/// the upstream just declined to serve the envelopes. Answering `0x0` there, or
+/// `null` for index 0, hands a wallet an unverified claim wearing a verified method's
+/// clothes; both fail closed with `-32001` instead.
+enum TxBind {
+    Empty,
+    Omitted,
+    List(Vec<[u8; 32]>),
+}
+
+impl TxBind {
+    /// Hash list for `eth_getBlock*`: nothing to show for `Empty` or `Omitted`.
+    fn hashes(&self) -> &[[u8; 32]] {
+        match self {
+            TxBind::List(v) => v,
+            TxBind::Empty | TxBind::Omitted => &[],
+        }
+    }
 }
 
 enum ReceiptBind {
@@ -2881,11 +2982,23 @@ struct ParsedReceipt {
     tx_hash: Option<[u8; 32]>,
 }
 
+/// Overwrite every locally-known field of an upstream receipt with the verified value.
+///
+/// The receipt-level `blockHash` / `blockNumber` / `transactionIndex` were already
+/// overwritten here because an upstream must not get to name the block. The `logs[]`
+/// array was not, and it carries the same fields: only `address` / `topics` / `data`
+/// are bound by `receiptsRoot`, so a receipt that hashes correctly could still ship
+/// `logs[0].blockNumber` / `blockHash` / `transactionHash` / `logIndex` pointing at
+/// some other block or tx, and `eth_getBlockReceipts` (a *verified* method, no flag)
+/// echoed them straight to the wallet. Rebuild each log from the parsed consensus
+/// values plus the local header instead — the same shape `eth_getLogs` emits.
 fn decorate_receipt_json(
     mut v: Value,
     hdr: &RpcBlockHeader,
     index: usize,
     tx_hash: Option<[u8; 32]>,
+    logs: &[ConsensusLog],
+    first_log_index: u64,
 ) -> Value {
     if let Value::Object(map) = &mut v {
         map.insert("blockHash".into(), json!(hdr.hash.clone()));
@@ -2897,6 +3010,20 @@ fn decorate_receipt_json(
                 json!(format!("0x{}", hex::encode(h))),
             );
         }
+        let rebuilt: Vec<Value> = logs
+            .iter()
+            .enumerate()
+            .map(|(j, log)| {
+                rpc_log_json(
+                    log,
+                    hdr,
+                    tx_hash,
+                    index as u64,
+                    first_log_index.saturating_add(j as u64),
+                )
+            })
+            .collect();
+        map.insert("logs".into(), Value::Array(rebuilt));
     }
     v
 }
@@ -2960,6 +3087,16 @@ fn parse_consensus_receipt_json(v: &Value) -> Result<ParsedReceipt, String> {
         ),
         Some(_) => return Err("transactionHash not a string".into()),
     };
+    // `receiptsRoot` binds status / cumulativeGasUsed / logsBloom / type / logs and
+    // nothing else, so these five are echoed unverified. `docs/rpc-matrix.md` promises
+    // they are at least *structurally* validated; they were not, so an upstream could
+    // hand a wallet `"to": 12345` or a 4-byte `from` through a verified method.
+    // Same checks the passthrough path (`bind_mined_object`) already applies.
+    bind_optional_address(map.get("from"), "from", false)?;
+    bind_optional_address(map.get("to"), "to", true)?;
+    bind_optional_address(map.get("contractAddress"), "contractAddress", true)?;
+    bind_optional_qty(map.get("gasUsed"), "gasUsed")?;
+    bind_optional_qty(map.get("effectiveGasPrice"), "effectiveGasPrice")?;
     Ok(ParsedReceipt {
         consensus: ConsensusReceipt {
             status,
