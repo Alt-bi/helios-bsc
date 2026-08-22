@@ -5,7 +5,7 @@
 use crate::rlp_util::{encode_bytes, encode_list, encode_uint};
 use helios_bsc_config::{
     params_at, parse_extra, ExtraDataVersion, ExtraError, BOHR_TIME, DIFF_IN_TURN, DIFF_NO_TURN,
-    EXTRA_SEAL, EXTRA_VANITY, LORENTZ_TIME, MAX_TURN_LENGTH,
+    EXTRA_SEAL, EXTRA_VANITY, LONDON_BLOCK, LORENTZ_TIME, MAX_TURN_LENGTH,
 };
 use helios_bsc_types::{
     address_from_pubkey_uncompressed, decode_hex, decode_hex_fixed, decode_u64, format_address,
@@ -35,6 +35,12 @@ pub enum SealError {
     InvalidUncles,
     #[error("gasUsed {used} exceeds gasLimit {limit}")]
     InvalidGasUsed { used: u64, limit: u64 },
+    #[error("baseFeePerGas {got} must be 0 on a Parlia chain")]
+    InvalidBaseFee { got: String },
+    #[error("baseFeePerGas missing after London (block {number})")]
+    MissingBaseFee { number: u64 },
+    #[error("baseFeePerGas present before London (block {number})")]
+    UnexpectedBaseFee { number: u64 },
     #[error("gasLimit {got} exceeds 2^63-1")]
     InvalidGasLimit { got: u64 },
     #[error("invalid mixDigest (Lorentz milliseconds / pre-Lorentz zero)")]
@@ -368,6 +374,7 @@ pub fn verify_unsealed_fields(header: &RpcBlockHeader) -> Result<(), SealError> 
             limit: gas_limit,
         });
     }
+    verify_base_fee(header)?;
     let time = decode_u64(&header.timestamp)?;
     let mix = decode_hex_fixed::<32>(&header.mix_hash)?;
     if time < LORENTZ_TIME {
@@ -402,6 +409,48 @@ pub fn verify_unsealed_fields(header: &RpcBlockHeader) -> Result<(), SealError> 
     verify_timestamp_not_future(header, unix_now())?;
     verify_extra_layout(header)?;
     Ok(())
+}
+
+/// EIP-1559 `baseFeePerGas`, which on a Parlia chain is a constant, not a formula.
+///
+/// v1.7.8 `consensus/misc/eip1559/eip1559.go`:
+///
+/// ```text
+/// func CalcBaseFee(config *params.ChainConfig, parent *types.Header) *big.Int {
+///     if config.IsInBSC() {
+///         return new(big.Int).SetUint64(params.InitialBaseFeeForBSC)
+///     }
+///     ...
+/// ```
+///
+/// `IsInBSC()` is `c.Parlia != nil` and `InitialBaseFeeForBSC` is `0`, so the whole
+/// parent-dependent 1559 formula is dead code on BSC: `VerifyEIP1559Header` reduces to
+/// "present, and equal to zero". `verifyCascadingFields` pairs it with the pre-fork half:
+///
+/// ```text
+/// if !chain.Config().IsLondon(header.Number) {
+///     if header.BaseFee != nil {
+///         return fmt.Errorf("invalid baseFee before fork: have %d, expected 'nil'", header.BaseFee)
+///     }
+/// } else if err := eip1559.VerifyEIP1559Header(chain.Config(), parent, header); err != nil {
+/// ```
+///
+/// This matters because `baseFeePerGas` is inside the sealed header hash: an upstream that
+/// serves a header with a forged non-zero base fee, and whose seal therefore cannot be a
+/// real validator's, must be rejected on the field rather than only on the signature.
+pub fn verify_base_fee(header: &RpcBlockHeader) -> Result<(), SealError> {
+    let number = decode_u64(&header.number)?;
+    match header.base_fee_per_gas.as_deref() {
+        None if number >= LONDON_BLOCK => Err(SealError::MissingBaseFee { number }),
+        None => Ok(()),
+        Some(_) if number < LONDON_BLOCK => Err(SealError::UnexpectedBaseFee { number }),
+        // A value too large for `u64` is certainly not zero; report it as the wrong
+        // base fee rather than as a malformed quantity.
+        Some(raw) => match decode_u64(raw) {
+            Ok(0) => Ok(()),
+            _ => Err(SealError::InvalidBaseFee { got: raw.into() }),
+        },
+    }
 }
 
 /// Bohr+ extraData: epoch blocks must parse `n` validator records + turnLength > 0.
@@ -797,6 +846,51 @@ mod tests {
         assert!(matches!(
             verify_cascading_vs_parent(p_milli, p_gas, &gas).unwrap_err(),
             SealError::InvalidGasLimit { got: 1 } | SealError::GasLimitBound { .. }
+        ));
+    }
+
+    /// `CalcBaseFee` short-circuits to `InitialBaseFeeForBSC` (0) on any Parlia chain, so
+    /// every mainnet header carries `0x0` and anything else is a forgery.
+    #[test]
+    fn base_fee_must_be_zero_after_london() {
+        let mut h = load("header_116664001.json");
+        assert!(decode_u64(&h.number).unwrap() > LONDON_BLOCK);
+        assert_eq!(h.base_fee_per_gas.as_deref(), Some("0x0"));
+        verify_base_fee(&h).unwrap();
+
+        // The value a naive EIP-1559 port would compute: parent baseFee 0 with gasUsed
+        // above target gives `max(1, ...)` = 1. On BSC that is simply wrong.
+        h.base_fee_per_gas = Some("0x1".into());
+        assert!(matches!(
+            verify_base_fee(&h).unwrap_err(),
+            SealError::InvalidBaseFee { .. }
+        ));
+
+        // Too large for u64 is still "not zero", not "malformed quantity".
+        h.base_fee_per_gas = Some("0x10000000000000000".into());
+        assert!(matches!(
+            verify_base_fee(&h).unwrap_err(),
+            SealError::InvalidBaseFee { .. }
+        ));
+
+        h.base_fee_per_gas = None;
+        assert!(matches!(
+            verify_base_fee(&h).unwrap_err(),
+            SealError::MissingBaseFee { .. }
+        ));
+    }
+
+    #[test]
+    fn base_fee_absent_before_london() {
+        let mut h = load("header_116664001.json");
+        h.number = format!("0x{:x}", LONDON_BLOCK - 1);
+        h.base_fee_per_gas = None;
+        verify_base_fee(&h).unwrap();
+
+        h.base_fee_per_gas = Some("0x0".into());
+        assert!(matches!(
+            verify_base_fee(&h).unwrap_err(),
+            SealError::UnexpectedBaseFee { .. }
         ));
     }
 

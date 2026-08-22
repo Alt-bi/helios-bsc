@@ -336,25 +336,11 @@ impl Node {
         if self.finality_mode != FinalityMode::Fast {
             return conf_safe.clone();
         }
-        let Some((number, hash)) = snapshot.and_then(Snapshot::finalized) else {
-            return conf_safe.clone();
-        };
-        if number <= conf_safe.number {
-            return conf_safe.clone();
-        }
-        let Some(block) = chain.iter().find(|b| b.number == number && b.hash == hash) else {
-            return conf_safe.clone();
-        };
-        SafeHead {
-            number: block.number,
-            hash: format!("0x{}", hex::encode(block.hash)),
-            state_root: format!("0x{}", hex::encode(block.state_root)),
-            // These two always describe the confirmation-depth rule; `safeSource` on
-            // `helios_bsc_syncStatus` says which rule actually chose the head. Reporting
-            // a vote count here would silently retype the field.
-            distinct_sealers: conf_safe.distinct_sealers,
-            required_sealers: conf_safe.required_sealers,
-        }
+        // One definition of the rule, shared with `soak --finality fast`: the gate and
+        // the thing it gates must not be able to disagree about which head that is.
+        // `distinct_sealers` / `required_sealers` stay the confirmation-depth counts;
+        // `safeSource` on `helios_bsc_syncStatus` says which rule actually chose.
+        crate::sync::fast_finality_head(chain, snapshot, conf_safe)
     }
 
     pub fn metrics_enabled(&self) -> bool {
