@@ -2166,6 +2166,14 @@ fn call_error_rpc(e: CallError) -> (i64, String, Option<String>) {
             None,
         ),
         CallError::Invalid(msg) => (ERR_PARAMS, msg.to_string(), None),
+        // Fail-closed, not a proof failure: the upstream did nothing wrong, the local
+        // EVM simply cannot reproduce this chain precompile. Same -32001 the other
+        // "cannot answer this verifiably" cases use.
+        CallError::UnsupportedPrecompile(a) => (
+            ERR_PROOF_FAILED,
+            format!("unsupported_precompile: 0x{}", hex::encode(a)),
+            None,
+        ),
         CallError::Revert(data) => revert_rpc(&data),
         CallError::Halt(reason) => (ERR_EXECUTION, format!("execution_halt: {reason}"), None),
     }

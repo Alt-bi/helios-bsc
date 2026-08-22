@@ -90,6 +90,11 @@ pub enum CallError {
     Budget,
     #[error("invalid call: {0}")]
     Invalid(&'static str),
+    /// The chain runs a precompile at this address that the local EVM does not
+    /// implement. Executing it as an ordinary empty account would return a
+    /// plausible wrong answer, so the call is refused instead.
+    #[error("chain precompile {0:?} is not implemented by the local EVM")]
+    UnsupportedPrecompile([u8; 20]),
 }
 
 /// Untrusted proof/code source at a verified Safe block (hash + number).
@@ -191,9 +196,49 @@ impl ProofDb {
     }
 }
 
-fn is_precompile(address: Address) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrecompileKind {
+    /// Not a precompile on either side: an ordinary account, needs a proof.
+    Account,
+    /// The local revm implements it, so no account state is needed.
+    Local,
+    /// BSC runs a precompile here and the local revm does not implement it.
+    Unsupported,
+}
+
+/// Which precompile, if any, lives at `address`.
+///
+/// The local set is revm's at [`SpecId::CANCUN`], which is **exactly** `0x01..=0x0a`
+/// (asked of `Precompiles::new(PrecompileSpecId::from_spec_id(SpecId::CANCUN))` rather
+/// than assumed).
+///
+/// BSC's live set is much larger. v1.7.8 `core/vm/contracts.go`
+/// `PrecompiledContractsPrague`, which `activePrecompiledContracts` selects from Prague
+/// onwards, adds the BLS12-381 group at `0x0b..=0x11`, `0x0100` (`p256Verify`,
+/// RIP-7212), and BSC's own `0x64` `tmHeaderValidate`, `0x65`
+/// `iavlMerkleProofValidatePlato`, `0x66` `blsSignatureVerify`, `0x67`
+/// `cometBFTLightBlockValidateHertz`, `0x68` `verifyDoubleSignEvidence`, `0x69`
+/// `secp256k1SignatureRecover`.
+///
+/// Every one of those used to fall through to "ordinary account". The proof for such an
+/// address verifies as *empty*, so revm executed a `CALL` to it as a call to an account
+/// with no code — which succeeds and returns nothing. A contract asking `0x66` to check
+/// a BLS signature, or `0x0100` to check a P-256 signature, got a silent wrong answer
+/// out of a method this client calls **verified**. They are refused now.
+fn precompile_kind(address: Address) -> PrecompileKind {
     let n = address.into_array();
-    n[..19] == [0u8; 19] && (1..=0x0b).contains(&n[19])
+    // `0x0100` is the only precompile whose address needs two bytes.
+    if n[..18] == [0u8; 18] && n[18] == 0x01 && n[19] == 0x00 {
+        return PrecompileKind::Unsupported;
+    }
+    if n[..19] != [0u8; 19] {
+        return PrecompileKind::Account;
+    }
+    match n[19] {
+        0x01..=0x0a => PrecompileKind::Local,
+        0x0b..=0x11 | 0x64..=0x69 => PrecompileKind::Unsupported,
+        _ => PrecompileKind::Account,
+    }
 }
 
 fn addr_bytes(address: Address) -> [u8; 20] {
@@ -255,11 +300,18 @@ impl Database for ProofDb {
     type Error = CallError;
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        // Before the map lookup on purpose: an `eth_getProof` for `0x64` verifies as an
+        // empty account, so a seeded entry would otherwise let execution proceed as if
+        // the precompile were not there.
+        match precompile_kind(address) {
+            PrecompileKind::Unsupported => {
+                return Err(CallError::UnsupportedPrecompile(addr_bytes(address)))
+            }
+            PrecompileKind::Local => return Ok(Some(AccountInfo::default())),
+            PrecompileKind::Account => {}
+        }
         if let Some(acc) = self.accounts.get(&address) {
             return Ok(Some(acc.info.clone()));
-        }
-        if is_precompile(address) {
-            return Ok(Some(AccountInfo::default()));
         }
         Err(CallError::Missing(Miss::Account(addr_bytes(address))))
     }
@@ -457,7 +509,7 @@ fn seed_call_accounts<P: ProveAtSafe>(
     access_list_within_caps(tx)?;
     let mut seen: Vec<[u8; 20]> = Vec::with_capacity(3);
     for address in [tx.to, tx.from, block.beneficiary] {
-        if is_precompile(Address::from(address)) {
+        if precompile_kind(Address::from(address)) != PrecompileKind::Account {
             continue;
         }
         if seen.iter().any(|a| a == &address) {
@@ -499,7 +551,7 @@ fn seed_access_list<P: ProveAtSafe>(
         return Ok(());
     }
     for (address, slots) in &tx.access_list {
-        if is_precompile(Address::from(*address)) {
+        if precompile_kind(Address::from(*address)) != PrecompileKind::Account {
             continue;
         }
         fetch_and_load(prover, db, block, address, slots)?;
@@ -721,6 +773,80 @@ mod tests {
         ) -> Result<Vec<u8>, CallError> {
             Err(CallError::Missing(Miss::Account(*address)))
         }
+    }
+
+    fn precompile_addr(low: u16) -> [u8; 20] {
+        let mut a = [0u8; 20];
+        a[18..20].copy_from_slice(&low.to_be_bytes());
+        a
+    }
+
+    /// Every address BSC runs a precompile at, from v1.7.8
+    /// `PrecompiledContractsPrague` (the set `activePrecompiledContracts` selects from
+    /// Prague onwards), that revm at `SpecId::CANCUN` does not implement.
+    ///
+    /// Before the classifier these executed as ordinary empty accounts: a `CALL`
+    /// succeeded and returned nothing. `0x66` is `blsSignatureVerify` and `0x0100` is
+    /// `p256Verify` — a contract asking either "is this signature valid" got a silent
+    /// empty answer out of a *verified* method.
+    #[test]
+    fn bsc_precompiles_the_local_evm_lacks_are_refused() {
+        let unsupported: Vec<u16> = (0x0b..=0x11).chain(0x64..=0x69).chain([0x0100]).collect();
+        for low in unsupported {
+            let addr = precompile_addr(low);
+            let mut db = ProofDb::new();
+            // revm resolves the caller first; seed it so the callee is what fails.
+            db.insert_account([9u8; 20], 0, [0u8; 32], EMPTY_TRIE_ROOT, &[]);
+            let block = sample_block([0u8; 32]);
+            let err = eth_call_with_db(&mut db, &block, &call_tx([9u8; 20], addr, Vec::new()))
+                .expect_err(&format!("0x{low:x} executed instead of being refused"));
+            assert!(
+                matches!(err, CallError::UnsupportedPrecompile(a) if a == addr),
+                "0x{low:x} -> {err}"
+            );
+        }
+    }
+
+    /// A proof for a precompile address verifies as an *empty account*, so a seeded
+    /// entry must not be able to talk the EVM into running the call anyway. This is why
+    /// the classifier runs before the account map lookup.
+    #[test]
+    fn seeded_empty_account_cannot_unlock_an_unsupported_precompile() {
+        let addr = precompile_addr(0x66);
+        let mut db = ProofDb::new();
+        db.insert_account([9u8; 20], 0, [0u8; 32], EMPTY_TRIE_ROOT, &[]);
+        db.insert_account(addr, 0, [0u8; 32], EMPTY_TRIE_ROOT, &[]);
+        let block = sample_block([0u8; 32]);
+        let err = eth_call_with_db(&mut db, &block, &call_tx([9u8; 20], addr, Vec::new()))
+            .expect_err("seeded account bypassed the refusal");
+        assert!(matches!(err, CallError::UnsupportedPrecompile(_)), "{err}");
+    }
+
+    /// The ten revm implements keep working without any proof, and an ordinary
+    /// address next to the ranges is still an ordinary address.
+    #[test]
+    fn local_precompiles_need_no_proof_and_neighbours_still_do() {
+        for low in 0x01u16..=0x0a {
+            assert_eq!(
+                precompile_kind(Address::from(precompile_addr(low))),
+                PrecompileKind::Local,
+                "0x{low:x}"
+            );
+        }
+        for low in [0x00u16, 0x12, 0x13, 0x63, 0x6a, 0xff, 0x0101] {
+            assert_eq!(
+                precompile_kind(Address::from(precompile_addr(low))),
+                PrecompileKind::Account,
+                "0x{low:x}"
+            );
+        }
+        // A real contract address that merely ends in precompile-looking bytes.
+        let mut wbnb_like = [0xabu8; 20];
+        wbnb_like[19] = 0x05;
+        assert_eq!(
+            precompile_kind(Address::from(wbnb_like)),
+            PrecompileKind::Account
+        );
     }
 
     fn sample_block(state_root: [u8; 32]) -> CallBlock {
