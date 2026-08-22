@@ -41,29 +41,66 @@ Probed with `scripts/probe_eth_get_proof.py` plus a lag sweep (0 / 8 / 16 / 32 /
 
 ## Gate verdict
 
-**PARTIAL PASS (2026-08-19).** Ankr by-number proved WBNB at live Safe when lag ≤~108 after catch-up (`probe-safe` GATE PASS vs BlastAPI oracle). Soak **10 unique / 0 mismatch** vs BlastAPI (`helios-bsc soak --min-unique 10`). Neighbor-leaf proofs for unused addresses are **exclusion** (empty account), not a walker bug. BlastAPI stays oracle-only (~96). Tag-only still fails the gate.
+**PASS with `--finality fast` (2026-08-21). PARTIAL PASS on the default build.**
 
-Next (operator order from design):
+The gate had been stuck since 2026-08-19 on one number: confirmation-depth Safe needs a
+proof ~112 blocks back, and no free provider retains state that deep. BLS fast finality
+moves the head to **2 blocks**, so the requirement becomes a ~3-block window — and the
+free, keyless providers clear that easily.
 
-1. Probe **one paid** provider with archive or `debug`/`full` state (Ankr / NodeReal / QuickNode / Alchemy / Chainstack).
-2. If that also cannot prove `tip-120` by hash/number → **Alt F is mandatory** for Demo Slice.
+Measured 2026-08-21 (`scripts/sweep_proof_window.py`, then the client itself):
+
+| | Default (confirmation depth) | `run --finality fast` |
+|--|--|--|
+| Required by-number/by-hash window | ~112 blocks | **~3 blocks** |
+| `bsc-mainnet.public.blastapi.io` (free, **no key**) | **FAIL** — window ends between lag 64 and 96 | **PASS** — OK by number *and* hash at lag 0/2/3/5/8/16/32/64 |
+
+End-to-end on that free endpoint with `--finality fast`, head at `tip - 2`:
+
+- `eth_getBalance`, `eth_getStorageAt` (WBNB slot 0 → "Wrapped BNB") and `eth_call`
+  (`totalSupply`) all returned MPT-verified values.
+- Differential against **two independent blind oracles** (publicnode, meowrpc) at a pinned
+  block: **8 addresses, 8 match, 0 mismatch, 0 skip.**
+
+So Alt F (self-hosted full node) is **no longer mandatory** for a verified read, and no
+paid key is needed either — provided the operator opts into `--finality fast`. The default
+build still needs a ≥112-block window, which is why this is not a clean full PASS.
+
+Two caveats that have not changed:
+
+- **Tag-only providers still fail, at any lag.** `bsc-rpc.publicnode.com` rejects an
+  explicit block id even at the tip (`-32602 distance to target block exceeds maximum
+  proof window`). Fast finality changes the required *depth*, not whether a provider can
+  address a block at all.
+- A **rate-limited** probe is not a window verdict. `bsc-dataseed.bnbchain.org` answers
+  `limit exceeded` to every proof; that says nothing about its capability, and the sweep
+  script now reports it as inconclusive rather than as tag-only.
+
+Next:
+
+1. Re-probe the paid/keyed rows (Ankr / NodeReal / QuickNode) against the **≥3-block**
+   requirement — QuickNode free was rejected for a 5-block window that is now ample.
+2. The ≥24h differential soak, which is also the gate for making `--finality fast` the
+   default.
 
 ## What Fast Finality changes here (2026-08-21)
 
-`run --finality fast` serves reads from the BLS-finalized head, **~2 blocks** behind the
-tip instead of ~112. That changes the **depth** column, not the **addressing** column:
+**Every Pass? column in the table above was measured against the ~112-block requirement
+and is only valid for the default build.** `run --finality fast` needs ~3.
 
-- A provider now needs a by-number/by-hash window of **≥3 blocks**, not ≥112. Every row
-  that failed only on window depth — BlastAPI (~96), NodeReal (~96), even QuickNode free
-  (**5**) — is worth re-probing against this rule before concluding Alt F is mandatory.
-- **Tag-only rows are unaffected and still fail the gate.** Confirmed live with
-  `bsc-rpc.publicnode.com` under `--finality fast`: the client correctly served
-  `safe = tip - 2`, and `eth_getBalance` still returned `-32001` wrapping
-  `-32602 distance to target block exceeds maximum proof window` — that endpoint rejects
-  by-number proofs at *any* distance, including at the tip. No finality rule fixes that.
+Re-swept 2026-08-21 with `scripts/sweep_proof_window.py`, which now probes the
+fast-finality lags (0/2/3/5) alongside the deep ones and reports by-hash next to by-number:
 
-Re-probing the paid/keyed rows under the ≥3-block requirement is the next step for this
-gate; the numbers in the table above were all measured against the ~112 requirement.
+| Provider | by-number at lag ≤3 | deepest by-number | Verdict |
+|----------|--------------------|-------------------|---------|
+| `bsc-mainnet.public.blastapi.io` | **OK** (also by hash) | lag 64 OK, 96 fails | **passes `--finality fast`**, fails default |
+| `bsc-rpc.publicnode.com` | FAIL | none — fails at the tip | **tag-only**; no finality rule helps |
+| `bsc.meowrpc.com` | FAIL (`missing trie node`) | none by number | fails both; by-hash answers were inconsistent across probes, so it is load-balanced across nodes with different pruning |
+| `bsc-dataseed.bnbchain.org` | `limit exceeded` | — | **inconclusive**, rate limit not a window verdict |
+
+The rows still worth re-probing under ≥3 are the ones rejected purely on depth: NodeReal
+(~96) and especially **QuickNode free, whose 5-block window was a hard fail at 112 and is
+ample at 2**.
 
 ## Re-probe notes (2026-08-21)
 

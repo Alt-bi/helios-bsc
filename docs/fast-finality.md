@@ -196,6 +196,24 @@ That endpoint rejects proofs by number or hash at *any* distance, including at t
 no finality rule can rescue it. The matrix already records it as a gate fail for exactly
 this reason; fast finality does not change that verdict.
 
+On a provider that *does* address blocks, the change is decisive. `bsc-mainnet.public.blastapi.io`
+is free and needs no key; its proof window ends somewhere between lag 64 and 96, which is a
+hard fail at ~112 and ample at 2. Running against it with `--finality fast`, head at
+`tip - 2`:
+
+- `eth_getBalance`, `eth_getStorageAt` (WBNB slot 0 → `"Wrapped BNB"`) and `eth_call`
+  (`totalSupply`) all returned MPT-verified values.
+- Differential at a pinned block against two independent blind oracles (publicnode,
+  meowrpc): **8 addresses, 8 match, 0 mismatch, 0 skip.**
+
+That is the Phase 0 `eth_getProof` gate, which had been stuck at PARTIAL PASS on exactly
+this constraint. See [proof-provider-matrix.md](./proof-provider-matrix.md).
+
+One caveat about the differential above, because it bit me while measuring: compare at a
+**pinned block number**, never at `latest`. WBNB's balance changes every block, so two
+requests a second apart legitimately disagree — an artefact that looks exactly like a
+verification failure.
+
 It stays opt-in because changing what `latest` means to a wallet is a behavioural change,
 and the ≥24h differential soak is the gate for making it the default.
 
