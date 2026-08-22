@@ -298,6 +298,9 @@ impl Snapshot {
         let Some(att) = decode_vote_attestation(raw)? else {
             return Ok(None);
         };
+        // Before anything that depends on local state, as in geth: this one holds even
+        // when the vote keys are unknown and every check below is skipped.
+        att.data.source_below_target()?;
         let set = self.attestation_set(att.data.target_number);
         if set.is_empty() {
             return Ok(None);

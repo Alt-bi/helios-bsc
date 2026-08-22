@@ -36,6 +36,9 @@ pub enum VoteError {
     Rlp(&'static str),
     #[error("too large extra length: {len} > {MAX_ATTESTATION_EXTRA_LEN}")]
     ExtraTooLong { len: usize },
+    // Not named `source`: thiserror reserves that field name for an error cause.
+    #[error("attestation source {from_block} is not below its target {to_block}")]
+    SourceNotBelowTarget { from_block: u64, to_block: u64 },
     #[error("vote number larger than validators number: {voted} > {validators}")]
     VoteNumberLargerThanValidators { voted: usize, validators: usize },
     #[error("vote address set has bit {index} set but only {validators} validators exist")]
@@ -70,6 +73,29 @@ pub struct VoteData {
 }
 
 impl VoteData {
+    /// Step 1 of `verifyVoteAttestation`:
+    ///
+    /// ```text
+    /// if attestation.Data.SourceNumber >= attestation.Data.TargetNumber {
+    ///     return errors.New("invalid attestation, SourceNumber not lower than TargetNumber")
+    /// }
+    /// ```
+    ///
+    /// geth checks this before it consults the chain at all, so it holds even where this
+    /// client has no justified block to compare the source against — which is exactly the
+    /// window just after a checkpoint, where [`Snapshot::check_attestation`]'s source
+    /// check is silent. Finality is defined by `source < target`; a pair that violates it
+    /// describes nothing.
+    pub fn source_below_target(&self) -> Result<(), VoteError> {
+        if self.source_number >= self.target_number {
+            return Err(VoteError::SourceNotBelowTarget {
+                from_block: self.source_number,
+                to_block: self.target_number,
+            });
+        }
+        Ok(())
+    }
+
     /// `VoteData.Hash()` = `rlpHash(d)` — this, not the header hash, is the signed message.
     pub fn hash(&self) -> [u8; 32] {
         keccak256(&encode_list(&[
@@ -369,6 +395,38 @@ fn fixed_str<const N: usize>(raw: &[u8], what: &'static str) -> Result<[u8; N], 
 
 #[cfg(test)]
 mod tests {
+    /// geth runs this before it consults the chain, which matters here: just after a
+    /// checkpoint there is no justified block, so `check_attestation`'s source comparison
+    /// is silent and this is the only thing standing between the client and a vote whose
+    /// range runs backwards.
+    #[test]
+    fn source_must_be_below_target() {
+        let data = |s: u64, t: u64| super::VoteData {
+            source_number: s,
+            source_hash: [1u8; 32],
+            target_number: t,
+            target_hash: [2u8; 32],
+        };
+        data(9, 10)
+            .source_below_target()
+            .expect("a source one below its target is the ordinary case");
+        assert_eq!(
+            data(10, 10).source_below_target().unwrap_err(),
+            super::VoteError::SourceNotBelowTarget {
+                from_block: 10,
+                to_block: 10
+            },
+            "equal is not below"
+        );
+        assert_eq!(
+            data(11, 10).source_below_target().unwrap_err(),
+            super::VoteError::SourceNotBelowTarget {
+                from_block: 11,
+                to_block: 10
+            }
+        );
+    }
+
     use super::*;
     use helios_bsc_config::{parse_extra, ExtraDataVersion};
     use helios_bsc_types::{decode_hex, decode_hex_fixed, decode_u64, RpcBlockHeader};
