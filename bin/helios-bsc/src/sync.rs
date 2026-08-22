@@ -165,18 +165,74 @@ pub fn catch_up(
 ///
 /// Live Safe lag jitters ~106–112 vs Ankr ~108; a short wait often recovers a window
 /// that a slow header walk just missed. Does **not** lower the 15-sealer threshold.
+/// Head that reads resolve to under `--finality fast`, or `conf_safe` unchanged.
+///
+/// Single definition of the rule, shared by the RPC server and the soak so the soak
+/// actually exercises the mode it is the gate for. Three conditions, all necessary:
+///
+/// * the snapshot must carry a BLS-finalized head at all (no vote keys ⇒ none),
+/// * it must be **newer** than confirmation depth, so enabling fast finality can never
+///   move reads backwards — both are complete finality rules, so the newer of the two is
+///   final under at least one of them either way,
+/// * and it must name a block **in the local verified chain**. An attestation pointing at
+///   a block this client never walked is an upstream's word, not a head.
+///
+/// `distinct_sealers` / `required_sealers` are carried over from `conf_safe` on purpose:
+/// they describe the confirmation-depth rule, and retyping them into vote counts would
+/// silently change what those fields mean.
+pub fn fast_finality_head(
+    chain: &[VerifiedBlock],
+    snapshot: Option<&Snapshot>,
+    conf_safe: &SafeHead,
+) -> SafeHead {
+    let Some((number, hash)) = snapshot.and_then(Snapshot::finalized) else {
+        return conf_safe.clone();
+    };
+    if number <= conf_safe.number {
+        return conf_safe.clone();
+    }
+    let Some(block) = chain.iter().find(|b| b.number == number && b.hash == hash) else {
+        return conf_safe.clone();
+    };
+    SafeHead {
+        number: block.number,
+        hash: format!("0x{}", hex::encode(block.hash)),
+        state_root: format!("0x{}", hex::encode(block.state_root)),
+        distinct_sealers: conf_safe.distinct_sealers,
+        required_sealers: conf_safe.required_sealers,
+    }
+}
+
 pub fn wait_until_in_window(
+    up: &dyn RpcUpstream,
+    chain: &mut Vec<VerifiedBlock>,
+    lookback: u64,
+    max_sync: u64,
+    snapshot: Option<&mut Snapshot>,
+    timeout: Duration,
+) -> Result<(u64, SafeHead)> {
+    wait_until_in_window_with(up, chain, lookback, max_sync, snapshot, timeout, false)
+}
+
+/// `fast` selects the BLS-finalized head when one is usable; see [`fast_finality_head`].
+pub fn wait_until_in_window_with(
     up: &dyn RpcUpstream,
     chain: &mut Vec<VerifiedBlock>,
     lookback: u64,
     max_sync: u64,
     mut snapshot: Option<&mut Snapshot>,
     timeout: Duration,
+    fast: bool,
 ) -> Result<(u64, SafeHead)> {
     let deadline = Instant::now() + timeout;
     loop {
         let tip = catch_up(up, chain, lookback, max_sync, snapshot.as_deref_mut())?;
-        let safe = safe_of(chain)?;
+        let conf_safe = safe_of(chain)?;
+        let safe = if fast {
+            fast_finality_head(chain, snapshot.as_deref(), &conf_safe)
+        } else {
+            conf_safe
+        };
         let lag = proof_lag(tip, safe.number);
         if lag <= PROVIDER_PROOF_LOOKBACK {
             return Ok((tip, safe));

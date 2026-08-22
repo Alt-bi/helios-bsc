@@ -11,7 +11,7 @@ use helios_bsc::rpc_server::{self, FinalityMode, Node};
 use helios_bsc::sync::{
     checkpoint_policy, confirm_checkpoint_with_oracle, doctor_checkpoint_line, env_host_line,
     env_independence_line, independent_rpc_hosts, rpc_host, safe_of, wait_until_in_window,
-    walk_from_checkpoint, walk_headers, write_checkpoint_file,
+    wait_until_in_window_with, walk_from_checkpoint, walk_headers, write_checkpoint_file,
 };
 use helios_bsc::upstream::{open_data_plane, RpcUpstream, Upstream};
 use helios_bsc_config::{
@@ -205,6 +205,10 @@ enum Commands {
         /// If >0, keep soaking until this many seconds (1h = 3600) even after min-unique.
         #[arg(long, default_value_t = 0)]
         duration_secs: u64,
+        /// Which head to soak: confirmation depth (default) or the BEP-126 BLS
+        /// finalized head that `run --finality fast` serves.
+        #[arg(long, value_enum, default_value_t = FinalityArg::ConfirmationDepth)]
+        finality: FinalityArg,
     },
     /// Check a checkpoint file against upstream (and optional oracle). No header walk.
     VerifyCheckpoint {
@@ -369,6 +373,7 @@ async fn main() -> Result<()> {
             burst,
             pause,
             duration_secs,
+            finality,
         } => soak(SoakArgs {
             upstream: &upstream,
             backup: backup.as_deref(),
@@ -387,6 +392,7 @@ async fn main() -> Result<()> {
             burst,
             pause,
             duration_secs,
+            fast_finality: finality == FinalityArg::Fast,
         }),
         Commands::VerifyCheckpoint {
             checkpoint,
@@ -818,6 +824,9 @@ fn probe_safe(args: ProbeSafeArgs<'_>) -> Result<()> {
                 lookback,
                 max_sync,
                 visit_all: false,
+                // probe-safe reports the confirmation-depth Safe above; diff the
+                // same head so the two numbers cannot disagree.
+                fast_finality: false,
             },
             &mut done,
         )?;
@@ -855,6 +864,8 @@ struct SoakArgs<'a> {
     burst: usize,
     pause: f64,
     duration_secs: u64,
+    /// Soak the head that `--finality fast` would serve, not confirmation depth.
+    fast_finality: bool,
 }
 
 struct SoakUntilOpts {
@@ -866,6 +877,8 @@ struct SoakUntilOpts {
     max_sync: u64,
     /// Re-diff every address once (duration soak after unique is full).
     visit_all: bool,
+    /// Compare at the BLS-finalized head instead of confirmation depth.
+    fast_finality: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -901,13 +914,14 @@ fn soak_until(
     let mut report = SoakReport::default();
     let mut empty = 0u32;
     while !pending.is_empty() && done.len() < unique_cap {
-        let (tip, safe) = match wait_until_in_window(
+        let (tip, safe) = match wait_until_in_window_with(
             up,
             chain,
             opts.lookback,
             opts.max_sync,
             snapshot.as_deref_mut(),
             Duration::from_secs(20),
+            opts.fast_finality,
         ) {
             Ok(v) => v,
             Err(e) => {
@@ -1102,6 +1116,7 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
                 lookback: args.lookback,
                 max_sync: args.max_sync,
                 visit_all,
+                fast_finality: args.fast_finality,
             },
             &mut done,
         )?;
