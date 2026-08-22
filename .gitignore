@@ -15,3 +15,6 @@ req.json
 *.pyc
 # Grant application drafts — never publish
 docs/grant/
+
+# local agent/tooling state — never publish
+.claude/
