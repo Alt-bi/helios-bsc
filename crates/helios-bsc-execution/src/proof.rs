@@ -24,6 +24,8 @@ pub enum ProofError {
     TooManyNodes,
     #[error("proof node too large")]
     NodeTooLarge,
+    #[error("too many storageProof entries")]
+    TooManyStorageEntries,
 }
 
 /// EIP-1186 proofs on BSC are ~8–12 nodes; 32 is a DoS cap, not a protocol constant.
@@ -32,6 +34,14 @@ pub const MAX_PROOF_NODES: usize = 32;
 pub const MAX_PROOF_NODE_BYTES: usize = 16 * 1024;
 /// geth `params.MaxCodeSize`.
 pub const MAX_CODE_SIZE: usize = 24_576;
+/// Max `storageProof[]` entries accepted in one `eth_getProof` response.
+///
+/// Nothing in this workspace ever asks for more than
+/// [`crate::MAX_PROOF_STORAGE_KEYS`] keys, so a longer array is a lying
+/// upstream. It is also a hard DoS bound: `load_proven_account` verifies every
+/// entry and each verification scans the array, so an uncapped response is
+/// quadratic work driven entirely by the untrusted RPC.
+pub const MAX_PROOF_STORAGE_ENTRIES: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -93,6 +103,9 @@ pub fn verify_eth_get_proof(
     }
     if proof.account_proof.len() > MAX_PROOF_NODES {
         return Err(ProofError::TooManyNodes);
+    }
+    if proof.storage_proof.len() > MAX_PROOF_STORAGE_ENTRIES {
+        return Err(ProofError::TooManyStorageEntries);
     }
     for sp in &proof.storage_proof {
         if sp.proof.len() > MAX_PROOF_NODES {
@@ -188,29 +201,43 @@ pub fn encode_data32(bytes: &[u8]) -> String {
     format!("0x{}", hex::encode(pad32(bytes)))
 }
 
+/// The 32-byte slot a `storageProof[].key` (or a requested key) denotes.
+///
+/// `None` for anything that is not a hex quantity of at most 32 bytes — an
+/// over-long key must not alias a requested slot via [`pad32`] truncation.
+fn slot_of_key(s: &str) -> Option<[u8; 32]> {
+    let raw = decode_qty(s).ok()?;
+    if raw.len() > 32 {
+        return None;
+    }
+    Some(pad32(&raw))
+}
+
 /// Drop storageProof entries the caller did not request (and drop all if `keys` is empty).
+///
+/// At most one entry survives per requested slot, and it is the *first* match —
+/// the same entry [`verify_storage_slot`] verifies. Without that, an upstream
+/// could append a second entry for an already-verified key carrying a forged
+/// `value`, and it would ride out in the response unchecked.
 pub fn retain_requested_storage(proof: &mut EthAccountProof, keys: &[String]) {
     if keys.is_empty() {
         proof.storage_proof.clear();
         return;
     }
-    let want: Vec<[u8; 32]> = keys
-        .iter()
-        .filter_map(|k| {
-            let raw = hexutil::strip_0x(k);
-            let even = if raw.len() % 2 == 1 {
-                format!("0{raw}")
-            } else {
-                raw.to_string()
-            };
-            hex::decode(even).ok().map(|b| pad32(&b))
-        })
-        .collect();
+    let want: Vec<[u8; 32]> = keys.iter().filter_map(|k| slot_of_key(k)).collect();
+    let mut taken = vec![false; want.len()];
+    // `Vec::retain` visits in order, so the first match for a slot is the keeper.
     proof.storage_proof.retain(|e| {
-        decode_qty(&e.key)
-            .ok()
-            .map(|k| want.iter().any(|w| pad32(&k) == *w))
-            .unwrap_or(false)
+        let Some(slot) = slot_of_key(&e.key) else {
+            return false;
+        };
+        match want.iter().position(|w| *w == slot) {
+            Some(i) if !taken[i] => {
+                taken[i] = true;
+                true
+            }
+            _ => false,
+        }
     });
 }
 

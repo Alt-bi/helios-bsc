@@ -260,6 +260,39 @@ mod tests {
         );
     }
 
+    /// `n` nested single-element lists — the cheapest way to drive recursion.
+    fn nested_lists(n: usize) -> Vec<u8> {
+        let mut cur = vec![0xc0u8];
+        for _ in 0..n {
+            let len = cur.len();
+            let mut out = Vec::with_capacity(len + 9);
+            if len <= 55 {
+                out.push(0xc0 + len as u8);
+            } else {
+                let be = (len as u64).to_be_bytes();
+                let start = be.iter().position(|&b| b != 0).unwrap_or(7);
+                out.push(0xf7 + (8 - start) as u8);
+                out.extend_from_slice(&be[start..]);
+            }
+            out.extend_from_slice(&cur);
+            cur = out;
+        }
+        cur
+    }
+
+    /// Before the RLP depth cap this aborted the process with a stack overflow
+    /// (`STATUS_STACK_OVERFLOW` / SIGSEGV) — not a catchable panic — from a
+    /// single `eth_sendRawTransaction` body well under [`MAX_RAW_TX`].
+    #[test]
+    fn deeply_nested_raw_tx_is_rejected_not_a_stack_overflow() {
+        let raw = nested_lists(100_000);
+        assert!(raw.len() <= MAX_RAW_TX, "input len {}", raw.len());
+        assert_eq!(
+            validate_bsc_raw_tx(&raw).unwrap_err(),
+            RawTxError::InvalidRlp
+        );
+    }
+
     #[test]
     fn unsigned_typed_rejected() {
         let mut raw = dummy_eip1559(56);
