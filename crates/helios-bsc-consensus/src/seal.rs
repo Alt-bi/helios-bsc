@@ -312,7 +312,7 @@ pub fn ecrecover(digest: &[u8; 32], seal: &[u8]) -> Result<[u8; 20], SealError> 
         .map_err(|e| SealError::Recover(e.to_string()))?;
     let msg = Message::from_digest(*digest);
     let pk = SECP256K1
-        .recover_ecdsa(&msg, &sig)
+        .recover_ecdsa(msg, &sig)
         .map_err(|e| SealError::Recover(e.to_string()))?;
     address_from_pubkey_uncompressed(&pk.serialize_uncompressed()).map_err(SealError::from)
 }
