@@ -122,9 +122,10 @@ the finalized head sits a small constant number of blocks behind the tip rather 
 | `Extra` length | **0** bytes on every block (cap 256) |
 
 So the finalized head sits **2 blocks** behind the tip against **106–112** for
-confirmation depth — a ~53–56x reduction in distance-to-tip, and comfortably inside every
-`eth_getProof` provider window in [proof-provider-matrix.md](./proof-provider-matrix.md)
-rather than at the knife-edge of the tightest one.
+confirmation depth — a ~53–56x reduction in distance-to-tip. For `eth_getProof` that
+relaxes the required **window depth** from ~112 blocks to ~3; it does not relax the
+requirement that a provider serve proofs **by number or hash at all**. See
+[below](#what-this-does-and-does-not-fix-for-eth_getproof).
 
 Two caveats worth keeping in view:
 
@@ -154,8 +155,49 @@ python scripts/verify_attestations.py --rpc https://bsc-dataseed.bnbchain.org --
 | Justified / finalized tracking | `snapshot.rs` `justified()` / `finalized()` | **Done** |
 | Vote keys carried in the checkpoint | `helios-bsc-types`, `write-checkpoint --sealing-set-from-epoch` | **Done** |
 | Exposed on `helios_bsc_syncStatus` + `/metrics` | `bin/helios-bsc/src/rpc_server.rs` | **Done** |
-| `finalized` block tag served from BLS finality | — | **Not done** — the tag still resolves to the confirmation-depth Safe head. Changing what a wallet-visible tag means is a behavioural change that wants its own soak, not a side effect of this module. |
-| Maxwell BEP-524 `recents` prune to the finalized head | — | **Not done** |
+| `latest` / `safe` / `finalized` served from BLS finality | `run --finality fast` | **Done, opt-in.** Default is unchanged confirmation depth; the ≥24h soak is the gate for flipping it. |
+| Maxwell BEP-524 `recents` prune to the finalized head | `snapshot.rs` `prune_recents_to_finalized` | **Done** |
+
+## Serving reads from the finalized head
+
+`run --finality fast` makes `latest` / `safe` / `finalized` — and the ceiling on
+historical reads — resolve to the BLS-finalized head rather than the confirmation-depth
+Safe head. Three rules keep that from being a downgrade:
+
+- **Never a block we did not verify.** The finalized head is used only when the
+  attestation's `(number, hash)` matches a block already in the local verified chain. An
+  attestation naming a block this client never walked is an upstream's word, not a head.
+- **Never backwards.** If BLS finality stalls behind confirmation depth, tags stay on the
+  confirmation-depth head. Both are complete finality rules, so taking the newer of the
+  two means the head is final under at least one of them either way — enabling the flag
+  can only make reads fresher.
+- **Never silently.** `helios_bsc_syncStatus.safeSource` says which rule chose the current
+  head, and `distinctSealers` / `requiredSealers` keep describing confirmation depth
+  rather than being retyped into vote counts.
+
+### What this does and does not fix for `eth_getProof`
+
+It changes the **depth** a provider must retain, not the **addressing mode** it supports.
+A proof at ~2 blocks needs a by-number/by-hash window of ≥3 blocks where ~112 was needed
+before — which brings the shallow-window providers in
+[proof-provider-matrix.md](./proof-provider-matrix.md) into range, including ones whose
+window is far too small for confirmation depth.
+
+It does **not** help a **tag-only** provider. Measured 2026-08-21: with
+`bsc-rpc.publicnode.com` and `--finality fast`, `helios_bsc_syncStatus` correctly showed
+`safe = tip - 2`, and `eth_getBalance` still failed:
+
+```text
+-32001 proof_verification_failed: by-number: rpc error:
+  {"code":-32602,"message":"distance to target block exceeds maximum proof window"}
+```
+
+That endpoint rejects proofs by number or hash at *any* distance, including at the tip, so
+no finality rule can rescue it. The matrix already records it as a gate fail for exactly
+this reason; fast finality does not change that verdict.
+
+It stays opt-in because changing what `latest` means to a wallet is a behavioural change,
+and the ≥24h differential soak is the gate for making it the default.
 
 ## Trust model
 

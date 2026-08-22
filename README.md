@@ -52,6 +52,10 @@ cargo run -p helios-bsc -- probe-safe --upstream %HELIOS_BSC_UPSTREAM% --oracle 
 cargo run -p helios-bsc -- run --listen 127.0.0.1:8545
 # Optional transport failover (still untrusted): --backup $HELIOS_BSC_BACKUP
 # Optional Prometheus metrics on GET /metrics (off by default): --metrics
+# Optional BEP-126 BLS finality for latest/safe/finalized (~2 blocks behind tip
+# instead of ~110). Falls back to confirmation depth when no finalized head is
+# known. Needs a checkpoint written with --sealing-set-from-epoch (vote keys):
+#   --finality fast
 
 # Optional: sealing-set membership (does not invent validators from recent miners)
 cargo run -p helios-bsc -- write-checkpoint --block 0x… --sealing-set 0xabc,0xdef,… --out checkpoint.json

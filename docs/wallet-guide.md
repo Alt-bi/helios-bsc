@@ -14,10 +14,12 @@ Custom RPC URL: `http://127.0.0.1:8545` · chainId **56**.
 | What the client asks | What helios-bsc serves |
 |----------------------|------------------------|
 | `latest` / `eth_blockNumber` | **Safe** — newest block with ≥15 distinct subsequent sealers |
-| `safe` / `finalized` | Same Safe head (MVP-1; Fast Finality not verified) |
+| `safe` / `finalized` | Same Safe head by default. Fast Finality **is** verified (BLS, `docs/fast-finality.md`), but the tags move to the BLS-finalized head only under opt-in `run --finality fast`; otherwise read `helios_bsc_syncStatus` for it |
 | Exact number/hash | Local verified header with `n ≤ Safe` (same as `eth_getBlockByNumber`; `latest` still maps to Safe) |
 
 Safe lag on mainnet is ~106–112 blocks (~50s), not “the last mined block”.
+
+**Fast Finality (BEP-126).** The client verifies the BLS vote attestation in each sealed header and tracks a justified and a finalized head, measured **2 blocks** behind the tip on live mainnet — the observed norm over 120 consecutive headers in a healthy period, not a guaranteed bound. By default it is **reported, not served**: `latest` / `safe` / `finalized` stay on the confirmation-depth Safe head, and `run --finality fast` is the opt-in switch that points them at the BLS-finalized head instead (falling back to confirmation depth whenever no finalized head is known). A wallet on the default reads `helios_bsc_syncStatus` → `finality` (`fast-finality` vs `confirmation-depth`), `finalizedBlock` / `finalizedHash`, `finalizedLagBlocks`, `justifiedBlock` / `justifiedLagBlocks`, and `finalityHead` (the verified head the lags are measured against). The fields are `null` and `finality` stays `confirmation-depth` until the client has BLS vote keys — write the checkpoint with `write-checkpoint --sealing-set-from-epoch` to carry them; it never guesses a key. Details: `docs/fast-finality.md`.
 
 ## Methods
 
@@ -27,7 +29,9 @@ Safe lag on mainnet is ~106–112 blocks (~50s), not “the last mined block”.
 
 **Unverified opt-in** (`run --allow-unverified-passthrough`): receipts / tx-by-hash **header-bound to Safe** and to the requested 32-byte hash; `eth_gasPrice` / `eth_maxPriorityFeePerGas` / `eth_blobBaseFee` hex quantities; `eth_feeHistory` object (`oldestBlock` if present is a local verified header ≤ Safe). Default is `-32601`.
 
-**Unsupported (no index / no keys / later):** `eth_getLogs`, filters, `eth_subscribe`, `eth_sendTransaction`, `eth_sign*`, `personal_*`, `debug_*`, `txpool_*`. Fast Finality is **not** implemented.
+**`eth_getLogs` is supported for a single block only** — `fromBlock == toBlock`, or `blockHash`; a range is `-32602`. Logs come from receipts bound to the sealed `receiptsRoot`, never from an upstream `eth_getLogs`.
+
+**Unsupported (no index / no keys / later):** log **ranges**, filters, `eth_subscribe`, `eth_sendTransaction`, `eth_sign*`, `personal_*`, `debug_*`, `txpool_*`. Fast Finality **is** implemented and verified, but exposes **no new RPC method** — it adds fields to `helios_bsc_syncStatus` and, under opt-in `run --finality fast`, changes which head the existing tags resolve to (see Tags above).
 
 There is **no silent passthrough**. Unsupported or unverified-without-flag methods hard-error.
 
@@ -35,4 +39,4 @@ There is **no silent passthrough**. Unsupported or unverified-without-flag metho
 
 Verified reads need `eth_getProof` at Safe (by **number**, then hash). Free Ankr is ~108–112 blocks and ~3 proofs/burst. If `helios_bsc_syncStatus.inProofWindow` is false or balances return `-32001`, swap to a deeper RPC — do not lower the 15-sealer rule.
 
-`helios_bsc_syncStatus` / `helios_bsc_getVerificationStatus` expose tip, Safe, lag, and `finality=confirmation-depth`.
+`helios_bsc_syncStatus` / `helios_bsc_getVerificationStatus` expose tip, Safe, lag, and `finality` — `confirmation-depth`, or `fast-finality` once a valid BLS attestation has been verified, alongside the `finalized*` / `justified*` fields above. `finality` describes what the client has **verified**, not which head the tags serve — that stays the confirmation-depth Safe head unless you pass `--finality fast`.

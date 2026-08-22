@@ -48,6 +48,23 @@ Next (operator order from design):
 1. Probe **one paid** provider with archive or `debug`/`full` state (Ankr / NodeReal / QuickNode / Alchemy / Chainstack).
 2. If that also cannot prove `tip-120` by hash/number → **Alt F is mandatory** for Demo Slice.
 
+## What Fast Finality changes here (2026-08-21)
+
+`run --finality fast` serves reads from the BLS-finalized head, **~2 blocks** behind the
+tip instead of ~112. That changes the **depth** column, not the **addressing** column:
+
+- A provider now needs a by-number/by-hash window of **≥3 blocks**, not ≥112. Every row
+  that failed only on window depth — BlastAPI (~96), NodeReal (~96), even QuickNode free
+  (**5**) — is worth re-probing against this rule before concluding Alt F is mandatory.
+- **Tag-only rows are unaffected and still fail the gate.** Confirmed live with
+  `bsc-rpc.publicnode.com` under `--finality fast`: the client correctly served
+  `safe = tip - 2`, and `eth_getBalance` still returned `-32001` wrapping
+  `-32602 distance to target block exceeds maximum proof window` — that endpoint rejects
+  by-number proofs at *any* distance, including at the tip. No finality rule fixes that.
+
+Re-probing the paid/keyed rows under the ≥3-block requirement is the next step for this
+gate; the numbers in the table above were all measured against the ~112 requirement.
+
 ## Re-probe notes (2026-08-21)
 
 Two traps that cost time when re-running this matrix — neither is a client bug:

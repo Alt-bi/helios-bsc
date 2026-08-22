@@ -5,7 +5,7 @@
 | **Document** | BSC Verified Local JSON-RPC (Parlia Light Client) |
 | **Author** | helios-bsc maintainers |
 | **Date** | 2026-08-21 |
-| **Status** | **Active** — Demo Slice closed; MVP-1 methods+docs in tree; 24h soak remains the GA live gate; MVP-2 constrained `eth_call` + best-effort `eth_estimateGas` in tree (FF still open) |
+| **Status** | **Active** — Demo Slice closed; MVP-1 methods+docs in tree; 24h soak remains the GA live gate; MVP-2 constrained `eth_call` + best-effort `eth_estimateGas` in tree; **Fast Finality BLS verified** (`docs/fast-finality.md`) — block tags still serve the confirmation-depth Safe head by default (`run --finality fast` is opt-in, unsoaked) |
 | **Working name** | **helios-bsc** (crate/binary: `helios-bsc`) |
 | **License** | Dual Apache-2.0 OR MIT |
 | **Repo** | https://github.com/Alt-bi/helios-bsc |
@@ -21,7 +21,7 @@ Operators want wallet-like JSON-RPC on BNB Smart Chain—balances, `eth_call`, r
 
 This document proposes an open-source Rust binary that (1) maintains a minimal verified view of Parlia headers / validator set / finality, (2) serves a local JSON-RPC (`:8545`-style) that **cryptographically verifies** account and storage results against a verified `stateRoot`, and (3) clearly labels methods as **verified**, **unverified passthrough**, or **unsupported**. Upstream RPCs remain required as *data sources*; trust in them is minimized by verification, not eliminated as a networking dependency.
 
-**MVP split:** **MVP-1** = seals + epochs + confirmation-depth + verified state reads (no FF dependency). **MVP-2** = Fast Finality when Phase 0 proves public RPC vote data is verifiable. **Demo Slice** = thinnest vertical (checkpoint → seals → epoch delay → confirmation-depth → verified `eth_getBalance`) as the first staffing reality check.
+**MVP split:** **MVP-1** = seals + epochs + confirmation-depth + verified state reads (no FF dependency). **MVP-2** = Fast Finality — the Phase 0 question is **answered**: the vote attestation rides inside the sealed header, so ordinary public `eth_getBlockByNumber` carries verifiable aggregates and BLS verification is in tree ([fast-finality.md](./fast-finality.md)). **Demo Slice** = thinnest vertical (checkpoint → seals → epoch delay → confirmation-depth → verified `eth_getBalance`) as the first staffing reality check.
 
 This is a **long R&D / open-source track** (months of part-time work), not a weekend drop-in for every wallet.
 
@@ -58,7 +58,7 @@ BSC Parlia:
 2. **Elected pool vs sealing set:** ~**45 elected active** validators (21 Cabinet + 24 Candidates); each epoch only **N_seal ≈ 21 consensus validators** produce/seal blocks (typically 18 Cabinet + 3 Candidates). Confirmation-depth math uses **N_seal**, not 45.
 3. **Epoch blocks** embed the validator set in `extraData` for light clients. **Current mainnet epoch length = 1000 blocks (post-Maxwell)**; historical values include 200 then 500—treat those as legacy only. Activation of the new set is **delayed by N_seal/2 blocks** so a single dishonest epoch sealer cannot immediately rewrite the light-client view without subsequent seals.
 4. **Validator set source of truth** for full nodes is system contract `BSCValidatorSet` at `0x000…1000`; light clients cannot re-execute that contract continuously without state proofs—they rely on epoch `extraData` plus the delay rule.
-5. **Fast Finality** (Plato / BEP-126+) adds BLS vote aggregation aiming for ~1s finality when ≥⅔ of the **vote/consensus set** vote (`ceil(2×N_vote/3)` / BEP-126). Public JSON-RPC exposure of verifiable aggregates is **unproven for MVP**—see MVP-1 vs MVP-2. Fallback: probabilistic confirmations waiting for **>⅔ distinct ECDSA sealers** from the epoch sealing set (**`floor(2×N_seal/3)+1`**, e.g. **15 for N_seal=21**).
+5. **Fast Finality** (Plato / BEP-126+) adds BLS vote aggregation aiming for ~1s finality when ≥⅔ of the **vote/consensus set** vote (`ceil(2×N_vote/3)` / BEP-126 → **14 of 21** live). Public JSON-RPC exposure of verifiable aggregates is **proven**: the attestation is embedded in the sealed `extraData`, so a plain `eth_getBlockByNumber` carries it and no full node is needed ([fast-finality.md](./fast-finality.md)). Measured on mainnet, the finalized head sat **2 blocks** behind the tip — an observed norm over 120 consecutive headers in a healthy period, **not** a proven bound. Fallback (and still what block tags resolve to by default): probabilistic confirmations waiting for **>⅔ distinct ECDSA sealers** from the epoch sealing set (**`floor(2×N_seal/3)+1`**, e.g. **15 for N_seal=21**).
 
 Honest conclusion: **execution-proof reuse is high; consensus path is a new Parlia module; sync cost is fundamentally different from Helios.**
 
@@ -85,7 +85,7 @@ Honest conclusion: **execution-proof reuse is high; consensus path is a new Parl
 
 #### MVP-2 (after Demo Slice / when data available)
 
-7. Fast Finality BLS verification when Phase 0 fixtures prove RPC fields suffice.
+7. Fast Finality BLS verification — **in tree.** RPC fields do suffice: the attestation is inside the sealed header. Aggregate verify via `blst` (min_pk) against the epoch vote keys; quorum `ceil(2N/3)` = 14 of 21. See [fast-finality.md](./fast-finality.md).
 8. Constrained `eth_call` / best-effort `eth_estimateGas` (historically large; deferred past Demo Slice). **In tree:** Safe-only revm + iterative proofs; estimateGas is proof-backed binary search (best-effort; gas is not consensus).
 
 ### Non-Goals (explicit)
@@ -125,7 +125,7 @@ Honest conclusion: **execution-proof reuse is high; consensus path is a new Parl
 
 ### MVP-2 DoD (optional track)
 
-- [ ] FF verification feature-flagged; enabled only when fixtures + live RPC expose verifiable aggregates.
+- [x] FF verification gated on **data, not a build flag**: it engages only once BLS vote keys are known (checkpoint `--sealing-set-from-epoch`, or an ingested epoch header); without them the client stays on confirmation depth and never guesses a key. Verifies the real signatures on five mainnet fixture headers, and ran live 2026-08-21 (`finality=fast-finality`, `finalizedLagBlocks=2`). Block tags still resolve to the confirmation-depth Safe head **by default**; `run --finality fast` opts into serving them from the BLS-finalized head and stays opt-in until the ≥24h soak covers it. See [fast-finality.md](./fast-finality.md).
 - [x] Constrained `eth_call` with gas/proof budgets; estimateGas explicitly best-effort.
 
 ---
@@ -169,11 +169,11 @@ flowchart LR
 | Dimension | Helios (ETH) | helios-bsc (proposed) |
 |-----------|--------------|------------------------|
 | Consensus root of trust | Weak subjectivity beacon checkpoint | Weak subjectivity **Parlia checkpoint** (block hash + number + **sealing** validator set) |
-| Ongoing consensus proof | Sync committee BLS (≥⅔ of 512) | Header **ECDSA seals** by epoch **sealing set (N_seal≈21)** + optional FF BLS (MVP-2) |
+| Ongoing consensus proof | Sync committee BLS (≥⅔ of 512) | Header **ECDSA seals** by epoch **sealing set (N_seal≈21)** + **FF BLS aggregate** over the same set (in tree; needs vote keys) |
 | Committee size / churn | 512 random, ~27h | **45 elected** / **21 seal per epoch**; epoch length **1000** blocks post-Maxwell; N_seal/2 activation delay |
-| Consensus data API | Beacon light-client REST | Standard `eth_getBlockByNumber/Hash` (+ FF fields when available — MVP-2) |
+| Consensus data API | Beacon light-client REST | Standard `eth_getBlockByNumber/Hash` — the FF attestation needs **no extra RPC surface**, it is inside the sealed `extraData` |
 | Execution proofs | `eth_getProof` vs verified `stateRoot` | Same pattern; **Demo Slice requires hash/number proofs or Alt F** (tag-only insufficient for Safe lag) |
-| Finality | Beacon finalized checkpoints | **MVP-1:** confirmation-depth **`floor(2×N_seal/3)+1`** distinct sealers (=15 for 21). **Live:** turnLength=**8**, Safe lag **~106–112** / proof window **112** (`STATUS.md`; ~50s @ 0.45s). **Historical example:** ~1–2 min @ turnLength≈16 / lag ~240. **MVP-2:** FF when verifiable |
+| Finality | Beacon finalized checkpoints | **MVP-1:** confirmation-depth **`floor(2×N_seal/3)+1`** distinct sealers (=15 for 21). **Live:** turnLength=**8**, Safe lag **~106–112** / proof window **112** (`STATUS.md`; ~50s @ 0.45s). **Historical example:** ~1–2 min @ turnLength≈16 / lag ~240. **MVP-2:** FF verified in tree — finalized head **2 blocks** behind tip (observed norm over 120/120 headers, not a bound); block tags still resolve to Safe unless `--finality fast` |
 | Sync time target | Seconds (committee skip) | **After a fresh checkpoint (hours–≤24h default):** minutes–tens of minutes with batched fetch. **Not** “seconds from a week-old checkpoint” |
 | Durable storage | Latest checkpoint (~32 B+) | Checkpoint + last headers / validator snapshot (KB–few MB) |
 
@@ -199,7 +199,7 @@ flowchart LR
 |------|---------|----------|
 | **Elected active set (~45)** | 21 Cabinet + 24 Candidates (governance/election) | Who *can* enter the sealing set; contract views |
 | **Epoch consensus / sealing set (N_seal ≈ 21)** | Validators that produce and ECDSA-seal blocks this epoch (typically 18 Cabinet + 3 Candidates) | Seal verification; confirmation-depth threshold; N/2 epoch-delay denominator |
-| **FF vote set** | Validators with vote/BLS keys participating in Fast Finality | MVP-2 only; Phase 0 must confirm whether vote N equals N_seal |
+| **FF vote set** | Validators with vote/BLS keys participating in Fast Finality | **Answered (was a Phase 0 question):** on mainnet today it *is* the sealing set — the attestation bitset indexes the same N_seal validators **sorted by address**, and the vote keys ride in the same epoch `extraData` records as the addresses. Quorum is `ceil(2N/3)` = **14 of 21**, deliberately not the confirmation-depth 15. See [fast-finality.md](./fast-finality.md) |
 
 **Confirmation-depth threshold (MVP-1) — strictly more than ⅔:**
 
@@ -241,7 +241,7 @@ checkpoint := {
   block_hash,
   state_root,          // recommended
   sealing_validator_set,  // N_seal consensus addresses for this epoch
-  vote_keys,           // optional; required only if FF enabled
+  vote_keys,           // optional; no vote keys ⇒ no fast finality (stays confirmation-depth)
   epoch_number,
   fork_id / config_hash,
   sourced_from,        // "manual" | "multisource-majority" | …
@@ -308,7 +308,7 @@ For each new header `H` extending the verified chain:
    - Default: **strict linear extension** from checkpoint; accept a reorg only within **`max_reorg_depth = N_seal` blocks** (for N_seal=21 → **≤21**), preferring the branch with higher cumulative in-turn difficulty sum as defined in `parlia.go` (`CalcDifficulty` / snapshot scoring)—exact function names pinned in Phase 0 appendix.
    - Reject headers that violate backoff / future timestamps.
    - Full GHOST-like exploration is **out of MVP-1**; document limitation.
-5. **Fast Finality (MVP-2 only, feature-flagged)** — If header/RPC exposes FF vote bitfield + aggregated BLS signature, verify against known vote pubkeys; mark `finalized` when ≥⅔ of **vote set** verify. If FF data absent, **do not block**—confirmation-depth remains the safe path for MVP-1 reads.
+5. **Fast Finality (MVP-2 — in tree; engaged when vote keys are known)** — Decode the vote attestation from `extraData`; require target = direct parent and source = the currently justified block; map the bitset onto the sealing set **sorted by address**; require `popcount ≥ ceil(2N/3)` (**14 of 21**) and verify the aggregate BLS signature over `keccak256(RLP(VoteData))` against those vote keys. Justified = the attestation's target, finalized = its source. If the attestation is **absent**, do not block — confirmation depth remains the path. If it is **present but invalid**, reject the header (otherwise an upstream could strip or corrupt attestations to downgrade the client silently). Justification and finality are **reported** on `helios_bsc_syncStatus` / `/metrics` in all cases; block tags resolve to the confirmation-depth Safe head unless the operator opts in with `run --finality fast`. Full rules and measurements: [fast-finality.md](./fast-finality.md).
 
 #### Implementation specificity gate (do not invent seals from prose alone)
 
@@ -320,7 +320,7 @@ For each new header `H` extending the verified chain:
 | In-turn / out-of-turn difficulty | `parlia.go` `CalcDifficulty` / snapshot | Pseudo-code + vectors in PR 4 |
 | Backoff / intentional delay mining rules | Same package + BEPs | Tests in PR 4–5 |
 | Epoch delay N/2 | Parlia light-client security rule; N = **N_seal** | PR 5 |
-| FF / BEP-126 wire fields on `eth_getBlock*` | Live RPC matrix + full-node capture | Phase 0; unlocks PR 7 only if pass |
+| FF / BEP-126 wire fields on `eth_getBlock*` | `core/types/vote.go` + `parlia.go` `verifyVoteAttestation` (v1.7.8) + mainnet header fixtures | **Closed.** No full-node capture needed — the attestation is inside sealed `extraData` on ordinary public RPC. PR 7 landed |
 
 **Rule:** Do not implement seal verification until fixtures + pseudo-code land in PR 3–4. Point engineers at exact upstream functions in the Phase 0 appendix (`docs/consensus-appendix.md`).
 
@@ -337,7 +337,7 @@ For each new header `H` extending the verified chain:
 ### Execution verification path
 
 1. Consensus engine exposes `VerifiedBlock { hash, number, state_root, status: Safe | Finalized }`.
-   - **MVP-1:** `Safe` = confirmation-depth satisfied; `Finalized` may alias Safe until FF exists, or map only when upstream `finalized` tag root matches local Safe root.
+   - **This tree:** `Safe` = confirmation-depth satisfied, and by default it is what every block tag (including `finalized`) resolves to. BLS finality **is** tracked — in the Parlia snapshot, reported via `helios_bsc_syncStatus` (`finality`, `finalizedBlock`, `finalizedLagBlocks`) and `/metrics` — and `run --finality fast` opts the tags into it. That mode is off by default until the ≥24h soak covers it, and it only ever moves the head **forward**: it uses the BLS-finalized head when that is newer than confirmation depth **and** names a block this client verified itself.
 2. For `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt`:
    - Request `eth_getProof` from upstream for the **verified block tag/hash**.
    - Verify account trie proof → `stateRoot`; storage trie proof → account `storageRoot`; code hash if needed.
@@ -397,7 +397,7 @@ Standard wallets (MetaMask, many cast/SDK defaults) call `eth_getBalance(addr, "
 | `latest` (proof-backed reads) | **Map to local Safe**; fetch `eth_getProof` by **Safe hash/number**. MetaMask gets Safe semantics under the name `latest`. If no Safe yet → `-32003` `not_synced`. | **Not implemented.** Enum variant only in `helios-bsc-rpc`; no CLI flag; server always uses wallet Safe. Do not ship as if tip reads were wired. |
 | **`eth_blockNumber`** | Returns **Safe** block height (same view as proof-backed `latest`) | **Not implemented** (would return tip). This tree always returns Safe. |
 | `safe` | Confirmation-depth head (`min_distinct_sealers = floor(2N/3)+1`) | Same (unimplemented mode) |
-| `finalized` | MVP-1: alias of `safe` unless FF enabled and verified | Same (unimplemented mode) |
+| `finalized` | **Alias of `safe`** (confirmation depth) by default, even though BLS finality is verified and reported on `helios_bsc_syncStatus`. `run --finality fast` opts all tags into the BLS-finalized head (only when it is newer *and* locally verified); off by default pending soak | Same (unimplemented mode) |
 | hex number / hash | Verified header at height **and** hash/number proof against that root; else error | Same |
 
 **Modes (document clearly):**
@@ -411,7 +411,7 @@ Standard wallets (MetaMask, many cast/SDK defaults) call `eth_getBalance(addr, "
 
 | Need | Source | Trust minimization |
 |------|--------|--------------------|
-| Headers | ≥1 RPC (ideally 2) or Alt F node | Seal + confirmation-depth (FF optional) |
+| Headers | ≥1 RPC (ideally 2) or Alt F node | Seal + confirmation-depth, plus the FF BLS attestation carried in the same header (when vote keys are known) |
 | Proofs | **Hash/number** `eth_getProof` (public or Alt F); tag-only insufficient for Safe | MPT verify vs local Safe `stateRoot` |
 | Broadcast | RPC and/or peers | Tx hash returned; inclusion verified later (post-MVP) |
 | Checkpoint | Manual / multisource | Operator UX + **freshness** limits |
@@ -430,7 +430,7 @@ Standard wallets (MetaMask, many cast/SDK defaults) call `eth_getBalance(addr, "
 | Go (reuse `bnb-chain/bsc` Parlia) | Faster consensus fidelity via copy, worse for “light” product & WASM; higher coupling to full node. Use as **spec oracle**. |
 | TypeScript | Faster prototype, weaker crypto/performance story for long-term OSS. |
 
-**Reuse plan:** Helios patterns (`core` execution proof flow, RPC surface, checkpoint UX); crates `alloy-*`, `revm`, `tokio`. Live JSON-RPC server is **`tiny_http`** in `bin/helios-bsc/src/rpc_server.rs` — **not** jsonrpsee (do not claim jsonrpsee is the server). BLS only when MVP-2 FF is unlocked. **Do not** vendor Helios beacon light client.
+**Reuse plan:** Helios patterns (`core` execution proof flow, RPC surface, checkpoint UX); crates `alloy-*`, `revm`, `tokio`. Live JSON-RPC server is **`tiny_http`** in `bin/helios-bsc/src/rpc_server.rs` — **not** jsonrpsee (do not claim jsonrpsee is the server). BLS via **`blst`** (min_pk) for FF attestation verification — in tree. **Do not** vendor Helios beacon light client.
 
 ### Repo layout (proposed)
 
@@ -499,7 +499,11 @@ helios-bsc \
   --max-checkpoint-age 24h \
   --rpc-bind 127.0.0.1 --rpc-port 8545 \
   --finality confirmation-depth \
-  # --finality fast-finality   # MVP-2 only, after Phase 0 FF gate
+  # run --finality fast        # opt-in: latest/safe/finalized resolve to the BEP-126 BLS-finalized
+  #                            # head (~2 blocks behind) instead of confirmation depth (~110).
+  #                            # Needs vote keys (checkpoint written --sealing-set-from-epoch);
+  #                            # falls back to confirmation depth when no finalized head is known.
+  #                            # Attestation *verification* itself is always on — it needs no flag.
   # min_distinct_sealers derived: floor(2*N_seal/3)+1  (e.g. 15 when N_seal=21)
   # default (this tree): proof-backed "latest" maps to Safe (wallet mode)
   # --allow-unsafe-head-reads   # NOT IMPLEMENTED — unused BlockTagMode::AllowUnsafeHead only; do not pass
@@ -586,7 +590,7 @@ Local `:8545` that forwards to public BSC RPC with API key rotation.
 
 Run a pruned/fast BSC node on a **separate cheap VPS** or spare disk—**not** as the wallet trust root.
 
-- **Pros:** Provides **hash/number `eth_getProof`** when public RPCs are tag-only—**required for Demo Slice wallet mode** if no public hash/number provider works; also FF capture, fixtures, and **one side** of differential soak.
+- **Pros:** Provides **hash/number `eth_getProof`** when public RPCs are tag-only—**required for Demo Slice wallet mode** if no public hash/number provider works; also fixtures and **one side** of differential soak. **No longer needed for FF capture** — attestations arrive on ordinary public RPC inside the sealed header.
 - **Cons:** Ops cost; disk on another machine; must never be mistaken for “trusted RPC” (integrity still from seals + proofs). **Cannot be both sole upstream and sole soak oracle** — soak requires a second independent source.
 - **Verdict:** **Accepted as fallback.** Operator order: public/paid matrix **first**; Alt F **only if matrix fails**—then mandatory for Demo Slice. Hosting (VPS vs spare disk) deferred until needed. Does not replace local verification.
 
@@ -604,7 +608,7 @@ Run a pruned/fast BSC node on a **separate cheap VPS** or spare disk—**not** a
 | Malicious weak subjectivity checkpoint | **Critical** | Multisource check; **freshness** limits; UX warnings |
 | Long-range / validator-set rewrite via dishonest epoch extraData | **High** | N_seal/2 activation delay; confirmation-depth; FF when available |
 | ≥⅓–⅔ **sealing-set** collusion / censorship | **High (inherent)** | Light client ≤ BSC security; document clearly |
-| Fast Finality vote forgery by RPC | **High** | MVP-2: verify BLS vs known vote keys; else ignore FF |
+| Fast Finality vote forgery by RPC | **High** | **Implemented:** aggregate BLS verified against the epoch vote keys over `keccak256(RLP(VoteData))`, quorum `ceil(2N/3)`=14/21. A **present-but-invalid** attestation rejects the header; an **absent** one never does (absence is legal, and stripping one is already prevented by the ECDSA seal). No vote keys ⇒ FF simply stays off — the client never guesses a key |
 | `eth_sendRawTransaction` front-running / drop | **Medium** | Untrusted broadcast; optional multi-broadcast |
 | Silent unverified passthrough | **High (product)** | Default deny; CI adversarial tests |
 | RPC `eth_getProof` tag mismatch | **High** | Compare roots; refuse |
@@ -637,8 +641,13 @@ Run a pruned/fast BSC node on a **separate cheap VPS** or spare disk—**not** a
 | `helios_bsc_sync_lag_blocks` | gauge | Tip vs network (if known) |
 | `helios_bsc_safe_lag_blocks` | gauge | Tip − Safe (expect ~O(min_distinct×turnLength); **live ~106–112** / 120 in-turn upper @ T=8; historical ~240 @ T=16) |
 | `helios_bsc_safe_lag_seconds` | gauge | Wall-clock Safe lag (**live ~50s** @ 0.45s / T=8; historical ~1–2 min @ T=16) |
-| `helios_bsc_finality_mode` | gauge/enum | 0=conf-depth, 1=FF |
+| `helios_bsc_finality_mode` | gauge/enum | 0=conf-depth, 1=FF (a BLS-finalized head is known) |
 | `helios_bsc_upstream_errors_total` | counter | Provider health |
+| `helios_bsc_finalized_block` | gauge | BLS-finalized head — newest attestation's **source** (added with FF) |
+| `helios_bsc_justified_block` | gauge | BLS-justified head — newest attestation's **target** (added with FF) |
+| `helios_bsc_finalized_lag_blocks` | gauge | Tip − finalized (**live 2**, vs 106–113 for Safe) |
+
+`helios_bsc_sync_lag_blocks` is **not** implemented: the client has no independent view of "the network tip" beyond the upstream it is already asking, so the gauge would restate `helios_bsc_tip_block`. `helios_bsc_tip_block` / `helios_bsc_safe_block` / `helios_bsc_safe_lag_within_bound` / `helios_bsc_sealing_set_enforced` / `helios_bsc_unverified_passthrough_enabled` exist and are not in this table. Unknown values report `-1`, never `0`. See [slo.md](./slo.md).
 
 **Alerting:** tip stale ≫ expected Safe lag floor (do **not** alert merely because Safe is ~50s behind tip at live T=8; historical T=16 was ~1–2 min); `proof_fail` storm; checkpoint_age &gt; policy; validator-set mismatch vs contract prove-read.
 
@@ -664,7 +673,7 @@ Run a pruned/fast BSC node on a **separate cheap VPS** or spare disk—**not** a
 
 ### Feature flags
 
-- `finality=confirmation-depth` (default MVP-1) / `fast-finality` (MVP-2)
+- `run --finality confirmation-depth` (default) / `fast` — chooses which rule **block tags** resolve to; `fast` falls back to confirmation depth whenever no BLS-finalized head is known. Attestation *verification* is not behind this or any build flag: it runs whenever vote keys are available, and the `finality` value on `helios_bsc_syncStatus` is derived from whether a valid attestation has been seen.
 - `allow_unverified_passthrough`
 - `strict_checkpoint_age` / `max_checkpoint_age`
 - `allow_unsafe_head_reads` — **not implemented** (no CLI flag; unused `BlockTagMode::AllowUnsafeHead`). Default remains wallet mode: proof-backed `latest`→Safe.
@@ -684,10 +693,10 @@ Prefer a dedicated spare volume or small VPS for any Alt F full/fast node. Avoid
 
 ## Test Strategy
 
-1. **Mainnet fixtures** — Modern **epochLength=1000** boundary headers (not only legacy 200); non-epoch headers; optional FF payloads; `eth_getProof` responses.
+1. **Mainnet fixtures** — Modern **epochLength=1000** boundary headers (not only legacy 200); non-epoch headers; **FF vote attestations** (five mainnet headers whose real BLS signatures are verified in `vote.rs`); `eth_getProof` responses.
 2. **Consensus unit tests** — Seal recovery; wrong signer; N_seal/2 activation; backoff; reorg ≤ N_seal.
 3. **MPT tests** — Positive + mutated proofs must fail.
-4. **Adversarial RPC mock** — Fake proofs; wrong roots; stalled head; conflicting headers; bad FF (when enabled).
+4. **Adversarial RPC mock** — Fake proofs; wrong roots; stalled head; conflicting headers; **tampered attestation must reject the header** (`tampered_attestation_rejects_the_header`), while an absent one must not.
 5. **Differential soak** — Verified balances vs an **independent** oracle (second RPC, explorer API, or second Alt F). The soak oracle **must not** be the sole proof/header upstream (otherwise the test only checks self-consistency with that node’s `stateRoot`).
 6. **Chaos** — Kill upstream mid-sync; fail-closed.
 7. **Threshold unit table** — Assert `floor(2N/3)+1` for several N_seal values (21→15, 22→15, …).
@@ -717,7 +726,7 @@ Prefer a dedicated spare volume or small VPS for any Alt F full/fast node. Avoid
 3. **Execution trust via `eth_getProof` + verified `stateRoot`** — Same Helios execution thesis; provider matrix is a **GA/Phase 0 gate**.
 4. **Weak subjectivity checkpoints with multisource UX** — Unavoidable without Portal.
 5. **Default fail-closed RPC** — MetaMask-compatible via hard errors; TrustClass via meta APIs only.
-6. **Finality (amended):** **MVP-1 default = confirmation-depth over sealing set** with `min_distinct_sealers = floor(2×N_seal/3)+1` (=**15** for N_seal=**21**). **Live pins (`STATUS.md`):** turnLength=**8**, proof window **112**, Safe lag **~106–112** (~50s @ 0.45s). Historical example: ~1–2 min @ turnLength≈16. Fast Finality is **MVP-2 / feature-flagged** (`ceil(2×N_vote/3)` / BEP-126), enabled only when Phase 0 proves verifiable vote data on RPC (or Alt F capture). **Default wallet mode:** proof-backed `latest` maps to Safe. `--allow-unsafe-head-reads` is **not implemented**.
+6. **Finality (amended):** **MVP-1 default = confirmation-depth over sealing set** with `min_distinct_sealers = floor(2×N_seal/3)+1` (=**15** for N_seal=**21**). **Live pins (`STATUS.md`):** turnLength=**8**, proof window **112**, Safe lag **~106–112** (~50s @ 0.45s). Historical example: ~1–2 min @ turnLength≈16. Fast Finality (`ceil(2×N_vote/3)` = **14 of 21** / BEP-126) is **implemented and verified** — the vote data question is closed, since the attestation rides in the sealed header on ordinary public RPC. Verification engages whenever vote keys are known, and is **additive**: it is reported on `helios_bsc_syncStatus` / `/metrics` (measured finalized lag **2 blocks**, an observed norm, not a bound), while the `safe` / `finalized` / `latest` tags still resolve to the confirmation-depth Safe head **by default**. `run --finality fast` opts the tags into BLS finality; off by default until the ≥24h soak covers it. **Default wallet mode:** proof-backed `latest` maps to Safe. `--allow-unsafe-head-reads` is **not implemented**.
 7. **~0 durable storage** — Checkpoint + `last_safe` + ephemeral cache; compatible with BTC IBD host sharing.
 8. **Apache-2.0 OR MIT dual license** — Community/wallet adoption.
 9. **SOL / opBNB / Portal deferred** — Keep MVP coherent.
@@ -726,7 +735,7 @@ Prefer a dedicated spare volume or small VPS for any Alt F full/fast node. Avoid
 12. **Max checkpoint age driven by header-walk cost** — Default ≤24h strict; not Helios’s week-scale window.
 13. **Required upstream proof capability for Demo Slice / GA** — At least one reproducible **`eth_getProof` by block hash or number**. **Order (operator-decided):** measure **public/paid RPC provider matrix first**; stand up **Alt F only if that matrix fails**. Tag-only degraded mode does not satisfy wallet-mode Safe proofs.
 14. **Independent public repo `helios-bsc`** (dual MIT/Apache) — not starting inside a16z/helios workspace; optional upstream discussion only after Demo Slice.
-15. **Development in this repo (2026-08-21)** — Demo Slice closed; MVP-1 verified reads + unverified `sendRaw` + operator docs in tree. **24h soak remains the GA live gate.** MVP-2: constrained Safe-only `eth_call` + best-effort proof-backed `eth_estimateGas` (DoD ticked); `BLOCKHASH` from local verified headers (in-window unknown fail-closed). Revert/Halt map to JSON-RPC **code 3**, not `-32001`. **FF not implemented.** `--allow-unsafe-head-reads` **not implemented**. Out-of-turn backoff, Maxwell FF recents prune, and EIP-1559 parent `baseFee` formulas are **not implemented**. Pasteur 2026-08-25 is scheduled, not live.
+15. **Development in this repo (2026-08-21)** — Demo Slice closed; MVP-1 verified reads + unverified `sendRaw` + operator docs in tree. **24h soak remains the GA live gate.** MVP-2: constrained Safe-only `eth_call` + best-effort proof-backed `eth_estimateGas` (DoD ticked); `BLOCKHASH` from local verified headers (in-window unknown fail-closed). Revert/Halt map to JSON-RPC **code 3**, not `-32001`. **Fast Finality BLS is implemented and verified** (consensus + `syncStatus`/`metrics`; live finalized lag **2**) — but block tags still serve the confirmation-depth Safe head **by default**; `run --finality fast` is the opt-in, unsoaked switch. The **Maxwell FF `recents` prune** it unblocked is now implemented too. `--allow-unsafe-head-reads` **not implemented**. Out-of-turn backoff and EIP-1559 parent `baseFee` formulas remain **not implemented** (no fixtures). Pasteur 2026-08-25 is scheduled, not live.
 
 ### Operator decisions (2026-08-18)
 
@@ -736,7 +745,7 @@ Settled by operator; treat as final (not open for re-debate in this doc):
 |---|----------|
 | A | **OSS home:** independent public repo **`helios-bsc`**, dual MIT/Apache. No initial a16z/helios workspace membership; optional upstream chat **only after Demo Slice**. |
 | B | **`eth_getProof` path:** **first** fill/measure the public/paid provider matrix for hash/number proofs; **Alt F only if the matrix fails**. |
-| C | **Near-term work:** keep milestones honest — Demo Slice closed; 24h soak still blocks MVP-1 GA; Pasteur 2026-08-25 is scheduled, not live. MVP-2 `eth_call` / `eth_estimateGas` / local `BLOCKHASH` in tree; FF not started. Live Parlia pins: T=**8**, Safe lag ~106–112, proof window 112. `--allow-unsafe-head-reads` not implemented. |
+| C | **Near-term work:** keep milestones honest — Demo Slice closed; 24h soak still blocks MVP-1 GA; Pasteur 2026-08-25 is scheduled, not live. MVP-2 `eth_call` / `eth_estimateGas` / local `BLOCKHASH` in tree; **FF landed** (verified live 2026-08-21); block tags stay on confirmation depth by default, `--finality fast` opt-in. Live Parlia pins: T=**8**, Safe lag ~106–112, proof window 112. `--allow-unsafe-head-reads` not implemented. |
 
 This file is the canonical design document for the public repository.
 
@@ -745,12 +754,12 @@ This file is the canonical design document for the public repository.
 ## Open Questions
 
 1. **Freeze hardfork table** from a pinned `bnb-chain/bsc` commit (epochLength, turnLength, `extraData` versions for Maxwell/Fermi/…). *Partial answer in-doc: normative epoch **1000** post-Maxwell; Phase 0 still must pin commit SHA when coding resumes.*
-2. **Fast Finality wire format** on public JSON-RPC vs full-node-only — **MVP-2 gate**, not MVP-1 blocker. Record BEP-126 fields in Phase 0 (when resumed).
+2. **Fast Finality wire format** on public JSON-RPC vs full-node-only — **ANSWERED:** public JSON-RPC is sufficient. The BEP-126 attestation is RLP inside the sealed `extraData` (between the validator records and the 65-byte seal), so any endpoint returning the header returns the votes; no full node and no Alt F capture were needed. Fields, BLS suite, quorum and the mainnet measurements are recorded in [fast-finality.md](./fast-finality.md). Remaining sub-question: whether serving **block tags** from BLS finality should become the default. It exists as opt-in `run --finality fast`; making it the default is a wallet-visible behavioural change and wants the ≥24h soak first.
 3. **`eth_getProof` provider matrix — DECIDED (process):** On resume, Phase 0 **first measures public/paid hash/number support**; tag-only is recorded for awareness but does not unlock Demo Slice. **Alt F is provisioned only if that matrix fails** (see Operator decision B / KD13–14). Remaining work is executing the matrix, not choosing the strategy.
 4. **Checkpoint distribution:** own signed checkpoint feed vs manual + explorers?
 5. **Upstream / repo home — DECIDED:** Independent public **`helios-bsc`** repo (dual MIT/Apache). Not inside a16z/helios; optional upstream discussion only after Demo Slice (Operator decision A / KD14).
 6. **Receipt verification priority** vs `eth_call` after Demo Slice?
-7. **Governance changes** to Cabinet/Candidate counts or N_seal — config-driven thresholds assumed; confirm if FF vote N can diverge from seal N.
+7. **Governance changes** to Cabinet/Candidate counts or N_seal — config-driven thresholds assumed. *Partially answered:* FF vote N does **not** diverge from seal N as BSC is deployed today — the attestation bitset indexes the sealing set itself (sorted by address), and geth evaluates it against the snapshot at `TargetNumber-1`, which the client mirrors. The code derives both `N` and the `ceil(2N/3)` quorum from the live snapshot rather than hardcoding 21/14, so a governance change to N_seal is handled; a protocol change that gave FF a *separate* set would not be, and would need re-reading `parlia.go`.
 8. **Hermes integration:** separate `bsc-verified` endpoint vs detect `helios_bsc_syncStatus`?
 9. **Alt F hosting — DECIDED (conditional):** Alt F is **not** the default first step; only if public/paid hash/number matrix fails (Operator decision B). Exact host (cheap VPS vs spare disk) remains a **deferred ops choice** if/when Alt F is required.
 
@@ -782,7 +791,7 @@ Incremental, independently reviewable PRs. Rough **engineer-days** assume one pr
 - [ ] Modern mainnet fixtures across **epochLength=1000** boundary (PR 3).
 - [ ] `docs/proof-provider-matrix.md` has ≥1 reproducible **hash/number or Alt F** proof path (+ mutated fail case). Tag-only alone = **gate fail**.
 - [ ] If public hash/number unavailable: Alt F node provisioned as untrusted data plane (still not soak-oracle-only).
-- [ ] FF RPC availability recorded (pass → schedule PR 7; fail → leave optional forever for MVP-1).
+- [x] FF RPC availability recorded — **pass**: the attestation is inside sealed `extraData`, so public RPC suffices. PR 7 scheduled and landed ([fast-finality.md](./fast-finality.md)).
 - [ ] `docs/consensus-appendix.md` stub with `parlia.go` function pointers.
 
 ### PR 1 — Repository scaffold & license (~2 d)
@@ -834,12 +843,12 @@ Incremental, independently reviewable PRs. Rough **engineer-days** assume one pr
 - **Dependencies:** PR 5
 - **Description:** **MVP-1 finality path.** Threshold `floor(2N/3)+1` (=15 for N=21); unit-test table for other N. Expose `safe_lag_*` metrics. Live Safe lag ~106–112 @ turnLength=**8** / proof window 112 (`STATUS.md`). Historical example ~1–2 min @ turnLength≈16.
 
-### PR 7 — Fast Finality verification (**optional / non-blocking**) (~8–20 d if unlocked)
+### PR 7 — Fast Finality verification (**landed**; was optional / non-blocking)
 
-- **Title:** `feat(consensus): optional Fast Finality BLS aggregate verification`
-- **Files/components:** FF module behind feature flag
-- **Dependencies:** PR 6; **Phase 0 FF gate must pass**
-- **Description:** Does **not** block PR 8–9 / Demo Slice. Skip or indefinitely defer if RPC fields unavailable.
+- **Title:** `feat(consensus): Fast Finality BLS aggregate verification`
+- **Files/components:** `crates/helios-bsc-consensus/src/vote.rs` (RLP decode, `VoteData.Hash()`, `blst` aggregate verify, bitset → sorted set, `ceil(2N/3)` quorum); `snapshot.rs` (`check_attestation`, `attestation_set`, `justified()` / `finalized()`); vote keys in the checkpoint; `syncStatus` / `/metrics` fields
+- **Dependencies:** PR 6; Phase 0 FF gate — **passed** (attestation is in the sealed header; public RPC sufficed)
+- **Description:** Did **not** block PR 8–9 / Demo Slice, and did not need Alt F. Verifies the real signatures on five mainnet fixture headers; live 2026-08-21 `finalizedLagBlocks=2`. Also unblocked the Maxwell BEP-524 `recents` prune. **Still open:** making BLS finality the default for block tags — it ships as opt-in `run --finality fast`, pending soak. See [fast-finality.md](./fast-finality.md).
 
 ### PR 8 — MPT `eth_getProof` verifier (~5–10 d; parallelizable after PR 2)
 
@@ -918,3 +927,5 @@ _Rev 8 (2026-08-21): MVP-2 slice 2 — proof-backed best-effort `eth_estimateGas
 _Rev 9 (2026-08-21): Docs honesty — `--allow-unsafe-head-reads` / `BlockTagMode::AllowUnsafeHead` are **not implemented** (unused enum; no CLI flag; default remains wallet `latest`→Safe). Live JSON-RPC server is **tiny_http** (`bin/helios-bsc/src/rpc_server.rs`), not jsonrpsee. Qualify turnLength≈16 / Safe lag ~240 as historical; live pins (`STATUS.md`): epochLength=1000, turnLength=**8**, N_seal=21, Safe=15, proof window 112, Safe lag ~106–112. MVP-2 DoD: `eth_call` + `eth_estimateGas` ticked; FF still unchecked. **BLOCKHASH not done** (may land separately; do not claim it at 70f5aed)._
 
 _Rev 10 (2026-08-21): Local verified `BLOCKHASH` (in-window unknown fail-closed; out-of-window/current → 0). `eth_call`/`eth_estimateGas` Revert/Halt map to JSON-RPC code 3, not `-32001`. Drop unused `BlockTagMode`. FF still unchecked. 24h soak still the GA live gate. Pasteur 2026-08-25 is not live._
+
+_Rev 11 (2026-08-21): Fast Finality landed — BEP-126 vote attestations decoded from sealed `extraData` and their aggregate BLS signature verified (`blst`, min_pk, POP DST) against the epoch vote keys; quorum `ceil(2N/3)` = **14 of 21** (not the confirmation-depth 15); justified = the newest attestation's target, finalized = its source. The Phase 0 "is public RPC vote data verifiable?" gate is **closed — pass**: the attestation is inside the sealed header, so no full node / Alt F capture was required. Measured live: finalized lag **2 blocks** vs 106–112 for confirmation depth (constant over 120 consecutive headers in a healthy period — an observed norm, not a proven bound). Present-but-invalid attestation rejects the header; absent never does; no vote keys ⇒ confirmation depth and no guessing. Block tags **still resolve to the confirmation-depth Safe head by default**; `run --finality fast` is an opt-in switch that serves them from the BLS-finalized head when it is newer and locally verified, and falls back to confirmation depth otherwise — off by default until the ≥24h soak covers it. Maxwell FF `recents` prune also now implemented. 24h soak still the GA live gate. Pasteur 2026-08-25 is not live._
