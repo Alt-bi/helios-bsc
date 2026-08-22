@@ -41,12 +41,79 @@ Probed with `scripts/probe_eth_get_proof.py` plus a lag sweep (0 / 8 / 16 / 32 /
 
 ## Gate verdict
 
-**PARTIAL PASS (2026-08-19).** Ankr by-number proved WBNB at live Safe when lag ≤~108 after catch-up (`probe-safe` GATE PASS vs BlastAPI oracle). Soak **10 unique / 0 mismatch** vs BlastAPI (`helios-bsc soak --min-unique 10`). Neighbor-leaf proofs for unused addresses are **exclusion** (empty account), not a walker bug. BlastAPI stays oracle-only (~96). Tag-only still fails the gate.
+**PASS with `--finality fast` (2026-08-21). PARTIAL PASS on the default build.**
 
-Next (operator order from design):
+The gate had been stuck since 2026-08-19 on one number: confirmation-depth Safe needs a
+proof ~112 blocks back, and no free provider retains state that deep. BLS fast finality
+moves the head to **2 blocks**, so the requirement becomes a ~3-block window — and the
+free, keyless providers clear that easily.
 
-1. Probe **one paid** provider with archive or `debug`/`full` state (Ankr / NodeReal / QuickNode / Alchemy / Chainstack).
-2. If that also cannot prove `tip-120` by hash/number → **Alt F is mandatory** for Demo Slice.
+Measured 2026-08-21 (`scripts/sweep_proof_window.py`, then the client itself):
+
+| | Default (confirmation depth) | `run --finality fast` |
+|--|--|--|
+| Required by-number/by-hash window | ~112 blocks | **~3 blocks** |
+| `bsc-mainnet.public.blastapi.io` (free, **no key**) | **FAIL** — window ends between lag 64 and 96 | **PASS** — OK by number *and* hash at lag 0/2/3/5/8/16/32/64 |
+
+End-to-end on that free endpoint with `--finality fast`, head at `tip - 2`:
+
+- `eth_getBalance`, `eth_getStorageAt` (WBNB slot 0 → "Wrapped BNB") and `eth_call`
+  (`totalSupply`) all returned MPT-verified values.
+- Differential against **two independent blind oracles** (publicnode, meowrpc) at a pinned
+  block: **8 addresses, 8 match, 0 mismatch, 0 skip.**
+
+So Alt F (self-hosted full node) is **no longer mandatory** for a verified read, and no
+paid key is needed either — provided the operator opts into `--finality fast`. The default
+build still needs a ≥112-block window, which is why this is not a clean full PASS.
+
+Two caveats that have not changed:
+
+- **Tag-only providers still fail, at any lag.** `bsc-rpc.publicnode.com` rejects an
+  explicit block id even at the tip (`-32602 distance to target block exceeds maximum
+  proof window`). Fast finality changes the required *depth*, not whether a provider can
+  address a block at all.
+- A **rate-limited** probe is not a window verdict. `bsc-dataseed.bnbchain.org` answers
+  `limit exceeded` to every proof; that says nothing about its capability, and the sweep
+  script now reports it as inconclusive rather than as tag-only.
+
+Next:
+
+1. Re-probe the paid/keyed rows (Ankr / NodeReal / QuickNode) against the **≥3-block**
+   requirement — QuickNode free was rejected for a 5-block window that is now ample.
+2. The ≥24h differential soak, which is also the gate for making `--finality fast` the
+   default.
+
+## What Fast Finality changes here (2026-08-21)
+
+**Every Pass? column in the table above was measured against the ~112-block requirement
+and is only valid for the default build.** `run --finality fast` needs ~3.
+
+Re-swept 2026-08-21 with `scripts/sweep_proof_window.py`, which now probes the
+fast-finality lags (0/2/3/5) alongside the deep ones and reports by-hash next to by-number:
+
+| Provider | by-number at lag ≤3 | deepest by-number | Verdict |
+|----------|--------------------|-------------------|---------|
+| `bsc-mainnet.public.blastapi.io` | **OK** (also by hash) | lag 64 OK, 96 fails | **passes `--finality fast`**, fails default |
+| `bsc-rpc.publicnode.com` | FAIL | none — fails at the tip | **tag-only**; no finality rule helps |
+| `bsc.meowrpc.com` | FAIL (`missing trie node`) | none by number | fails both; by-hash answers were inconsistent across probes, so it is load-balanced across nodes with different pruning |
+| `bsc-dataseed.bnbchain.org` | `limit exceeded` | — | **inconclusive**, rate limit not a window verdict |
+
+The rows still worth re-probing under ≥3 are the ones rejected purely on depth: NodeReal
+(~96) and especially **QuickNode free, whose 5-block window was a hard fail at 112 and is
+ample at 2**.
+
+## Re-probe notes (2026-08-21)
+
+Two traps that cost time when re-running this matrix — neither is a client bug:
+
+- **Send a `User-Agent`.** BlastAPI, publicnode and meowrpc now answer **403** to a bare `Python-urllib` / default-`curl` request, and **200** to the same request with any UA set. This reads exactly like an IP ban or a new key requirement and is neither. Every `scripts/*.py` sets one, and the client sends `helios-bsc` (`bin/helios-bsc/src/upstream.rs`), so only ad-hoc one-liners are affected. Re-confirmed working from the client UA against all four hosts.
+- **A non-batching upstream cannot keep up with 0.45 s blocks.** Measured 2026-08-21: with
+  `bsc-dataseed.bnbchain.org` the sync poller holds the chain lock almost continuously
+  (one round-trip per header, ~4 new blocks per 1.8 s poll), and `helios_bsc_syncStatus`
+  then blocks for **90 s+**. The same build against `bsc-rpc.publicnode.com`, which does
+  batch, answers in **0.8–1.8 s**. This is an upstream property, not a client defect —
+  but it is a second, independent reason not to pick a non-batching endpoint for the soak.
+- **`bsc-dataseed.bnbchain.org` serves headers but rejects batching.** Both the parallel fetch and the JSON-RPC batch array fail, so the client falls back to one request per header — a cold 130-header walk becomes 130 sequential round-trips. Fine as a header source for fixture capture; **do not pick it as a soak upstream**. (Its `eth_getProof` is still `-32005 limit exceeded`, as the matrix already records.)
 
 ## Repro
 

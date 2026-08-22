@@ -1,6 +1,7 @@
 //! PR 10: lying upstream through `Node::handle` (no network).
 
 use crate::diff::{diff_vs_oracle, soak_list, SOAK_ADDRESSES};
+use crate::rpc_server::FinalityMode;
 use crate::sync::{
     confirm_checkpoint_with_oracle, walk_from_checkpoint, walk_from_checkpoint_inturn, walk_headers,
 };
@@ -8,11 +9,12 @@ use crate::{Node, RpcUpstream};
 use anyhow::{anyhow, Result};
 use helios_bsc_consensus::{header_hash, newest_safe, Snapshot, VerifiedBlock};
 use helios_bsc_execution::{
-    encode_data32, encode_qty, EMPTY_TRIE_ROOT, MAX_CALL_ACCOUNTS, MAX_RAW_TX, TX_GAS,
+    encode_consensus_receipt, encode_data32, encode_qty, ordered_trie_root, ConsensusReceipt,
+    EMPTY_TRIE_ROOT, MAX_CALL_ACCOUNTS, MAX_RAW_TX, TX_GAS,
 };
 use helios_bsc_mock::{
-    cycling_sealer_chain, distinct_sealer_chain, headers_from_chain, n_seal, relink_dummy_chain,
-    MockRpc, Scenario, WBNB_ADDRESS, WRONG_STATE_ROOT,
+    cycling_sealer_chain, distinct_sealer_chain, header_from_verified, headers_from_chain, n_seal,
+    relink_dummy_chain, MockRpc, Scenario, WBNB_ADDRESS, WRONG_STATE_ROOT,
 };
 use helios_bsc_rpc::{
     ERR_INVALID, ERR_METHOD, ERR_NOT_SYNCED, ERR_PARAMS, ERR_PARSE, ERR_PROOF_FAILED,
@@ -36,6 +38,7 @@ struct MockUpstream {
     code: Vec<u8>,
     /// When set, `send_raw_transaction` returns this hash instead of keccak(raw).
     lie_raw_hash: Option<String>,
+    receipts: Vec<Value>,
 }
 
 impl MockUpstream {
@@ -55,6 +58,7 @@ impl MockUpstream {
             unverified: Value::Null,
             code: Vec::new(),
             lie_raw_hash: None,
+            receipts: Vec::new(),
         })
     }
 
@@ -69,6 +73,7 @@ impl MockUpstream {
             unverified: Value::Null,
             code: Vec::new(),
             lie_raw_hash: None,
+            receipts: Vec::new(),
         }
     }
 }
@@ -148,6 +153,10 @@ impl RpcUpstream for MockUpstream {
 
     fn unverified_call(&self, _method: &str, _params: &Value) -> Result<Value> {
         Ok(self.unverified.clone())
+    }
+
+    fn block_receipts_json(&self, _block_hash: &str) -> Result<Vec<Value>> {
+        Ok(self.receipts.clone())
     }
 }
 
@@ -915,7 +924,6 @@ fn filters_and_subscribe_unsupported() {
         "eth_newBlockFilter",
         "eth_subscribe",
         "eth_getFilterChanges",
-        "eth_getLogs",
         "eth_newPendingTransactionFilter",
         "eth_uninstallFilter",
         "eth_getFilterLogs",
@@ -1094,6 +1102,89 @@ fn proof_counters_ok_and_fail() {
     assert!(st_bad["result"]["proofFail"].as_u64().unwrap() >= 1);
 }
 
+#[test]
+fn metrics_are_off_by_default_and_opt_in() {
+    let (chain, rpc) = safe_chain_with_fixture_root();
+    let mut node = node_from_chain(chain, rpc.proof_json());
+    assert!(!node.metrics_enabled(), "metrics must default to off");
+    node.set_metrics_enabled(true);
+    assert!(node.metrics_enabled());
+}
+
+#[test]
+fn metrics_text_is_prometheus_and_tracks_proof_counters() {
+    let (chain, rpc) = safe_chain_with_fixture_root();
+    let node = node_from_chain(chain.clone(), rpc.proof_json());
+    let ok = node.handle(&req("eth_getBalance", json!([WBNB_ADDRESS, "latest"])));
+    assert!(ok.get("result").is_some(), "{ok}");
+
+    let m = node.metrics_text();
+    for name in [
+        "helios_bsc_headers_verified_total",
+        "helios_bsc_header_verify_fail_total",
+        "helios_bsc_proof_success_total",
+        "helios_bsc_proof_fail_total",
+        "helios_bsc_upstream_errors_total",
+        "helios_bsc_safe_lag_blocks",
+        "helios_bsc_safe_lag_seconds",
+        "helios_bsc_checkpoint_age_seconds",
+        "helios_bsc_finality_mode",
+    ] {
+        assert!(
+            m.contains(&format!("# TYPE {name} ")),
+            "missing {name}:\n{m}"
+        );
+        assert!(
+            m.lines().any(|l| l.starts_with(&format!("{name} "))),
+            "no sample line for {name}:\n{m}"
+        );
+    }
+    assert!(m.contains("helios_bsc_proof_success_total 1"), "{m}");
+    assert!(m.contains("helios_bsc_proof_fail_total 0"), "{m}");
+    assert!(m.contains("helios_bsc_finality_mode 0"), "{m}");
+
+    // A rejected proof must move proof_fail, not upstream_errors.
+    let lying = MockRpc::new(Scenario::LyingBalance).proof_json();
+    let bad = node_from_chain(chain, lying);
+    let _ = bad.handle(&req("eth_getBalance", json!([WBNB_ADDRESS, "latest"])));
+    let mb = bad.metrics_text();
+    assert!(mb.contains("helios_bsc_proof_fail_total 1"), "{mb}");
+    assert!(mb.contains("helios_bsc_upstream_errors_total 0"), "{mb}");
+}
+
+/// Regression: a scrape must not queue behind a sync holding the chain lock.
+/// A live run stalled `/metrics` for 180s because it took that mutex; the gauges
+/// are published to atomics instead, so this must return while the lock is held.
+#[test]
+fn metrics_do_not_take_the_chain_lock() {
+    let (chain, rpc) = safe_chain_with_fixture_root();
+    let node = node_from_chain(chain, rpc.proof_json());
+    let _ = node.handle(&req("eth_getBalance", json!([WBNB_ADDRESS, "latest"])));
+
+    let held = node.lock_chain_for_test();
+    // Would deadlock (std Mutex is not reentrant) if metrics touched the chain.
+    let m = node.metrics_text();
+    drop(held);
+
+    assert!(m.contains("helios_bsc_tip_block "), "{m}");
+    assert!(m.contains("helios_bsc_safe_lag_blocks "), "{m}");
+}
+
+/// Before the first sync the gauges must say "unknown" (-1), never a fake 0 that
+/// would read as "tip is block 0" or "zero lag" on a dashboard.
+#[test]
+fn metrics_report_unknown_before_first_sync() {
+    let node = node_from_chain(
+        Vec::new(),
+        MockRpc::new(Scenario::HonestFixtures).proof_json(),
+    );
+    let m = node.metrics_text();
+    assert!(m.contains("helios_bsc_tip_block -1"), "{m}");
+    assert!(m.contains("helios_bsc_safe_block -1"), "{m}");
+    assert!(m.contains("helios_bsc_safe_lag_blocks -1"), "{m}");
+    assert!(m.contains("helios_bsc_checkpoint_age_seconds -1"), "{m}");
+}
+
 fn snapshot_for_chain(chain: &[VerifiedBlock]) -> Snapshot {
     let g = &chain[0];
     let mut set: Vec<String> = chain
@@ -1122,9 +1213,233 @@ fn snapshot_for_chain(chain: &[VerifiedBlock]) -> Snapshot {
         timestamp: 1_768_357_801,
         fork_id: "fermi".into(),
         sealing_set: set,
+        vote_keys: None,
         attestation: None,
     };
     Snapshot::from_checkpoint(&cp).unwrap()
+}
+
+/// Node with a sealing-set snapshot, so the fast-finality fields have somewhere to live.
+fn node_with_snapshot() -> Node {
+    let chain = distinct_sealer_chain(15);
+    let snap = snapshot_for_chain(&chain);
+    let up = MockUpstream::for_chain(&chain, json!({}));
+    Node::from_parts_with_snapshot(Box::new(up), 130, chain, snap, "fermi")
+}
+
+#[test]
+fn finality_is_confirmation_depth_until_an_attestation_is_seen() {
+    let node = node_with_snapshot();
+
+    let m = node.metrics_text();
+    // `-1`, never `0`: a dashboard must not read "no finalized head yet" as "lag zero".
+    assert!(m.contains("helios_bsc_finalized_block -1"), "{m}");
+    assert!(m.contains("helios_bsc_finalized_lag_blocks -1"), "{m}");
+    assert!(m.contains("helios_bsc_justified_block -1"), "{m}");
+    assert!(m.contains("helios_bsc_finality_mode 0"), "{m}");
+
+    let st = node.handle(&req("helios_bsc_syncStatus", json!([])));
+    assert_eq!(st["result"]["finality"], json!("confirmation-depth"));
+    assert_eq!(st["result"]["finalizedBlock"], Value::Null);
+    assert_eq!(st["result"]["finalizedHash"], Value::Null);
+    assert_eq!(st["result"]["justifiedBlock"], Value::Null);
+    assert_eq!(st["result"]["finalizedLagBlocks"], Value::Null);
+    // A snapshot without BLS vote keys is a normal state, not an error.
+    assert_eq!(st["result"]["fastFinalityAvailable"], json!(false));
+}
+
+#[test]
+fn published_finality_reaches_metrics_and_sync_status() {
+    let node = node_with_snapshot();
+    let st0 = node.handle(&req("helios_bsc_syncStatus", json!([])));
+    let tip = st0["result"]["tip"].as_u64().expect("tip");
+    // The finality lag is measured against the snapshot head, not the upstream tip — the
+    // two are sampled at different instants. See `status_fields`.
+    // `finalityHead` is the verified head the lags are measured against; `refresh`
+    // publishes it together with the heads themselves.
+    let head = st0["result"]["finalityHead"]
+        .as_u64()
+        .expect("finalityHead");
+    assert_eq!(head, tip, "with a settled mock chain the two coincide");
+
+    // Live mainnet lag: justified = head-1, finalized = head-2.
+    let justified_hash = [0xa1u8; 32];
+    let finalized_hash = [0xb2u8; 32];
+    node.publish_finality_for_test((head - 1, justified_hash), (head - 2, finalized_hash));
+
+    let m = node.metrics_text();
+    assert!(
+        m.contains(&format!("helios_bsc_finalized_block {}", head - 2)),
+        "{m}"
+    );
+    assert!(
+        m.contains(&format!("helios_bsc_justified_block {}", head - 1)),
+        "{m}"
+    );
+    assert!(m.contains("helios_bsc_finalized_lag_blocks 2"), "{m}");
+    assert!(m.contains("helios_bsc_finality_mode 1"), "{m}");
+
+    let st = node.handle(&req("helios_bsc_syncStatus", json!([])));
+    let r = &st["result"];
+    assert_eq!(r["finality"], json!("fast-finality"));
+    assert_eq!(r["finalizedBlock"], json!(head - 2));
+    assert_eq!(r["justifiedBlock"], json!(head - 1));
+    assert_eq!(r["finalizedLagBlocks"], json!(2));
+    assert_eq!(r["justifiedLagBlocks"], json!(1));
+    assert_eq!(
+        r["finalizedHash"],
+        json!(format!("0x{}", hex::encode(finalized_hash)))
+    );
+    assert_eq!(
+        r["justifiedHash"],
+        json!(format!("0x{}", hex::encode(justified_hash)))
+    );
+
+    // Confirmation-depth reporting must be untouched — this change is additive, and no
+    // block tag resolves to the finalized head.
+    assert_eq!(r["safe"], json!(tip - 15));
+    assert_eq!(r["safeLagBlocks"], r["lag"]);
+    assert_eq!(r["requiredSealers"], json!(15));
+}
+
+#[test]
+fn finality_gauges_do_not_take_the_chain_lock() {
+    let node = node_with_snapshot();
+    let tip = node.handle(&req("helios_bsc_syncStatus", json!([])))["result"]["tip"]
+        .as_u64()
+        .expect("tip");
+    node.publish_finality_for_test((tip - 1, [0xa1u8; 32]), (tip - 2, [0xb2u8; 32]));
+
+    let held = node.lock_chain_for_test();
+    // Would deadlock (std Mutex is not reentrant) if a finality gauge touched the chain.
+    let m = node.metrics_text();
+    drop(held);
+
+    assert!(m.contains("helios_bsc_finalized_block "), "{m}");
+    assert!(m.contains("helios_bsc_finalized_lag_blocks "), "{m}");
+    assert!(m.contains("helios_bsc_justified_block "), "{m}");
+}
+
+/// A finalized head only moves the read head when the client verified that exact block
+/// itself. An attestation naming a block we never walked is an upstream's word.
+#[test]
+fn fast_finality_head_must_be_in_the_local_chain() {
+    let chain = distinct_sealer_chain(15);
+    let snap = snapshot_for_chain(&chain);
+    let up = MockUpstream::for_chain(&chain, json!({}));
+    let mut node = Node::from_parts_with_snapshot(Box::new(up), 130, chain, snap, "fermi");
+    node.set_finality_mode(FinalityMode::Fast);
+
+    let before = node.handle(&req("helios_bsc_syncStatus", json!([])));
+    let conf_safe = before["result"]["safe"].as_u64().expect("safe");
+    let tip = before["result"]["tip"].as_u64().expect("tip");
+
+    // Real number, hash that is not in the chain.
+    node.publish_finality_for_test((tip, [0x77u8; 32]), (tip - 1, [0x88u8; 32]));
+    let after = node.handle(&req("helios_bsc_syncStatus", json!([])));
+    assert_eq!(
+        after["result"]["safe"].as_u64(),
+        Some(conf_safe),
+        "unverified finalized hash must not move the read head"
+    );
+    assert_eq!(after["result"]["safeSource"], json!("confirmation-depth"));
+}
+
+/// Enabling the flag can only make reads fresher. If BLS finality stalls behind the
+/// confirmation-depth head, tags stay on the confirmation-depth head.
+#[test]
+fn stalled_fast_finality_does_not_move_reads_backwards() {
+    // 21 blocks, not the usual 16: with exactly 15 distinct sealers Safe lands on the
+    // very first block, leaving nothing verified below it to stall on.
+    let chain = distinct_sealer_chain(20);
+    // A block strictly below the confirmation-depth Safe head, taken from the chain so
+    // the hash is one the client really verified — the point is the height, not the hash.
+    let expected_safe = newest_safe(&chain, 21).expect("safe").number;
+    let stale_block = chain
+        .iter()
+        .find(|b| b.number == expected_safe - 1)
+        .expect("a verified block below Safe")
+        .clone();
+
+    let snap = snapshot_for_chain(&chain);
+    let up = MockUpstream::for_chain(&chain, json!({}));
+    let mut node = Node::from_parts_with_snapshot(Box::new(up), 130, chain, snap, "fermi");
+    node.set_finality_mode(FinalityMode::Fast);
+
+    let conf_safe = node.handle(&req("helios_bsc_syncStatus", json!([])))["result"]["safe"]
+        .as_u64()
+        .expect("safe");
+    let stale = stale_block.number;
+    assert!(
+        stale < conf_safe,
+        "fixture must put the stale head below Safe"
+    );
+
+    node.publish_finality_for_test((stale, stale_block.hash), (stale, stale_block.hash));
+    let st = node.handle(&req("helios_bsc_syncStatus", json!([])));
+    assert_eq!(st["result"]["safe"].as_u64(), Some(conf_safe));
+    assert_eq!(st["result"]["safeSource"], json!("confirmation-depth"));
+    // The finality fields still report the stalled head honestly.
+    assert_eq!(st["result"]["finalizedBlock"].as_u64(), Some(stale));
+}
+
+/// Default build must be byte-for-byte the confirmation-depth behaviour even when a
+/// finalized head is known — the flag is the only thing that changes what tags mean.
+#[test]
+fn finality_flag_is_opt_in() {
+    let node = node_with_snapshot();
+    let st0 = node.handle(&req("helios_bsc_syncStatus", json!([])));
+    let conf_safe = st0["result"]["safe"].as_u64().expect("safe");
+    let head = st0["result"]["finalityHead"].as_u64().expect("head");
+    assert_eq!(st0["result"]["finalityMode"], json!("confirmation-depth"));
+
+    node.publish_finality_for_test((head - 1, [0xa1u8; 32]), (head - 2, [0xb2u8; 32]));
+    let st = node.handle(&req("helios_bsc_syncStatus", json!([])));
+    assert_eq!(
+        st["result"]["safe"].as_u64(),
+        Some(conf_safe),
+        "without --finality fast the read head must not move"
+    );
+    assert_eq!(st["result"]["safeSource"], json!("confirmation-depth"));
+    // ...while still *reporting* fast finality.
+    assert_eq!(st["result"]["finality"], json!("fast-finality"));
+}
+
+#[test]
+fn sync_status_keeps_every_pre_existing_key() {
+    // Wallets and `scripts/soak_vs_oracle.py` read these by name; a later refactor must
+    // not be able to drop one silently while the new finality keys distract review.
+    let node = node_with_snapshot();
+    let st = node.handle(&req("helios_bsc_syncStatus", json!([])));
+    let r = st["result"].as_object().expect("status object");
+    for key in [
+        "trustClass",
+        "finality",
+        "forkId",
+        "tip",
+        "safe",
+        "safeHash",
+        "lag",
+        "safeLagBlocks",
+        "safeLagSeconds",
+        "blockIntervalMs",
+        "distinctSealers",
+        "requiredSealers",
+        "nSeal",
+        "proofWindow",
+        "inProofWindow",
+        "sealingSetEnforced",
+        "originCheckpoint",
+        "proofOk",
+        "proofFail",
+        "headersVerified",
+        "unverifiedPassthrough",
+        "backupTransport",
+        "expectedSafeLagBlocks",
+        "safeLagWithinBound",
+    ] {
+        assert!(r.contains_key(key), "syncStatus lost key {key}: {st}");
+    }
 }
 
 #[test]
@@ -1225,9 +1540,7 @@ fn receipt_disabled_without_flag() {
     let chain = distinct_sealer_chain(15);
     let node = node_from_chain(chain, json!({}));
     let v = node.handle(&req("eth_getTransactionReceipt", json!(["0x01"])));
-    assert_eq!(err_code(&v), ERR_METHOD);
-    let msg = v["error"]["message"].as_str().unwrap();
-    assert!(msg.contains("unverified_passthrough"), "{msg}");
+    assert_eq!(err_code(&v), ERR_PARAMS, "{v}");
     let g = node.handle(&req("eth_gasPrice", json!([])));
     assert_eq!(err_code(&g), ERR_METHOD);
 }
@@ -1342,9 +1655,20 @@ fn send_raw_binds_local_hash() {
     assert!(msg.contains("hash"), "{msg}");
 }
 
+fn chain_omitted_receipts_root() -> Vec<VerifiedBlock> {
+    let mut chain = distinct_sealer_chain(15);
+    let mut hdr = header_from_verified(&chain[0], [0u8; 32]);
+    hdr.receipts_root = format!("0x{}", hex::encode([0x11u8; 32]));
+    let hash = header_hash(&hdr).unwrap();
+    hdr.hash = format!("0x{}", hex::encode(hash));
+    chain[0].hash = hash;
+    chain[0].header = Some(hdr);
+    chain
+}
+
 #[test]
 fn receipt_header_bound_with_flag() {
-    let chain = distinct_sealer_chain(15);
+    let chain = chain_omitted_receipts_root();
     let safe = newest_safe(&chain, 21).expect("safe");
     let txh = "0x1111111111111111111111111111111111111111111111111111111111111111";
     let mut up = MockUpstream::for_chain(&chain, json!({}));
@@ -1360,6 +1684,20 @@ fn receipt_header_bound_with_flag() {
     assert_eq!(err_code(&short), ERR_PARAMS, "{short}");
     let v = node.handle(&req("eth_getTransactionReceipt", json!([txh])));
     assert_eq!(v["result"]["status"], json!("0x1"), "{v}");
+
+    let empty_root = distinct_sealer_chain(15);
+    let empty_safe = newest_safe(&empty_root, 21).expect("safe");
+    let mut empty_up = MockUpstream::for_chain(&empty_root, json!({}));
+    empty_up.unverified = json!({
+        "blockHash": empty_safe.hash,
+        "blockNumber": format!("0x{:x}", empty_safe.number),
+        "status": "0x1",
+        "transactionHash": txh,
+    });
+    let mut empty_node = Node::from_parts(Box::new(empty_up), 130, empty_root);
+    empty_node.set_allow_unverified_passthrough(true);
+    let empty = empty_node.handle(&req("eth_getTransactionReceipt", json!([txh])));
+    assert!(empty["result"].is_null(), "{empty}");
 
     let swapped = {
         let mut u = MockUpstream::for_chain(&chain, json!({}));
@@ -1411,6 +1749,13 @@ fn receipt_header_bound_with_flag() {
 #[test]
 fn gas_price_passthrough_with_flag() {
     let chain = distinct_sealer_chain(15);
+    let off = Node::from_parts(
+        Box::new(MockUpstream::for_chain(&chain, json!({}))),
+        130,
+        chain.clone(),
+    );
+    let off_hist = off.handle(&req("eth_feeHistory", json!(["0x4", "latest", []])));
+    assert_eq!(err_code(&off_hist), ERR_METHOD, "{off_hist}");
     let mut up = MockUpstream::for_chain(&chain, json!({}));
     up.unverified = json!("0x12a05f200");
     let mut node = Node::from_parts(Box::new(up), 130, chain.clone());
@@ -1428,11 +1773,35 @@ fn gas_price_passthrough_with_flag() {
     let obj = obj_node.handle(&req("eth_gasPrice", json!([])));
     assert_eq!(err_code(&obj), ERR_PARAMS, "{obj}");
     let mut hist_up = MockUpstream::for_chain(&chain, json!({}));
-    hist_up.unverified = json!({"oldestBlock": "0x1", "baseFeePerGas": ["0x1"]});
+    hist_up.unverified = json!({"oldestBlock": "0x0", "baseFeePerGas": ["0x1"]});
     let mut hist_node = Node::from_parts(Box::new(hist_up), 130, chain.clone());
     hist_node.set_allow_unverified_passthrough(true);
     let hist = hist_node.handle(&req("eth_feeHistory", json!(["0x4", "latest", []])));
-    assert_eq!(hist["result"]["oldestBlock"], json!("0x1"), "{hist}");
+    assert_eq!(hist["result"]["oldestBlock"], json!("0x0"), "{hist}");
+    let mut no_ob_up = MockUpstream::for_chain(&chain, json!({}));
+    no_ob_up.unverified = json!({"baseFeePerGas": ["0x1"]});
+    let mut no_ob = Node::from_parts(Box::new(no_ob_up), 130, chain.clone());
+    no_ob.set_allow_unverified_passthrough(true);
+    let no = no_ob.handle(&req("eth_feeHistory", json!(["0x4", "latest", []])));
+    assert_eq!(no["result"]["baseFeePerGas"], json!(["0x1"]), "{no}");
+    let mut junk_up = MockUpstream::for_chain(&chain, json!({}));
+    junk_up.unverified = json!({"oldestBlock": "latest", "baseFeePerGas": ["0x1"]});
+    let mut junk_node = Node::from_parts(Box::new(junk_up), 130, chain.clone());
+    junk_node.set_allow_unverified_passthrough(true);
+    let junk = junk_node.handle(&req("eth_feeHistory", json!(["0x4", "latest", []])));
+    assert_eq!(err_code(&junk), ERR_PARAMS, "{junk}");
+    let mut above_up = MockUpstream::for_chain(&chain, json!({}));
+    above_up.unverified = json!({"oldestBlock": "0x1", "baseFeePerGas": ["0x1"]});
+    let mut above_node = Node::from_parts(Box::new(above_up), 130, chain.clone());
+    above_node.set_allow_unverified_passthrough(true);
+    let above = above_node.handle(&req("eth_feeHistory", json!(["0x4", "latest", []])));
+    assert_eq!(err_code(&above), ERR_NOT_SYNCED, "{above}");
+    let mut miss_up = MockUpstream::for_chain(&chain, json!({}));
+    miss_up.unverified = json!({"oldestBlock": "0xff", "baseFeePerGas": ["0x1"]});
+    let mut miss_node = Node::from_parts(Box::new(miss_up), 130, chain.clone());
+    miss_node.set_allow_unverified_passthrough(true);
+    let miss = miss_node.handle(&req("eth_feeHistory", json!(["0x4", "latest", []])));
+    assert_eq!(err_code(&miss), ERR_NOT_SYNCED, "{miss}");
     let mut bad_hist_up = MockUpstream::for_chain(&chain, json!({}));
     bad_hist_up.unverified = json!({"oldestBlock": "0x1", "baseFeePerGas": "0x1"});
     let mut bad_hist = Node::from_parts(Box::new(bad_hist_up), 130, chain);
@@ -1898,4 +2267,157 @@ fn get_raw_tx_by_hash_keccak_bind_with_flag() {
     node_bad.set_allow_unverified_passthrough(true);
     let bad = node_bad.handle(&req("eth_getRawTransactionByHash", json!([txh])));
     assert_eq!(err_code(&bad), ERR_PROOF_FAILED, "{bad}");
+}
+
+#[test]
+fn dummy_empty_receipts_root_get_block_receipts_empty() {
+    let chain = distinct_sealer_chain(15);
+    let node = node_from_chain(chain, json!({}));
+    let v = node.handle(&req("eth_getBlockReceipts", json!(["latest"])));
+    assert_eq!(v["result"], json!([]), "{v}");
+}
+
+#[test]
+fn get_logs_latest_empty_on_dummy() {
+    let chain = distinct_sealer_chain(15);
+    let node = node_from_chain(chain, json!({}));
+    let v = node.handle(&req(
+        "eth_getLogs",
+        json!([{"fromBlock":"latest","toBlock":"latest"}]),
+    ));
+    assert_eq!(v["result"], json!([]), "{v}");
+    let omitted = node.handle(&req("eth_getLogs", json!([{}])));
+    assert_eq!(omitted["result"], json!([]), "{omitted}");
+}
+
+#[test]
+fn get_logs_multi_block_range_invalid() {
+    let chain = distinct_sealer_chain(15);
+    let node = node_from_chain(chain, json!({}));
+    let v = node.handle(&req(
+        "eth_getLogs",
+        json!([{"fromBlock":"0x0","toBlock":"0x1"}]),
+    ));
+    assert_eq!(err_code(&v), ERR_PARAMS, "{v}");
+}
+
+#[test]
+fn get_logs_not_passthrough_deadbeef() {
+    let chain = distinct_sealer_chain(15);
+    let mut up = MockUpstream::for_chain(&chain, json!({}));
+    up.unverified = json!([{
+        "address": "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        "topics": [],
+        "data": "0xdeadbeef",
+        "blockHash": "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    }]);
+    up.receipts = vec![json!({
+        "status": "0x1",
+        "cumulativeGasUsed": "0x1",
+        "logsBloom": format!("0x{}", hex::encode([0u8; 256])),
+        "logs": [{
+            "address": "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "topics": [],
+            "data": "0xdeadbeef",
+        }],
+        "type": "0x0",
+    })];
+    let mut node = Node::from_parts(Box::new(up), 130, chain);
+    node.set_allow_unverified_passthrough(true);
+    let v = node.handle(&req("eth_getLogs", json!([{"fromBlock":"latest"}])));
+    assert_eq!(v["result"], json!([]), "{v}");
+    let s = v.to_string();
+    assert!(!s.contains("deadbeef"), "{v}");
+}
+
+#[test]
+fn get_block_receipts_root_mismatch_is_proof_failed() {
+    let mut chain = distinct_sealer_chain(15);
+    let rec = ConsensusReceipt {
+        status: 1,
+        cumulative_gas_used: 21_000,
+        logs_bloom: [0u8; 256],
+        logs: Vec::new(),
+        tx_type: 2,
+    };
+    let raw = encode_consensus_receipt(&rec).unwrap();
+    let root = ordered_trie_root(&[raw]);
+    let mut hdr = header_from_verified(&chain[0], [0u8; 32]);
+    hdr.receipts_root = format!("0x{}", hex::encode(root));
+    let hash = header_hash(&hdr).unwrap();
+    hdr.hash = format!("0x{}", hex::encode(hash));
+    chain[0].hash = hash;
+    chain[0].header = Some(hdr);
+    let mut up = MockUpstream::for_chain(&chain, json!({}));
+    up.receipts = vec![json!({
+        "status": "0x0",
+        "cumulativeGasUsed": "0x1",
+        "logsBloom": format!("0x{}", hex::encode([0u8; 256])),
+        "logs": [],
+        "type": "0x2",
+        "transactionHash": format!("0x{}", "11".repeat(32)),
+    })];
+    let node = Node::from_parts(Box::new(up), 130, chain);
+    let v = node.handle(&req("eth_getBlockReceipts", json!(["latest"])));
+    assert_eq!(err_code(&v), ERR_PROOF_FAILED, "{v}");
+}
+
+#[test]
+fn pending_receipt_still_passthrough_only() {
+    let chain = distinct_sealer_chain(15);
+    let txh = "0x1111111111111111111111111111111111111111111111111111111111111111";
+    let mut up = MockUpstream::for_chain(&chain, json!({}));
+    up.unverified = json!({
+        "blockHash": Value::Null,
+        "blockNumber": Value::Null,
+        "transactionHash": txh,
+        "status": "0x1",
+    });
+    let node = Node::from_parts(Box::new(up), 130, chain);
+    let v = node.handle(&req("eth_getTransactionReceipt", json!([txh])));
+    assert_eq!(err_code(&v), ERR_METHOD, "{v}");
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("unverified_passthrough"), "{msg}");
+}
+
+#[test]
+fn get_transaction_receipt_verified_without_flag() {
+    let mut chain = distinct_sealer_chain(15);
+    let rec = ConsensusReceipt {
+        status: 1,
+        cumulative_gas_used: 21_000,
+        logs_bloom: [0u8; 256],
+        logs: Vec::new(),
+        tx_type: 2,
+    };
+    let raw = encode_consensus_receipt(&rec).unwrap();
+    let root = ordered_trie_root(&[raw]);
+    let mut hdr = header_from_verified(&chain[0], [0u8; 32]);
+    hdr.receipts_root = format!("0x{}", hex::encode(root));
+    let hash = header_hash(&hdr).unwrap();
+    hdr.hash = format!("0x{}", hex::encode(hash));
+    chain[0].hash = hash;
+    chain[0].header = Some(hdr.clone());
+    let txh = format!("0x{}", "11".repeat(32));
+    let mut up = MockUpstream::for_chain(&chain, json!({}));
+    up.receipts = vec![json!({
+        "status": "0x1",
+        "cumulativeGasUsed": "0x5208",
+        "logsBloom": format!("0x{}", hex::encode([0u8; 256])),
+        "logs": [],
+        "type": "0x2",
+        "transactionHash": txh,
+    })];
+    up.unverified = json!({
+        "blockHash": hdr.hash,
+        "blockNumber": hdr.number,
+        "transactionHash": txh,
+        "status": "0x1",
+    });
+    let node = Node::from_parts(Box::new(up), 130, chain);
+    let v = node.handle(&req("eth_getTransactionReceipt", json!([txh])));
+    assert_eq!(v["result"]["status"], json!("0x1"), "{v}");
+    assert_eq!(v["result"]["transactionHash"], json!(txh), "{v}");
+    let blk = node.handle(&req("eth_getBlockReceipts", json!(["latest"])));
+    assert_eq!(blk["result"].as_array().map(|a| a.len()), Some(1), "{blk}");
 }

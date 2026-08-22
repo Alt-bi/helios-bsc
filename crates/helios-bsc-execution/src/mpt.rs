@@ -26,6 +26,8 @@ pub enum MptError {
     BadAccount,
     #[error("key leftover after leaf")]
     KeyLeftover,
+    #[error("storage leaf is not rlp(uint256)")]
+    BadStorageLeaf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,15 +195,26 @@ pub fn verify_storage_proof(
         return Ok(Vec::new());
     }
     let key = keccak256(slot);
-    let raw = verify_trie_proof(storage_root, &key, proof)?.unwrap_or_default();
-    Ok(decode_storage_leaf(&raw))
+    match verify_trie_proof(storage_root, &key, proof)? {
+        // Verified exclusion: the slot is unset, which is the zero word.
+        None => Ok(Vec::new()),
+        Some(raw) => decode_storage_leaf(&raw),
+    }
 }
 
-/// Storage trie leaves hold `rlp(word)`. Some proofs store the raw word.
-fn decode_storage_leaf(raw: &[u8]) -> Vec<u8> {
+/// Storage trie leaves hold `rlp(uint256)` — geth stores a `uint256.Int`, so the
+/// decoded word is at most 32 bytes.
+///
+/// This used to fall back to `raw.to_vec()` on any decode failure, which is a silent
+/// wrong answer rather than a refusal: the caller pads to 32 bytes with [`crate::pad32`],
+/// which keeps the *low* 32 bytes, so an over-long or non-RLP leaf would be quietly
+/// truncated into a plausible-looking storage value. The leaf is hash-bound to the
+/// storage root so this is not reachable from a lying upstream today, but "cannot
+/// happen" is a reason to error, not a reason to guess.
+fn decode_storage_leaf(raw: &[u8]) -> Result<Vec<u8>, MptError> {
     match decode(raw) {
-        Ok(Rlp::Bytes(b)) => b.to_vec(),
-        _ => raw.to_vec(),
+        Ok(Rlp::Bytes(b)) if b.len() <= 32 => Ok(b.to_vec()),
+        _ => Err(MptError::BadStorageLeaf),
     }
 }
 
@@ -229,15 +242,33 @@ pub(crate) fn bytes_to_nibbles(b: &[u8]) -> Vec<u8> {
     n
 }
 
+/// Yellow Paper hex-prefix decode, canonical spellings only.
+///
+/// geth's own `trie/encoding.go` comment states the rule: "The high nibble of the first
+/// byte contains the flag; the lowest bit encoding the oddness of the length and the
+/// second-lowest encoding whether the node at the key is a value node. The low nibble of
+/// the first byte is zero in the case of an even number of nibbles."
+///
+/// So only flags 0..=3 exist. `compactToHex` never validates that — it infers leaf-ness
+/// from the terminator nibble instead — and its leniency does not match ours: for flag 4
+/// or 5 geth keeps the terminator and reads a **leaf**, while masking `flag & 2` here
+/// reads an **extension**. Rather than reproduce one arbitrary reading of a byte that
+/// cannot occur, refuse it. Every node reaching this function is hash-bound to a root
+/// taken from a sealed header, so a non-canonical prefix is unreachable in practice;
+/// this removes the divergence rather than picking a side of it.
 pub(crate) fn hex_prefix_decode(path: &[u8]) -> Result<(Vec<u8>, bool), MptError> {
+    let bad = || MptError::PathMismatch {
+        index: 0,
+        remaining: 0,
+        path_len: 0,
+    };
     if path.is_empty() {
-        return Err(MptError::PathMismatch {
-            index: 0,
-            remaining: 0,
-            path_len: 0,
-        });
+        return Err(bad());
     }
     let flag = path[0] >> 4;
+    if flag > 3 {
+        return Err(bad());
+    }
     let odd = flag & 1 == 1;
     let is_leaf = flag & 2 == 2;
     let mut nibs = bytes_to_nibbles(path);
@@ -245,11 +276,11 @@ pub(crate) fn hex_prefix_decode(path: &[u8]) -> Result<(Vec<u8>, bool), MptError
         nibs.remove(0);
     } else {
         if nibs.len() < 2 {
-            return Err(MptError::PathMismatch {
-                index: 0,
-                remaining: 0,
-                path_len: 0,
-            });
+            return Err(bad());
+        }
+        // Even length: the low nibble of the first byte is padding and must be zero.
+        if nibs[1] != 0 {
+            return Err(bad());
         }
         nibs.drain(..2);
     }
@@ -267,6 +298,12 @@ fn decode_account(value: &[u8]) -> Result<Account, MptError> {
         .as_bytes()
         .map_err(|_| MptError::BadAccount)?
         .to_vec();
+    // geth's `types.StateAccount.Balance` is a `uint256.Int`, so RLP decoding rejects
+    // anything wider. Ours reached `pad32`, which keeps the low 32 bytes — a silent
+    // truncation into a plausible balance rather than a refusal.
+    if balance.len() > 32 {
+        return Err(MptError::BadAccount);
+    }
     let storage = items[2].as_bytes().map_err(|_| MptError::BadAccount)?;
     let code = items[3].as_bytes().map_err(|_| MptError::BadAccount)?;
     if storage.len() != 32 || code.len() != 32 {
@@ -325,6 +362,113 @@ mod tests {
         kids[0] = rlp_bytes(&[0x11u8; 32]);
         kids[nibble] = child;
         rlp_list(&kids)
+    }
+
+    /// The leaf is hash-bound, so these shapes are unreachable from a lying upstream —
+    /// but the old fallback answered them with `raw.to_vec()`, which `pad32` then trims
+    /// to its low 32 bytes. A wrong storage value is worse than a refusal.
+    #[test]
+    fn malformed_storage_leaf_refuses_rather_than_truncating() {
+        assert_eq!(
+            decode_storage_leaf(&rlp_bytes(&[0x07])).unwrap(),
+            vec![0x07]
+        );
+        let word = [0xabu8; 32];
+        assert_eq!(decode_storage_leaf(&rlp_bytes(&word)).unwrap(), word);
+
+        // 33 bytes: wider than a uint256. Previously kept the low 32 and looked fine.
+        let mut wide = vec![0xb8u8, 33];
+        wide.extend_from_slice(&[0xcd; 33]);
+        assert!(matches!(
+            decode_storage_leaf(&wide),
+            Err(MptError::BadStorageLeaf)
+        ));
+
+        // A list where a word belongs, and trailing bytes after a valid word.
+        assert!(decode_storage_leaf(&rlp_list(&[rlp_bytes(&[1])])).is_err());
+        let mut trailing = rlp_bytes(&word);
+        trailing.push(0x00);
+        assert!(decode_storage_leaf(&trailing).is_err());
+    }
+
+    /// An account list is always long-form (two 32-byte hashes alone exceed 55 bytes).
+    fn rlp_list_long(items: &[Vec<u8>]) -> Vec<u8> {
+        let payload: Vec<u8> = items.concat();
+        assert!(payload.len() > 55 && payload.len() < 256);
+        let mut o = vec![0xf8u8, payload.len() as u8];
+        o.extend(payload);
+        o
+    }
+
+    #[test]
+    fn account_balance_wider_than_uint256_rejected() {
+        let ok = rlp_list_long(&[
+            rlp_bytes(&[0x01]),
+            rlp_bytes(&[0x02]),
+            rlp_bytes(&EMPTY_TRIE_ROOT),
+            rlp_bytes(&EMPTY_CODE_HASH),
+        ]);
+        assert_eq!(decode_account(&ok).unwrap().balance, vec![0x02]);
+
+        // Same account with a 33-byte balance, spelled canonically (`0x80+33`) so the
+        // RLP layer has no objection and the width check is what has to catch it.
+        // `pad32` would otherwise have kept its low 32 bytes and looked like a balance.
+        let wide = rlp_list_long(&[
+            rlp_bytes(&[0x01]),
+            rlp_bytes(&[0xff; 33]),
+            rlp_bytes(&EMPTY_TRIE_ROOT),
+            rlp_bytes(&EMPTY_CODE_HASH),
+        ]);
+        assert!(matches!(decode_account(&wide), Err(MptError::BadAccount)));
+
+        // The non-canonical long-form spelling of the same thing is refused one layer
+        // earlier, by the RLP reader itself.
+        let mut long_form = vec![0xb8u8, 33];
+        long_form.extend_from_slice(&[0xff; 33]);
+        let non_canon = rlp_list_long(&[
+            rlp_bytes(&[0x01]),
+            long_form,
+            rlp_bytes(&EMPTY_TRIE_ROOT),
+            rlp_bytes(&EMPTY_CODE_HASH),
+        ]);
+        assert!(matches!(
+            decode_account(&non_canon),
+            Err(MptError::Rlp(RlpError::NonCanonical))
+        ));
+    }
+
+    /// Only flags 0..=3 exist per the Yellow Paper. geth's `compactToHex` infers
+    /// leaf-ness from the terminator nibble instead of masking, so for flag 4 or 5 it
+    /// reads a leaf where masking `flag & 2` reads an extension. Refusing the byte is
+    /// the only reading that cannot silently disagree with geth.
+    #[test]
+    fn non_canonical_hex_prefix_refused() {
+        // The four legal spellings still decode.
+        assert_eq!(
+            hex_prefix_decode(&[0x00, 0xab]).unwrap(),
+            (vec![0xa, 0xb], false)
+        );
+        assert_eq!(hex_prefix_decode(&[0x1a]).unwrap(), (vec![0xa], false));
+        assert_eq!(
+            hex_prefix_decode(&[0x20, 0xab]).unwrap(),
+            (vec![0xa, 0xb], true)
+        );
+        assert_eq!(hex_prefix_decode(&[0x3a]).unwrap(), (vec![0xa], true));
+
+        // Flags 4..15: geth would call 0x4_ and 0x5_ leaves, we would have called them
+        // extensions. Neither guess is made.
+        for flag in 4u8..16 {
+            assert!(
+                hex_prefix_decode(&[flag << 4, 0xab]).is_err(),
+                "flag {flag:x} accepted"
+            );
+        }
+
+        // Even length: the low nibble of the first byte is padding and must be zero.
+        assert!(hex_prefix_decode(&[0x07, 0xab]).is_err());
+        assert!(hex_prefix_decode(&[0x27, 0xab]).is_err());
+
+        assert!(hex_prefix_decode(&[]).is_err());
     }
 
     #[test]

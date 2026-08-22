@@ -80,7 +80,16 @@ assert nonce == 8 zero bytes                    # Parlia prepare uses empty nonc
 assert keccak256(RLP(header)) == header.hash   # geth Header.Hash(); binds identity used in parent links
 assert epoch extraData parses (n≥1 unique records; Bohr turnLength 1..=64)  # membership still --checkpoint
 assert withdrawalsRoot is empty MPT (Cancun+ / present)
-assert MilliTimestamp >= parent.MilliTimestamp + BlockInterval   # Ramanujan floor; out-of-turn backoff not applied
+assert baseFeePerGas == 0 after London (31_302_048), absent before
+    # CalcBaseFee opens `if config.IsInBSC() { return InitialBaseFeeForBSC }`; IsInBSC() is
+    # `Parlia != nil` and the constant is 0, so BSC has no parent baseFee formula at all.
+assert MilliTimestamp >= parent.MilliTimestamp + BlockInterval   # Ramanujan floor (backOffTime == 0, i.e. in-turn)
+assert difficulty != 1 or MilliTimestamp >= parent.MilliTimestamp + BlockInterval + initialBackOff
+    # out-of-turn refinement; initialBackOff = 2000ms if parent past Lorentz else 1000ms.
+    # geth adds backOffSteps[idx]*wiggleTime from a Go math/rand shuffle we cannot reproduce;
+    # that term is >= 0, so dropping it under-estimates the floor and never rejects an honest block.
+    # No-op unless: sealing set trusted, parent millisecond walked, countRecents window fully
+    # walked, and the in-turn validator has NOT signed recently (which is what zeroes geth's delay).
 assert |gasLimit - parent.gasLimit| < parent.gasLimit / 1024 (Lorentz+; 256 pre-Lorentz) and gasLimit >= 5000
 assert signer == header.coinbase
 assert signer ∈ active_sealing_set

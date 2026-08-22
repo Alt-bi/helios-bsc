@@ -209,6 +209,9 @@ fn call_gas(tx: &CallTx, block: &CallBlock) -> u64 {
     user.min(CALL_GAS_CAP).min(block.gas_limit)
 }
 
+/// The slot a `storageProof[].key` denotes. Over-long keys are refused, not folded:
+/// `pad32` keeps the **low** 32 bytes, so a 33-byte key would alias a real slot and
+/// seed the revm state map under a slot the caller never asked about.
 fn decode_slot_key(s: &str) -> Result<[u8; 32], ProofError> {
     let raw = helios_bsc_types::hexutil::strip_0x(s);
     let even = if raw.len() % 2 == 1 {
@@ -217,6 +220,11 @@ fn decode_slot_key(s: &str) -> Result<[u8; 32], ProofError> {
         raw.to_string()
     };
     let b = hex::decode(even).map_err(|e| ProofError::Json(e.to_string()))?;
+    if b.len() > 32 {
+        return Err(ProofError::ClaimMismatch(
+            "storageProof key wider than a slot",
+        ));
+    }
     Ok(pad32(&b))
 }
 
@@ -657,6 +665,19 @@ pub fn eth_estimate_gas_verified<P: ProveAtSafe>(
 
 #[cfg(test)]
 mod tests {
+    /// `pad32` keeps the **low** 32 bytes, so a 33-byte `storageProof[].key` would fold
+    /// onto a real slot and seed the revm state map under a slot nobody asked about.
+    #[test]
+    fn over_long_slot_key_refused_not_folded() {
+        use super::decode_slot_key;
+        assert_eq!(decode_slot_key("0x01").unwrap()[31], 1);
+        let word = format!("0x{}", "ab".repeat(32));
+        assert!(decode_slot_key(&word).is_ok());
+        // Same low 32 bytes, one byte wider.
+        let wide = format!("0xff{}", "ab".repeat(32));
+        assert!(decode_slot_key(&wide).is_err());
+    }
+
     use super::*;
     use crate::{encode_data32, encode_qty, verify_eth_get_proof};
     use helios_bsc_types::{decode_hex, decode_hex_fixed, keccak256};

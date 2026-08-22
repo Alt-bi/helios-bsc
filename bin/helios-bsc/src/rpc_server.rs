@@ -11,15 +11,20 @@ use helios_bsc_config::{
     expected_safe_lag_blocks, mainnet_current_fork, mainnet_n_seal, max_reorg_depth,
     safe_lag_seconds, safe_lag_within_slo, PROVIDER_PROOF_LOOKBACK,
 };
+#[cfg(test)]
+use helios_bsc_consensus::VoteData;
 use helios_bsc_consensus::{
-    checkpoint_at_snapshot, header_hash, proof_lag, within_proof_window, Snapshot, VerifiedBlock,
+    checkpoint_age_secs, checkpoint_at_snapshot, header_hash, proof_lag, unix_now,
+    within_proof_window, Snapshot, VerifiedBlock,
 };
 use helios_bsc_execution::{
-    encode_data32, encode_qty, eth_call_verified, eth_estimate_gas_verified, pad32,
-    retain_requested_storage, validate_bsc_raw_tx, verify_account_code, verify_eth_get_proof,
-    verify_storage_slot, verify_tx_list, CallBlock, CallError, CallTx, EthAccountProof, ProofError,
-    ProveAtSafe, VerifiedAccount, CALL_GAS_CAP, EMPTY_CODE_HASH, EMPTY_TRIE_ROOT,
-    MAX_CALL_ACCOUNTS, MAX_CALL_DATA, MAX_CODE_SIZE, MAX_RAW_TX,
+    encode_consensus_receipt, encode_data32, encode_qty, eth_call_verified,
+    eth_estimate_gas_verified, pad32, retain_requested_storage, validate_bsc_raw_tx,
+    verify_account_code, verify_eth_get_proof, verify_receipt_list, verify_storage_slot,
+    verify_tx_list, CallBlock, CallError, CallTx, ConsensusLog, ConsensusReceipt, EthAccountProof,
+    ProofError, ProveAtSafe, VerifiedAccount, CALL_GAS_CAP, EMPTY_CODE_HASH, EMPTY_TRIE_ROOT,
+    MAX_CALL_ACCOUNTS, MAX_CALL_DATA, MAX_CODE_SIZE, MAX_LOG_TOPICS, MAX_ORDERED_TRIE_ITEMS,
+    MAX_RAW_TX, MAX_RECEIPT_LOGS,
 };
 use helios_bsc_rpc::{
     jsonrpc_id_ok, jsonrpc_is_v2, jsonrpc_params_len, jsonrpc_params_ok, method_policy, rpc_err,
@@ -55,9 +60,85 @@ pub struct Node {
     proof_ok: AtomicU64,
     proof_fail: AtomicU64,
     headers_verified: AtomicU64,
+    /// Sync failures after the tip was fetched (seal / parent-link / Safe).
+    header_verify_fail: AtomicU64,
+    /// Upstream `eth_blockNumber` failures (transport, not verification).
+    upstream_errors: AtomicU64,
+    /// Last observed tip / Safe, published after each sync so `/metrics` never has to
+    /// take the chain lock. [`NO_BLOCK`] means "not known yet".
+    last_tip: AtomicU64,
+    last_safe: AtomicU64,
+    /// Last observed fast-finality heads (BEP-126): the newest attestation's target
+    /// (justified) and source (finalized). Published on the same path as `last_tip` /
+    /// `last_safe` for the same reason — a scrape must never take the chain lock.
+    /// [`NO_BLOCK`] means "no attestation seen yet", which is a normal state.
+    last_justified: AtomicU64,
+    last_finalized: AtomicU64,
+    /// Consistent view of fast finality, published by `refresh` from one read under the
+    /// snapshot lock.
+    ///
+    /// Reading the snapshot again from `status_fields` looked equivalent and was not: the
+    /// background sync can advance it between `refresh` sampling the tip and the status
+    /// read, which reported a justified head *above* the tip and a finality lag of 0 while
+    /// the real lag was 2. Numbers, hashes and the head they are measured against have to
+    /// come from the same instant.
+    finality: Mutex<FinalityView>,
+    /// Which finality rule block tags resolve to. Default is confirmation depth.
+    finality_mode: FinalityMode,
+    /// Serialises checkpoint persistence. The background sync thread and any request
+    /// thread can both reach `persist_verified_tip`, and two writers racing on the same
+    /// file is how a checkpoint ends up truncated — the one outcome tmp+rename exists to
+    /// prevent.
+    persist_lock: Mutex<()>,
     allow_unverified_passthrough: bool,
     backup_transport: bool,
+    metrics_enabled: bool,
 }
+
+/// Sentinel for an unpublished `last_tip` / `last_safe` / finality gauge.
+const NO_BLOCK: u64 = u64::MAX;
+
+/// Which rule decides the head that block tags resolve to.
+///
+/// The design doc specifies fast finality as feature-flagged, and it stays that way:
+/// changing what `latest` means for a wallet is a behavioural change, and the ≥24h
+/// differential soak is the gate for making it the default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FinalityMode {
+    /// Newest block with ≥`floor(2N/3)+1` distinct subsequent sealers. ~106–113 blocks.
+    #[default]
+    ConfirmationDepth,
+    /// BLS-finalized head (BEP-126) when one is known, else confirmation depth. ~2 blocks.
+    Fast,
+}
+
+/// Fast-finality heads and the verified head they were measured against, all sampled at
+/// the same instant. See [`Node::finality`].
+#[derive(Clone, Default)]
+struct FinalityView {
+    /// Verified head at the time of the read; the lags are relative to this, not to a
+    /// tip sampled elsewhere.
+    head: u64,
+    available: bool,
+    justified: Option<(u64, [u8; 32])>,
+    finalized: Option<(u64, [u8; 32])>,
+    /// Head block tags resolved to at that same instant, and whether fast finality is
+    /// what chose it. Carried here rather than re-derived in `status_fields`, because a
+    /// concurrent sync can publish a newer view between a request's own `refresh` and its
+    /// status read — comparing the two produced a `safeSource` that disagreed with the
+    /// `safe` printed beside it.
+    read_head: Option<SafeHead>,
+    read_head_is_fast: bool,
+}
+
+/// Request threads serving the local JSON-RPC listener.
+///
+/// More than one because the listener must stay answerable while a request is blocked:
+/// `helios_bsc_syncStatus` triggers a sync, and against an upstream that does not support
+/// JSON-RPC batching a cold walk is one round-trip per header — minutes. A single accept
+/// loop would hold `/metrics` behind it for that whole time, which is precisely when a
+/// scrape is worth having. Fixed and small, so this cannot become a thread-spawn amplifier.
+const RPC_WORKER_THREADS: usize = 4;
 
 impl Node {
     pub fn bootstrap(up: Box<dyn RpcUpstream>, lookback: u64) -> Result<Self> {
@@ -65,7 +146,7 @@ impl Node {
         let from = tip.saturating_sub(lookback.saturating_sub(1));
         eprintln!("sync {from}..={tip}");
         let chain = walk_headers(up.as_ref(), from, tip)?;
-        let _ = safe_of(&chain)?;
+        let safe = safe_of(&chain)?;
         let n = chain.len() as u64;
         Ok(Self {
             up,
@@ -80,8 +161,19 @@ impl Node {
             proof_ok: AtomicU64::new(0),
             proof_fail: AtomicU64::new(0),
             headers_verified: AtomicU64::new(n),
+            header_verify_fail: AtomicU64::new(0),
+            upstream_errors: AtomicU64::new(0),
+            last_tip: AtomicU64::new(tip),
+            last_safe: AtomicU64::new(safe.number),
+            // Lookback bootstrap carries no snapshot, so no attestation is known yet.
+            last_justified: AtomicU64::new(NO_BLOCK),
+            last_finalized: AtomicU64::new(NO_BLOCK),
             allow_unverified_passthrough: false,
             backup_transport: false,
+            finality: Mutex::new(FinalityView::default()),
+            finality_mode: FinalityMode::default(),
+            persist_lock: Mutex::new(()),
+            metrics_enabled: false,
         })
     }
 
@@ -102,8 +194,10 @@ impl Node {
         let fork_id = checkpoint.fork_id.clone();
         let (chain, snapshot) =
             walk_from_checkpoint(up.as_ref(), checkpoint.clone(), tip, max_sync)?;
-        let _ = safe_of(&chain)?;
+        let safe = safe_of(&chain)?;
         let n = chain.len() as u64;
+        let justified = snapshot.justified().map(|(b, _)| b);
+        let finalized = snapshot.finalized().map(|(b, _)| b);
         Ok(Self {
             up,
             lookback,
@@ -117,8 +211,18 @@ impl Node {
             proof_ok: AtomicU64::new(0),
             proof_fail: AtomicU64::new(0),
             headers_verified: AtomicU64::new(n),
+            header_verify_fail: AtomicU64::new(0),
+            upstream_errors: AtomicU64::new(0),
+            last_tip: AtomicU64::new(tip),
+            last_safe: AtomicU64::new(safe.number),
+            last_justified: AtomicU64::new(justified.unwrap_or(NO_BLOCK)),
+            last_finalized: AtomicU64::new(finalized.unwrap_or(NO_BLOCK)),
             allow_unverified_passthrough: false,
             backup_transport: false,
+            finality: Mutex::new(FinalityView::default()),
+            finality_mode: FinalityMode::default(),
+            persist_lock: Mutex::new(()),
+            metrics_enabled: false,
         })
     }
 
@@ -138,8 +242,18 @@ impl Node {
             proof_ok: AtomicU64::new(0),
             proof_fail: AtomicU64::new(0),
             headers_verified: AtomicU64::new(0),
+            header_verify_fail: AtomicU64::new(0),
+            upstream_errors: AtomicU64::new(0),
+            last_tip: AtomicU64::new(NO_BLOCK),
+            last_safe: AtomicU64::new(NO_BLOCK),
+            last_justified: AtomicU64::new(NO_BLOCK),
+            last_finalized: AtomicU64::new(NO_BLOCK),
             allow_unverified_passthrough: false,
             backup_transport: false,
+            finality: Mutex::new(FinalityView::default()),
+            finality_mode: FinalityMode::default(),
+            persist_lock: Mutex::new(()),
+            metrics_enabled: false,
         }
     }
 
@@ -164,8 +278,18 @@ impl Node {
             proof_ok: AtomicU64::new(0),
             proof_fail: AtomicU64::new(0),
             headers_verified: AtomicU64::new(0),
+            header_verify_fail: AtomicU64::new(0),
+            upstream_errors: AtomicU64::new(0),
+            last_tip: AtomicU64::new(NO_BLOCK),
+            last_safe: AtomicU64::new(NO_BLOCK),
+            last_justified: AtomicU64::new(NO_BLOCK),
+            last_finalized: AtomicU64::new(NO_BLOCK),
             allow_unverified_passthrough: false,
             backup_transport: false,
+            finality: Mutex::new(FinalityView::default()),
+            finality_mode: FinalityMode::default(),
+            persist_lock: Mutex::new(()),
+            metrics_enabled: false,
         }
     }
 
@@ -184,6 +308,237 @@ impl Node {
 
     pub fn set_backup_transport(&mut self, yes: bool) {
         self.backup_transport = yes;
+    }
+
+    pub fn set_metrics_enabled(&mut self, yes: bool) {
+        self.metrics_enabled = yes;
+    }
+
+    pub fn set_finality_mode(&mut self, mode: FinalityMode) {
+        self.finality_mode = mode;
+    }
+
+    /// Head that block tags resolve to: `latest` / `safe` / `finalized`, and the ceiling
+    /// on historical reads.
+    ///
+    /// Confirmation depth unless `--finality fast`. In fast mode the BLS-finalized head
+    /// is used only when it is **newer** than confirmation depth and names a block this
+    /// client verified itself — an attestation pointing at a block we never walked is an
+    /// upstream's word, not a head. Taking the newer of the two also means enabling the
+    /// flag can never move reads backwards: both rules are complete finality rules on
+    /// their own, so the head is final under at least one of them either way.
+    fn read_head(
+        &self,
+        chain: &[VerifiedBlock],
+        snapshot: Option<&Snapshot>,
+        conf_safe: &SafeHead,
+    ) -> SafeHead {
+        if self.finality_mode != FinalityMode::Fast {
+            return conf_safe.clone();
+        }
+        // One definition of the rule, shared with `soak --finality fast`: the gate and
+        // the thing it gates must not be able to disagree about which head that is.
+        // `distinct_sealers` / `required_sealers` stay the confirmation-depth counts;
+        // `safeSource` on `helios_bsc_syncStatus` says which rule actually chose.
+        crate::sync::fast_finality_head(chain, snapshot, conf_safe)
+    }
+
+    pub fn metrics_enabled(&self) -> bool {
+        self.metrics_enabled
+    }
+
+    /// Hold the chain lock, so a test can prove `/metrics` does not need it.
+    #[cfg(test)]
+    pub fn lock_chain_for_test(&self) -> std::sync::MutexGuard<'_, Vec<VerifiedBlock>> {
+        self.chain.lock().expect("chain lock")
+    }
+
+    /// Run `f` while the finality lock is held, so a test can park a concurrent
+    /// `refresh` exactly at its publish step. See [`Node::finality`].
+    #[cfg(test)]
+    pub fn hold_finality_lock_for_test<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _held = self.finality.lock().expect("finality lock");
+        f()
+    }
+
+    /// Non-blocking probe: is the chain lock held by somebody else right now?
+    #[cfg(test)]
+    pub fn chain_lock_is_held_for_test(&self) -> bool {
+        self.chain.try_lock().is_err()
+    }
+
+    /// Last published tip gauge; `None` is the [`NO_BLOCK`] "no sync yet" sentinel.
+    #[cfg(test)]
+    pub fn published_tip_for_test(&self) -> Option<u64> {
+        let t = self.last_tip.load(Ordering::Relaxed);
+        (t != NO_BLOCK).then_some(t)
+    }
+
+    /// Publish a fast-finality pair exactly as a successful `refresh` would.
+    ///
+    /// The mock chain has no real BLS attestations, and forging one here would prove
+    /// nothing: whether a signature is genuine is settled in `helios-bsc-consensus`
+    /// against live mainnet fixtures. What these tests cover instead is the reporting
+    /// path — that a known head reaches `/metrics` and `syncStatus`, and that an unknown
+    /// one reads as `-1` / `null` rather than zero.
+    #[cfg(test)]
+    pub fn publish_finality_for_test(
+        &self,
+        justified: (u64, [u8; 32]),
+        finalized: (u64, [u8; 32]),
+    ) {
+        if let Some(snap) = self.snapshot.lock().expect("snapshot lock").as_mut() {
+            snap.attestation = Some(VoteData {
+                source_number: finalized.0,
+                source_hash: finalized.1,
+                target_number: justified.0,
+                target_hash: justified.1,
+            });
+        }
+        self.last_justified.store(justified.0, Ordering::Relaxed);
+        self.last_finalized.store(finalized.0, Ordering::Relaxed);
+        let mut view = self.finality.lock().expect("finality lock");
+        view.available = true;
+        view.justified = Some(justified);
+        view.finalized = Some(finalized);
+    }
+
+    /// Prometheus text exposition (`docs/slo.md`).
+    ///
+    /// **Lock-free by construction.** It reads only atomics published by the last
+    /// successful sync — never the chain mutex, and never `refresh()`. Both matter:
+    /// a scrape must not drive upstream RPC load, and it must not queue behind a sync
+    /// that is holding the chain lock across slow network I/O. Otherwise scrapes time
+    /// out exactly when the node is struggling, which is when metrics are needed most.
+    /// Values are therefore as of the last sync: a stalled poller surfaces as a
+    /// growing `safe_lag`, it does not hide behind a fetch.
+    pub fn metrics_text(&self) -> String {
+        let raw_tip = self.last_tip.load(Ordering::Relaxed);
+        let raw_safe = self.last_safe.load(Ordering::Relaxed);
+        let raw_justified = self.last_justified.load(Ordering::Relaxed);
+        let raw_finalized = self.last_finalized.load(Ordering::Relaxed);
+        let tip = (raw_tip != NO_BLOCK).then_some(raw_tip);
+        let safe = (raw_safe != NO_BLOCK).then_some(raw_safe);
+        let justified = (raw_justified != NO_BLOCK).then_some(raw_justified);
+        let finalized = (raw_finalized != NO_BLOCK).then_some(raw_finalized);
+        let interval_ms = mainnet_current_fork().block_interval_ms;
+        let lag = match (tip, safe) {
+            (Some(t), Some(s)) => Some(proof_lag(t, s)),
+            _ => None,
+        };
+        let finalized_lag = match (tip, finalized) {
+            (Some(t), Some(f)) => Some(proof_lag(t, f)),
+            _ => None,
+        };
+        let checkpoint_age = self
+            .origin
+            .as_ref()
+            .map(|cp| checkpoint_age_secs(cp.timestamp, unix_now()));
+
+        let mut out = String::with_capacity(2048);
+        let mut counter = |name: &str, help: &str, v: u64| {
+            out.push_str(&format!(
+                "# HELP {name} {help}\n# TYPE {name} counter\n{name} {v}\n"
+            ));
+        };
+        counter(
+            "helios_bsc_headers_verified_total",
+            "Headers whose seal and parent link verified since process start.",
+            self.headers_verified.load(Ordering::Relaxed),
+        );
+        counter(
+            "helios_bsc_header_verify_fail_total",
+            "Sync attempts rejected after the tip was fetched (seal, parent link, or no Safe).",
+            self.header_verify_fail.load(Ordering::Relaxed),
+        );
+        counter(
+            "helios_bsc_proof_success_total",
+            "Merkle proofs that verified against a Safe stateRoot.",
+            self.proof_ok.load(Ordering::Relaxed),
+        );
+        counter(
+            "helios_bsc_proof_fail_total",
+            "Merkle proofs rejected (root mismatch or malformed trie node).",
+            self.proof_fail.load(Ordering::Relaxed),
+        );
+        counter(
+            "helios_bsc_upstream_errors_total",
+            "Upstream transport failures fetching the tip (not a verification failure).",
+            self.upstream_errors.load(Ordering::Relaxed),
+        );
+
+        let mut gauge = |name: &str, help: &str, v: String| {
+            out.push_str(&format!(
+                "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {v}\n"
+            ));
+        };
+        gauge(
+            "helios_bsc_tip_block",
+            "Highest locally verified block number (-1 before the first sync).",
+            tip.map_or_else(|| "-1".into(), |t| t.to_string()),
+        );
+        gauge(
+            "helios_bsc_safe_block",
+            "Confirmation-depth Safe head (-1 when no Safe head exists yet).",
+            safe.map_or_else(|| "-1".into(), |s| s.to_string()),
+        );
+        gauge(
+            "helios_bsc_safe_lag_blocks",
+            "Tip minus Safe, in blocks (-1 when no Safe head exists yet).",
+            lag.map_or_else(|| "-1".into(), |l| l.to_string()),
+        );
+        gauge(
+            "helios_bsc_safe_lag_seconds",
+            "Tip minus Safe, in seconds (-1 when no Safe head exists yet).",
+            lag.map_or_else(
+                || "-1".into(),
+                |l| safe_lag_seconds(l, interval_ms).to_string(),
+            ),
+        );
+        gauge(
+            "helios_bsc_safe_lag_within_bound",
+            "1 when Safe lag is inside the documented SLO bound, else 0.",
+            lag.map_or_else(
+                || "0".into(),
+                |l| u8::from(safe_lag_within_slo(l)).to_string(),
+            ),
+        );
+        gauge(
+            "helios_bsc_checkpoint_age_seconds",
+            "Age of the origin checkpoint (-1 when running without one).",
+            checkpoint_age.map_or_else(|| "-1".into(), |a| a.to_string()),
+        );
+        gauge(
+            "helios_bsc_finalized_block",
+            "Fast-finality finalized head: the newest attestation's source (-1 when no attestation has been seen).",
+            finalized.map_or_else(|| "-1".into(), |f| f.to_string()),
+        );
+        gauge(
+            "helios_bsc_finalized_lag_blocks",
+            "Tip minus the fast-finality finalized head, in blocks (-1 when no attestation has been seen).",
+            finalized_lag.map_or_else(|| "-1".into(), |l| l.to_string()),
+        );
+        gauge(
+            "helios_bsc_justified_block",
+            "Fast-finality justified head: the newest attestation's target (-1 when no attestation has been seen).",
+            justified.map_or_else(|| "-1".into(), |j| j.to_string()),
+        );
+        gauge(
+            "helios_bsc_finality_mode",
+            "0 = confirmation-depth, 1 = fast finality (BLS attestation, finalized head known).",
+            u8::from(finalized.is_some()).to_string(),
+        );
+        gauge(
+            "helios_bsc_sealing_set_enforced",
+            "1 when a checkpoint supplies the sealing set, else 0 (lookback-only).",
+            u8::from(self.origin_checkpoint.is_some()).to_string(),
+        );
+        gauge(
+            "helios_bsc_unverified_passthrough_enabled",
+            "1 when --allow-unverified-passthrough is on, else 0.",
+            u8::from(self.allow_unverified_passthrough).to_string(),
+        );
+        out
     }
 
     fn bump_proof_ok(&self) {
@@ -205,6 +560,9 @@ impl Node {
         let Some(path) = self.checkpoint_store.as_ref() else {
             return;
         };
+        // Held for the whole read-then-write: two writers could otherwise interleave and
+        // leave the newer checkpoint overwritten by the older one's snapshot.
+        let _persist = self.persist_lock.lock().expect("persist lock");
         let (hash, state_root, number, snap, stored) = {
             let chain = self.chain.lock().expect("chain lock");
             let snapshot = self.snapshot.lock().expect("snapshot lock");
@@ -276,7 +634,83 @@ impl Node {
     fn refresh(&self) -> Result<(u64, SafeHead)> {
         let mut chain = self.chain.lock().expect("chain lock");
         let mut snapshot = self.snapshot.lock().expect("snapshot lock");
-        let tip = self.up.block_number()?;
+        // Transport failure here is not a verification failure — count it apart so a
+        // flaky provider never looks like a lying one on the metrics dashboard.
+        let tip = match self.up.block_number() {
+            Ok(t) => t,
+            Err(e) => {
+                self.upstream_errors.fetch_add(1, Ordering::Relaxed);
+                return Err(e);
+            }
+        };
+        let (safe, conf_safe, verified_this, grew) =
+            match self.resync_locked(&mut chain, &mut snapshot, tip) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.header_verify_fail.fetch_add(1, Ordering::Relaxed);
+                    return Err(e);
+                }
+            };
+        // Read the fast-finality heads while the snapshot is still locked, and keep them
+        // together with the head they are measured against. Everything published below
+        // comes from this one sample, so no consumer can mix two instants.
+        let mut view = match snapshot.as_ref() {
+            Some(s) => FinalityView {
+                head: tip,
+                available: s.fast_finality_available(),
+                justified: s.justified(),
+                finalized: s.finalized(),
+                ..FinalityView::default()
+            },
+            None => FinalityView {
+                head: tip,
+                ..FinalityView::default()
+            },
+        };
+        view.read_head_is_fast = safe.number != conf_safe.number;
+        view.read_head = Some(safe.clone());
+        // Publish **while the chain lock is still held**. `docs/slo.md` promises that
+        // `helios_bsc_tip_block` and the finality gauges are "published together", and
+        // publishing after the drop broke that with four worker threads: the whole sync
+        // is serialised by this lock, so a thread descheduled between `drop(chain)` and
+        // these stores could be overtaken by a newer sync and then overwrite it with its
+        // own older sample — tip, safe and the finality view going *backwards* and
+        // staying there until the next sync. These are plain atomic stores plus one
+        // uncontended mutex, no I/O, so the critical section does not grow measurably.
+        // `/metrics` still reads only atomics and never takes this lock.
+        self.last_tip.store(tip, Ordering::Relaxed);
+        // `last_safe` is the confirmation-depth head, whatever tags resolve to — the SLO
+        // bound and its alerts are defined against that rule, so the gauge must not start
+        // meaning something else when the flag is on.
+        self.last_safe.store(conf_safe.number, Ordering::Relaxed);
+        self.last_justified.store(
+            view.justified.map_or(NO_BLOCK, |(b, _)| b),
+            Ordering::Relaxed,
+        );
+        self.last_finalized.store(
+            view.finalized.map_or(NO_BLOCK, |(b, _)| b),
+            Ordering::Relaxed,
+        );
+        // Lock order is chain → snapshot → finality everywhere (`status_fields` takes
+        // snapshot then finality and holds neither across the other).
+        *self.finality.lock().expect("finality lock") = view;
+        drop(chain);
+        drop(snapshot);
+        self.bump_headers(verified_this);
+        // Must stay outside: `persist_verified_tip` re-takes chain and snapshot.
+        if grew {
+            self.persist_verified_tip();
+        }
+        Ok((tip, safe))
+    }
+
+    /// Advance the locked chain to `tip`. Returns `(safe, newly_verified, grew)`.
+    fn resync_locked(
+        &self,
+        chain: &mut Vec<VerifiedBlock>,
+        snapshot: &mut Option<Snapshot>,
+        tip: u64,
+    ) -> Result<(SafeHead, SafeHead, u64, bool)> {
         let last = chain.last().map(|b| b.number).unwrap_or(0);
         let mut grew = false;
         let verified_this;
@@ -288,7 +722,7 @@ impl Node {
                     self.max_sync
                 );
             }
-            match append_new_with_snapshot(self.up.as_ref(), &mut chain, tip, snapshot.as_mut()) {
+            match append_new_with_snapshot(self.up.as_ref(), chain, tip, snapshot.as_mut()) {
                 Ok(()) => {}
                 Err(e) if is_link_err(&e) => {
                     let Some(cp) = self.origin.clone() else {
@@ -311,7 +745,7 @@ impl Node {
             let from = tip.saturating_sub(self.lookback.saturating_sub(1));
             *chain = walk_headers(self.up.as_ref(), from, tip)?;
             verified_this = chain.len() as u64;
-        } else if let Err(e) = append_new(self.up.as_ref(), &mut chain, tip) {
+        } else if let Err(e) = append_new(self.up.as_ref(), chain, tip) {
             if is_link_err(&e) {
                 eprintln!(
                     "reorg/link break ({e}); resync lookback (max reorg {})",
@@ -331,14 +765,9 @@ impl Node {
                 .map(|b| b.number.saturating_sub(last))
                 .unwrap_or(0);
         }
-        let safe = safe_of(&chain)?;
-        drop(chain);
-        drop(snapshot);
-        self.bump_headers(verified_this);
-        if grew {
-            self.persist_verified_tip();
-        }
-        Ok((tip, safe))
+        let conf_safe = safe_of(chain)?;
+        let head = self.read_head(chain, snapshot.as_ref(), &conf_safe);
+        Ok((head, conf_safe, verified_this, grew))
     }
 
     /// JSON-RPC 2.0 envelope: single object, batch array, or parse error.
@@ -464,9 +893,10 @@ impl Node {
             "eth_getUncleByBlockHashAndIndex" => self.uncle_by_hash(id, req),
             "eth_coinbase" => rpc_ok(id, json!("0x0000000000000000000000000000000000000000")),
             "eth_sendRawTransaction" => self.send_raw(id, req),
-            "eth_getTransactionReceipt" | "eth_getTransactionByHash" => {
-                self.unverified_mined(id, req, method)
-            }
+            "eth_getBlockReceipts" => self.get_block_receipts(id, req),
+            "eth_getLogs" => self.get_logs(id, req),
+            "eth_getTransactionReceipt" => self.get_transaction_receipt(id, req),
+            "eth_getTransactionByHash" => self.unverified_mined(id, req, method),
             "eth_getRawTransactionByHash" => self.get_raw_tx_by_hash(id, req),
             "eth_gasPrice" | "eth_maxPriorityFeePerGas" | "eth_feeHistory" | "eth_blobBaseFee" => {
                 self.unverified_qty(id, req, method)
@@ -525,12 +955,33 @@ impl Node {
     }
 
     fn status_fields(&self, tip: u64, safe: &SafeHead) -> Value {
+        // One lock, three answers: whether a sealing set is enforced and, if the
+        // snapshot carries a BEP-126 attestation, the justified/finalized pair.
+        // `fast_finality_available` is false until the BLS vote keys are known — a
+        // normal state at a checkpoint before the first epoch activation, not an error.
         let sealing = self.snapshot.lock().expect("snapshot lock").is_some();
+        // One consistent sample published by `refresh` — never a fresh snapshot read, see
+        // [`Node::finality`]. The caller's own `(tip, safe)` are only a fallback for the
+        // window before any view has been published: a concurrent sync can publish a
+        // newer one between a request's `refresh` and this read, and mixing the two is
+        // how the head, its lag and its source end up describing different instants.
+        let view = self.finality.lock().expect("finality lock").clone();
+        let (fast_available, justified, finalized) =
+            (view.available, view.justified, view.finalized);
+        let finality_head = view.head;
+        let safe = view.read_head.as_ref().unwrap_or(safe);
+        let tip = if view.read_head.is_some() {
+            view.head
+        } else {
+            tip
+        };
         let lag = proof_lag(tip, safe.number);
         let interval_ms = mainnet_current_fork().block_interval_ms;
+        // `safe` / `safeLagBlocks` / `lag` keep meaning confirmation depth; the
+        // fast-finality fields are reported alongside them, not instead of them.
         json!({
             "trustClass": "verified",
-            "finality": "confirmation-depth",
+            "finality": if finalized.is_some() { "fast-finality" } else { "confirmation-depth" },
             "forkId": self.fork_id,
             "tip": tip,
             "safe": safe.number,
@@ -553,6 +1004,21 @@ impl Node {
             "backupTransport": self.backup_transport,
             "expectedSafeLagBlocks": expected_safe_lag_blocks(),
             "safeLagWithinBound": safe_lag_within_slo(lag),
+            "fastFinalityAvailable": fast_available,
+            "justifiedBlock": justified.map(|(b, _)| b),
+            "justifiedHash": justified.map(|(_, h)| format!("0x{}", hex::encode(h))),
+            "finalizedBlock": finalized.map(|(b, _)| b),
+            "finalizedHash": finalized.map(|(_, h)| format!("0x{}", hex::encode(h))),
+            "finalizedLagBlocks": finalized.map(|(b, _)| proof_lag(finality_head, b)),
+            "justifiedLagBlocks": justified.map(|(b, _)| proof_lag(finality_head, b)),
+            "finalityHead": finality_head,
+            // Which rule chose the head that `latest` / `safe` / `finalized` resolve to.
+            // `distinctSealers` / `requiredSealers` always describe confirmation depth.
+            "finalityMode": match self.finality_mode {
+                FinalityMode::Fast => "fast",
+                FinalityMode::ConfirmationDepth => "confirmation-depth",
+            },
+            "safeSource": if view.read_head_is_fast { "fast-finality" } else { "confirmation-depth" },
         })
     }
 
@@ -669,9 +1135,10 @@ impl Node {
             Ok(v) => v,
             Err(e) => return Err(rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}"))),
         };
-        let local = self.resolve_wallet_exec_block(id, tag, tip, &safe)?;
+        // One lock acquisition for both the executing header and its BLOCKHASH window.
         let block = {
             let chain = self.chain.lock().expect("chain lock");
+            let local = self.resolve_wallet_exec_block_in(id, tag, tip, &safe, &chain)?;
             call_block_from_verified(&local, &chain)
         };
         Ok((tx, block))
@@ -997,7 +1464,7 @@ impl Node {
 
     fn verified_header_json(&self, id: Value, local: &VerifiedBlock) -> Value {
         match self.bound_block_txs(local) {
-            Ok(bound) => rpc_ok(id, rpc_block_json(&bound.header, &bound.hashes)),
+            Ok(bound) => rpc_ok(id, rpc_block_json(&bound.header, bound.txs.hashes())),
             Err((code, msg)) => rpc_err(id, code, &msg),
         }
     }
@@ -1018,7 +1485,7 @@ impl Node {
     }
 
     /// Bind untrusted raw txs to the sealed `transactionsRoot`. Empty root → no fetch.
-    fn bind_tx_hashes(&self, hdr: &RpcBlockHeader) -> Result<Vec<[u8; 32]>, (i64, String)> {
+    fn bind_tx_hashes(&self, hdr: &RpcBlockHeader) -> Result<TxBind, (i64, String)> {
         let root = decode_hex_fixed::<32>(&hdr.transactions_root).map_err(|e| {
             (
                 ERR_PROOF_FAILED,
@@ -1026,24 +1493,358 @@ impl Node {
             )
         })?;
         if root == EMPTY_TRIE_ROOT {
-            return Ok(Vec::new());
+            return Ok(TxBind::Empty);
         }
         let raws = self
             .up
             .block_raw_transactions(&hdr.hash)
             .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))?;
         // No envelopes: omit hashes (do not invent, do not fail the header read).
+        // Distinct from `Empty` — see [`TxBind`].
         if raws.is_empty() {
-            return Ok(Vec::new());
+            return Ok(TxBind::Omitted);
         }
         verify_tx_list(&raws, &root)
+            .map(TxBind::List)
             .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))
     }
 
     fn bound_block_txs(&self, local: &VerifiedBlock) -> Result<BoundTxs, (i64, String)> {
         let header = self.load_verified_header(local)?;
-        let hashes = self.bind_tx_hashes(&header)?;
-        Ok(BoundTxs { header, hashes })
+        let txs = self.bind_tx_hashes(&header)?;
+        Ok(BoundTxs { header, txs })
+    }
+
+    /// Bind untrusted receipt JSON to sealed `receiptsRoot`. Empty root → no fetch.
+    /// Empty fetch + non-empty root → omitted (cannot prove; do not invent).
+    fn bind_receipts(&self, hdr: &RpcBlockHeader) -> Result<ReceiptBind, (i64, String)> {
+        let root = decode_hex_fixed::<32>(&hdr.receipts_root).map_err(|e| {
+            (
+                ERR_PROOF_FAILED,
+                format!("proof_verification_failed: receiptsRoot: {e}"),
+            )
+        })?;
+        if root == EMPTY_TRIE_ROOT {
+            return Ok(ReceiptBind::Empty);
+        }
+        let jsons = self
+            .up
+            .block_receipts_json(&hdr.hash)
+            .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))?;
+        if jsons.is_empty() {
+            return Ok(ReceiptBind::Omitted);
+        }
+        if jsons.len() > MAX_ORDERED_TRIE_ITEMS {
+            return Err((
+                ERR_PROOF_FAILED,
+                "proof_verification_failed: too many receipts".into(),
+            ));
+        }
+        let mut raws = Vec::with_capacity(jsons.len());
+        let mut items = Vec::with_capacity(jsons.len());
+        // Block-wide log index, the same counter `eth_getLogs` uses, so the two methods
+        // cannot disagree about `logIndex` for the same block.
+        let mut log_index: u64 = 0;
+        for (i, v) in jsons.iter().enumerate() {
+            let parsed = parse_consensus_receipt_json(v).map_err(|e| {
+                (
+                    ERR_PROOF_FAILED,
+                    format!("proof_verification_failed: receipt {i}: {e}"),
+                )
+            })?;
+            let raw = encode_consensus_receipt(&parsed.consensus).map_err(|e| {
+                (
+                    ERR_PROOF_FAILED,
+                    format!("proof_verification_failed: receipt {i}: {e}"),
+                )
+            })?;
+            raws.push(raw);
+            let json = decorate_receipt_json(
+                v.clone(),
+                hdr,
+                i,
+                parsed.tx_hash,
+                &parsed.consensus.logs,
+                log_index,
+            );
+            log_index = log_index.saturating_add(parsed.consensus.logs.len() as u64);
+            items.push(BoundReceipt {
+                json,
+                tx_hash: parsed.tx_hash,
+                logs: parsed.consensus.logs,
+            });
+        }
+        verify_receipt_list(&raws, &root)
+            .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))?;
+        Ok(ReceiptBind::List(items))
+    }
+
+    fn bound_block_receipts(
+        &self,
+        local: &VerifiedBlock,
+    ) -> Result<(RpcBlockHeader, ReceiptBind), (i64, String)> {
+        let header = self.load_verified_header(local)?;
+        let bind = self.bind_receipts(&header)?;
+        Ok((header, bind))
+    }
+
+    fn get_block_receipts(&self, id: Value, req: &Value) -> Value {
+        let local = match self.local_block_by_number_or_hash(req) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        match self.bound_block_receipts(&local) {
+            Ok((_, ReceiptBind::List(list))) => {
+                rpc_ok(id, Value::Array(list.into_iter().map(|r| r.json).collect()))
+            }
+            Ok((_, ReceiptBind::Empty | ReceiptBind::Omitted)) => rpc_ok(id, json!([])),
+            Err((code, msg)) => rpc_err(id, code, &msg),
+        }
+    }
+
+    fn get_transaction_receipt(&self, id: Value, req: &Value) -> Value {
+        let want = match query_tx_hash(req) {
+            Ok(h) => h,
+            Err(e) => return rpc_err(id, ERR_PARAMS, &e),
+        };
+        let params = req.get("params").cloned().unwrap_or(json!([]));
+        let raw = match self
+            .up
+            .unverified_call("eth_getTransactionReceipt", &params)
+        {
+            Ok(v) => v,
+            Err(e) => return rpc_err(id, -32000, &format!("unverified_upstream: {e}")),
+        };
+        if raw.is_null() {
+            return rpc_ok(id, Value::Null);
+        }
+        let (hash_empty, num_empty, block_hash) = {
+            let Some(map) = raw.as_object() else {
+                return rpc_err(id, ERR_PROOF_FAILED, "receipt is not an object");
+            };
+            let hash_v = map.get("blockHash");
+            let num_v = map.get("blockNumber");
+            (
+                is_empty_block_hash(hash_v),
+                is_nullish_json(num_v),
+                hash_v.and_then(Value::as_str).map(str::to_string),
+            )
+        };
+        if hash_empty && num_empty {
+            return self.passthrough_mined(id, raw, Some(&want));
+        }
+        if hash_empty != num_empty {
+            return rpc_err(id, ERR_NOT_SYNCED, "receipt/tx pending fields inconsistent");
+        }
+        let hash = match block_hash {
+            Some(s) => s,
+            None => return rpc_err(id, ERR_NOT_SYNCED, "receipt/tx blockHash not a string"),
+        };
+        let (_, safe) = match self.refresh() {
+            Ok(v) => v,
+            Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
+        };
+        let local = {
+            let chain = self.chain.lock().expect("chain lock");
+            chain
+                .iter()
+                .find(|b| {
+                    let h = format!("0x{}", hex::encode(b.hash));
+                    hex_eq_loose(&h, &hash)
+                })
+                .cloned()
+        };
+        let Some(local) = local else {
+            return rpc_err(
+                id,
+                ERR_NOT_SYNCED,
+                "receipt/tx blockHash not in local verified chain",
+            );
+        };
+        if local.number > safe.number {
+            return rpc_err(id, ERR_NOT_SYNCED, "receipt/tx is above local Safe");
+        }
+        match self.bound_block_receipts(&local) {
+            Ok((_, ReceiptBind::List(list))) => {
+                match list.into_iter().find(|r| r.tx_hash.as_ref() == Some(&want)) {
+                    Some(r) => rpc_ok(id, r.json),
+                    None => rpc_ok(id, Value::Null),
+                }
+            }
+            Ok((_, ReceiptBind::Empty)) => rpc_ok(id, Value::Null),
+            Ok((_, ReceiptBind::Omitted)) => self.passthrough_mined(id, raw, Some(&want)),
+            Err((code, msg)) => rpc_err(id, code, &msg),
+        }
+    }
+
+    fn passthrough_mined(&self, id: Value, raw: Value, want: Option<&[u8; 32]>) -> Value {
+        if !self.allow_unverified_passthrough {
+            return rpc_err(id, ERR_METHOD, "unverified_passthrough_disabled");
+        }
+        let (_, safe) = match self.refresh() {
+            Ok(v) => v,
+            Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
+        };
+        let chain = self.chain.lock().expect("chain lock");
+        match bind_mined_object(&raw, &safe, &chain, want) {
+            Ok(()) => rpc_ok(id, raw),
+            Err(msg) => rpc_err(id, ERR_NOT_SYNCED, &msg),
+        }
+    }
+
+    fn get_logs(&self, id: Value, req: &Value) -> Value {
+        let filter = match req.get("params").and_then(Value::as_array) {
+            None => None,
+            Some(p) if p.is_empty() => None,
+            Some(p) => match p.first() {
+                Some(Value::Object(m)) => Some(m),
+                Some(Value::Null) => None,
+                _ => return rpc_err(id, ERR_PARAMS, "eth_getLogs filter must be an object"),
+            },
+        };
+        let local = match self.resolve_get_logs_block(id.clone(), filter) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        let addresses = match parse_log_addresses(filter) {
+            Ok(a) => a,
+            Err(e) => return rpc_err(id, ERR_PARAMS, &e),
+        };
+        let topics = match parse_log_topics(filter) {
+            Ok(t) => t,
+            Err(e) => return rpc_err(id, ERR_PARAMS, &e),
+        };
+        let (header, bind) = match self.bound_block_receipts(&local) {
+            Ok(v) => v,
+            Err((code, msg)) => return rpc_err(id, code, &msg),
+        };
+        let receipts = match bind {
+            ReceiptBind::List(list) => list,
+            ReceiptBind::Empty | ReceiptBind::Omitted => return rpc_ok(id, json!([])),
+        };
+        let mut out = Vec::new();
+        let mut log_index: u64 = 0;
+        for (tx_i, rec) in receipts.iter().enumerate() {
+            for log in &rec.logs {
+                if log_matches(log, &addresses, &topics) {
+                    if out.len() >= MAX_GET_LOGS {
+                        break;
+                    }
+                    out.push(rpc_log_json(
+                        log,
+                        &header,
+                        rec.tx_hash,
+                        tx_i as u64,
+                        log_index,
+                    ));
+                }
+                log_index = log_index.saturating_add(1);
+            }
+            if out.len() >= MAX_GET_LOGS {
+                break;
+            }
+        }
+        rpc_ok(id, Value::Array(out))
+    }
+
+    fn resolve_get_logs_block(
+        &self,
+        id: Value,
+        filter: Option<&serde_json::Map<String, Value>>,
+    ) -> Result<VerifiedBlock, Value> {
+        let block_hash = filter.and_then(|m| m.get("blockHash"));
+        let from_v = filter.and_then(|m| m.get("fromBlock"));
+        let to_v = filter.and_then(|m| m.get("toBlock"));
+        let has_range = !is_nullish_json(from_v) || !is_nullish_json(to_v);
+        if !is_nullish_json(block_hash) {
+            if has_range {
+                return Err(rpc_err(
+                    id,
+                    ERR_PARAMS,
+                    "cannot specify both blockHash and fromBlock/toBlock",
+                ));
+            }
+            let hash = block_hash
+                .and_then(Value::as_str)
+                .ok_or_else(|| rpc_err(id.clone(), ERR_PARAMS, "blockHash must be a string"))?;
+            if decode_hex_fixed::<32>(hash).is_err() {
+                return Err(rpc_err(id, ERR_PARAMS, "blockHash is not 32 bytes"));
+            }
+            let (_, safe) = match self.refresh() {
+                Ok(v) => v,
+                Err(e) => return Err(rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}"))),
+            };
+            let chain = self.chain.lock().expect("chain lock");
+            return wallet_get_block_by_hash(hash, safe.number, &chain)
+                .cloned()
+                .ok_or_else(|| {
+                    rpc_err(
+                        id,
+                        ERR_NOT_SYNCED,
+                        "wallet mode only serves verified hashes at or below Safe",
+                    )
+                });
+        }
+        let from_s =
+            wallet_block_tag_str(from_v).map_err(|e| rpc_err(id.clone(), ERR_PARAMS, e))?;
+        let to_s = wallet_block_tag_str(to_v).map_err(|e| rpc_err(id.clone(), ERR_PARAMS, e))?;
+        let (_, safe) = match self.refresh() {
+            Ok(v) => v,
+            Err(e) => return Err(rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}"))),
+        };
+        let from_n = log_filter_block_number(from_s, safe.number, &safe.hash).ok_or_else(|| {
+            rpc_err(
+                id.clone(),
+                ERR_NOT_SYNCED,
+                "wallet mode only serves Safe or below (latest→Safe)",
+            )
+        })?;
+        let to_n = log_filter_block_number(to_s, safe.number, &safe.hash).ok_or_else(|| {
+            rpc_err(
+                id.clone(),
+                ERR_NOT_SYNCED,
+                "wallet mode only serves Safe or below (latest→Safe)",
+            )
+        })?;
+        if from_n != to_n {
+            return Err(rpc_err(
+                id,
+                ERR_PARAMS,
+                "eth_getLogs is single-block only (fromBlock==toBlock or blockHash)",
+            ));
+        }
+        if from_n > safe.number {
+            return Err(rpc_err(
+                id,
+                ERR_NOT_SYNCED,
+                "wallet mode only serves Safe or below (latest→Safe)",
+            ));
+        }
+        let chain = self.chain.lock().expect("chain lock");
+        chain
+            .iter()
+            .find(|b| b.number == from_n)
+            .cloned()
+            .ok_or_else(|| {
+                rpc_err(
+                    id,
+                    ERR_NOT_SYNCED,
+                    "wallet mode only serves Safe or below (latest→Safe)",
+                )
+            })
+    }
+
+    fn local_block_by_number_or_hash(&self, req: &Value) -> Result<VerifiedBlock, Value> {
+        let tag = req
+            .get("params")
+            .and_then(Value::as_array)
+            .and_then(|p| p.first())
+            .and_then(Value::as_str);
+        if tag.is_some_and(|s| decode_hex_fixed::<32>(s).is_ok()) {
+            self.local_block_by_hash(req)
+        } else {
+            self.local_block_by_number(req)
+        }
     }
 
     fn tx_count_by_number(&self, id: Value, req: &Value) -> Value {
@@ -1062,7 +1863,11 @@ impl Node {
 
     fn verified_tx_count(&self, id: Value, local: &VerifiedBlock) -> Value {
         match self.bound_block_txs(local) {
-            Ok(bound) => rpc_ok(id, json!(format!("0x{:x}", bound.hashes.len()))),
+            Ok(bound) => match bound.txs {
+                TxBind::Empty => rpc_ok(id, json!("0x0")),
+                TxBind::List(v) => rpc_ok(id, json!(format!("0x{:x}", v.len()))),
+                TxBind::Omitted => rpc_err(id, ERR_PROOF_FAILED, TX_ENVELOPES_UNAVAILABLE),
+            },
             Err((code, msg)) => rpc_err(id, code, &msg),
         }
     }
@@ -1096,10 +1901,16 @@ impl Node {
             Ok(v) => v,
             Err((code, msg)) => return rpc_err(id, code, &msg),
         };
+        let hashes = match &bound.txs {
+            TxBind::List(v) => v.as_slice(),
+            TxBind::Empty => &[][..],
+            // Non-empty root, no envelopes: `null` would claim "no tx at this index".
+            TxBind::Omitted => return rpc_err(id, ERR_PROOF_FAILED, TX_ENVELOPES_UNAVAILABLE),
+        };
         let Ok(i) = usize::try_from(index) else {
             return rpc_ok(id, Value::Null);
         };
-        let Some(hash) = bound.hashes.get(i) else {
+        let Some(hash) = hashes.get(i) else {
             return rpc_ok(id, Value::Null);
         };
         rpc_ok(
@@ -1146,10 +1957,23 @@ impl Node {
         }
         let params = req.get("params").cloned().unwrap_or(json!([]));
         match self.up.unverified_call(method, &params) {
-            Ok(v) => match bind_fee_result(method, &v) {
-                Ok(()) => rpc_ok(id, v),
-                Err(msg) => rpc_err(id, ERR_PARAMS, &msg),
-            },
+            Ok(v) => {
+                if let Err(msg) = bind_fee_result(method, &v) {
+                    return rpc_err(id, ERR_PARAMS, &msg);
+                }
+                if method == "eth_feeHistory" && v.get("oldestBlock").is_some_and(|x| !x.is_null())
+                {
+                    let (_, safe) = match self.refresh() {
+                        Ok(x) => x,
+                        Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
+                    };
+                    let chain = self.chain.lock().expect("chain lock");
+                    if let Err((code, msg)) = bind_fee_oldest_block(&v, &safe, &chain) {
+                        return rpc_err(id, code, &msg);
+                    }
+                }
+                rpc_ok(id, v)
+            }
             Err(e) => rpc_err(id, -32000, &format!("unverified_upstream: {e}")),
         }
     }
@@ -1227,14 +2051,27 @@ impl Node {
         tip: u64,
         safe: &SafeHead,
     ) -> Result<VerifiedBlock, Value> {
-        let local = {
-            let chain = self.chain.lock().expect("chain lock");
-            wallet_get_block_by_number(tag, safe.number, &safe.hash, &chain)
-                .cloned()
-                .or_else(|| {
-                    tag.and_then(|t| wallet_get_block_by_hash(t, safe.number, &chain).cloned())
-                })
-        };
+        let chain = self.chain.lock().expect("chain lock");
+        self.resolve_wallet_exec_block_in(id, tag, tip, safe, &chain)
+    }
+
+    /// As [`Self::resolve_wallet_exec_block`], against a chain the caller already holds.
+    ///
+    /// `eth_call` needs this: resolving the block under one lock acquisition and then
+    /// re-locking to collect the BLOCKHASH window is two instants, and a reorg landing
+    /// between them executes a block from the old chain against ancestor hashes from the
+    /// new one. Every value stays verified, but they stop describing one chain.
+    fn resolve_wallet_exec_block_in(
+        &self,
+        id: Value,
+        tag: Option<&str>,
+        tip: u64,
+        safe: &SafeHead,
+        chain: &[VerifiedBlock],
+    ) -> Result<VerifiedBlock, Value> {
+        let local = wallet_get_block_by_number(tag, safe.number, &safe.hash, chain)
+            .cloned()
+            .or_else(|| tag.and_then(|t| wallet_get_block_by_hash(t, safe.number, chain).cloned()));
         let Some(local) = local else {
             return Err(rpc_err(
                 id,
@@ -1752,10 +2589,14 @@ fn bind_result_tx_hash(
     Ok(())
 }
 
-const MAX_RECEIPT_LOGS: usize = 1024;
-const MAX_LOG_TOPICS: usize = 4;
+/// Non-empty `transactionsRoot` but the upstream served no raw envelopes: a count or an
+/// index lookup has nothing verified to answer with.
+const TX_ENVELOPES_UNAVAILABLE: &str =
+    "proof_verification_failed: upstream served no transaction envelopes";
+
 const MAX_LOG_DATA: usize = 64 * 1024;
 const MAX_FEE_HISTORY_ITEMS: usize = 1024;
+const MAX_GET_LOGS: usize = MAX_RECEIPT_LOGS;
 
 fn bind_optional_logs(
     v: Option<&Value>,
@@ -1897,6 +2738,7 @@ fn bind_optional_status(v: Option<&Value>) -> Result<(), String> {
 }
 
 /// Unverified fee oracles: known methods only; hex qty or `eth_feeHistory` object.
+/// `oldestBlock` if present is a hex qty; local chain bind is `bind_fee_oldest_block`.
 fn bind_fee_result(method: &str, v: &Value) -> Result<(), String> {
     match method {
         "eth_gasPrice" | "eth_maxPriorityFeePerGas" | "eth_blobBaseFee" => {
@@ -1947,6 +2789,38 @@ fn bind_fee_result(method: &str, v: &Value) -> Result<(), String> {
             Ok(())
         }
         _ => Err(format!("unknown fee method: {method}")),
+    }
+}
+
+/// `oldestBlock` if present must equal a local `VerifiedBlock.number` ≤ Safe.
+fn bind_fee_oldest_block(
+    v: &Value,
+    safe: &SafeHead,
+    chain: &[VerifiedBlock],
+) -> Result<(), (i64, String)> {
+    let Some(o) = v.as_object() else {
+        return Ok(());
+    };
+    match o.get("oldestBlock") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(s)) => {
+            let n = decode_u64(s)
+                .map_err(|_| (ERR_PARAMS, "oldestBlock is not a hex quantity".to_string()))?;
+            let Some(local) = chain.iter().find(|b| b.number == n) else {
+                return Err((
+                    ERR_NOT_SYNCED,
+                    "feeHistory oldestBlock not in local verified chain".into(),
+                ));
+            };
+            if local.number > safe.number {
+                return Err((
+                    ERR_NOT_SYNCED,
+                    "feeHistory oldestBlock is above local Safe".into(),
+                ));
+            }
+            Ok(())
+        }
+        Some(_) => Err((ERR_PARAMS, "oldestBlock not a hex quantity".into())),
     }
 }
 
@@ -2048,7 +2922,350 @@ fn wants_full_txs(params: Option<&Vec<Value>>) -> bool {
 
 struct BoundTxs {
     header: RpcBlockHeader,
-    hashes: Vec<[u8; 32]>,
+    txs: TxBind,
+}
+
+/// Outcome of binding a block's transaction hashes to the sealed `transactionsRoot`.
+///
+/// `Empty` and `Omitted` both render as `[]` in `eth_getBlock*` (documented: no raw
+/// envelopes → hashes omitted, never a fabricated list), but they are *not* the same
+/// claim and must not collapse for a count or an index lookup. `Empty` proves the
+/// block has no transactions — the sealed root is the empty-trie root. `Omitted`
+/// proves nothing: the root is non-empty, so the block certainly has transactions,
+/// the upstream just declined to serve the envelopes. Answering `0x0` there, or
+/// `null` for index 0, hands a wallet an unverified claim wearing a verified method's
+/// clothes; both fail closed with `-32001` instead.
+enum TxBind {
+    Empty,
+    Omitted,
+    List(Vec<[u8; 32]>),
+}
+
+impl TxBind {
+    /// Hash list for `eth_getBlock*`: nothing to show for `Empty` or `Omitted`.
+    fn hashes(&self) -> &[[u8; 32]] {
+        match self {
+            TxBind::List(v) => v,
+            TxBind::Empty | TxBind::Omitted => &[],
+        }
+    }
+}
+
+enum ReceiptBind {
+    Empty,
+    Omitted,
+    List(Vec<BoundReceipt>),
+}
+
+struct BoundReceipt {
+    json: Value,
+    tx_hash: Option<[u8; 32]>,
+    logs: Vec<ConsensusLog>,
+}
+
+struct ParsedReceipt {
+    consensus: ConsensusReceipt,
+    tx_hash: Option<[u8; 32]>,
+}
+
+/// Overwrite every locally-known field of an upstream receipt with the verified value.
+///
+/// The receipt-level `blockHash` / `blockNumber` / `transactionIndex` were already
+/// overwritten here because an upstream must not get to name the block. The `logs[]`
+/// array was not, and it carries the same fields: only `address` / `topics` / `data`
+/// are bound by `receiptsRoot`, so a receipt that hashes correctly could still ship
+/// `logs[0].blockNumber` / `blockHash` / `transactionHash` / `logIndex` pointing at
+/// some other block or tx, and `eth_getBlockReceipts` (a *verified* method, no flag)
+/// echoed them straight to the wallet. Rebuild each log from the parsed consensus
+/// values plus the local header instead — the same shape `eth_getLogs` emits.
+fn decorate_receipt_json(
+    mut v: Value,
+    hdr: &RpcBlockHeader,
+    index: usize,
+    tx_hash: Option<[u8; 32]>,
+    logs: &[ConsensusLog],
+    first_log_index: u64,
+) -> Value {
+    if let Value::Object(map) = &mut v {
+        map.insert("blockHash".into(), json!(hdr.hash.clone()));
+        map.insert("blockNumber".into(), json!(hdr.number.clone()));
+        map.insert("transactionIndex".into(), json!(format!("0x{index:x}")));
+        if let Some(h) = tx_hash {
+            map.insert(
+                "transactionHash".into(),
+                json!(format!("0x{}", hex::encode(h))),
+            );
+        }
+        let rebuilt: Vec<Value> = logs
+            .iter()
+            .enumerate()
+            .map(|(j, log)| {
+                rpc_log_json(
+                    log,
+                    hdr,
+                    tx_hash,
+                    index as u64,
+                    first_log_index.saturating_add(j as u64),
+                )
+            })
+            .collect();
+        map.insert("logs".into(), Value::Array(rebuilt));
+    }
+    v
+}
+
+fn parse_consensus_receipt_json(v: &Value) -> Result<ParsedReceipt, String> {
+    let map = v
+        .as_object()
+        .ok_or_else(|| "receipt is not an object".to_string())?;
+    let status = match map.get("status") {
+        Some(Value::String(s)) => {
+            let n = decode_u64(s).map_err(|_| "status invalid".to_string())?;
+            if n > 1 {
+                return Err("status is not 0x0 or 0x1".into());
+            }
+            n
+        }
+        _ => return Err("status missing".into()),
+    };
+    let cumulative_gas_used = match map.get("cumulativeGasUsed") {
+        Some(Value::String(s)) => {
+            decode_u64(s).map_err(|_| "cumulativeGasUsed is not a hex quantity".to_string())?
+        }
+        _ => return Err("cumulativeGasUsed missing".into()),
+    };
+    let logs_bloom = match map.get("logsBloom") {
+        Some(Value::String(s)) => {
+            decode_hex_fixed::<256>(s).map_err(|_| "logsBloom is not 256 bytes".to_string())?
+        }
+        _ => return Err("logsBloom missing".into()),
+    };
+    let tx_type = match map.get("type") {
+        None | Some(Value::Null) => 0u8,
+        Some(Value::String(s)) => {
+            let n = decode_u64(s).map_err(|_| "type invalid".to_string())?;
+            if n > 4 {
+                return Err("tx type is not 0x0..=0x4".into());
+            }
+            n as u8
+        }
+        Some(_) => return Err("type not a hex quantity".into()),
+    };
+    let logs = match map.get("logs") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(arr)) => {
+            if arr.len() > MAX_RECEIPT_LOGS {
+                return Err("too many logs".into());
+            }
+            let mut out = Vec::with_capacity(arr.len());
+            for log in arr {
+                out.push(parse_consensus_log_json(log)?);
+            }
+            out
+        }
+        Some(_) => return Err("logs not an array".into()),
+    };
+    let tx_hash = match map.get("transactionHash") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(
+            decode_hex_fixed::<32>(s)
+                .map_err(|_| "transactionHash is not a 32-byte hash".to_string())?,
+        ),
+        Some(_) => return Err("transactionHash not a string".into()),
+    };
+    // `receiptsRoot` binds status / cumulativeGasUsed / logsBloom / type / logs and
+    // nothing else, so these five are echoed unverified. `docs/rpc-matrix.md` promises
+    // they are at least *structurally* validated; they were not, so an upstream could
+    // hand a wallet `"to": 12345` or a 4-byte `from` through a verified method.
+    // Same checks the passthrough path (`bind_mined_object`) already applies.
+    bind_optional_address(map.get("from"), "from", false)?;
+    bind_optional_address(map.get("to"), "to", true)?;
+    bind_optional_address(map.get("contractAddress"), "contractAddress", true)?;
+    bind_optional_qty(map.get("gasUsed"), "gasUsed")?;
+    bind_optional_qty(map.get("effectiveGasPrice"), "effectiveGasPrice")?;
+    Ok(ParsedReceipt {
+        consensus: ConsensusReceipt {
+            status,
+            cumulative_gas_used,
+            logs_bloom,
+            logs,
+            tx_type,
+        },
+        tx_hash,
+    })
+}
+
+fn parse_consensus_log_json(v: &Value) -> Result<ConsensusLog, String> {
+    let map = v
+        .as_object()
+        .ok_or_else(|| "log is not an object".to_string())?;
+    let address = match map.get("address") {
+        Some(Value::String(s)) => {
+            decode_hex_fixed::<20>(s).map_err(|_| "log.address is not 20 bytes".to_string())?
+        }
+        _ => return Err("log.address missing".into()),
+    };
+    let mut topics = Vec::new();
+    match map.get("topics") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(arr)) => {
+            if arr.len() > MAX_LOG_TOPICS {
+                return Err("too many log topics".into());
+            }
+            for t in arr {
+                let s = t
+                    .as_str()
+                    .ok_or_else(|| "log topic not a string".to_string())?;
+                topics.push(decode_hex_fixed::<32>(s).map_err(|_| "log topic is not 32 bytes")?);
+            }
+        }
+        Some(_) => return Err("log.topics is not an array".into()),
+    }
+    let data = match map.get("data") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::String(s)) => {
+            let bytes = decode_hex(s).map_err(|_| "log.data is not hex")?;
+            if bytes.len() > MAX_LOG_DATA {
+                return Err("log.data too large".into());
+            }
+            bytes
+        }
+        Some(_) => return Err("log.data not a hex string".into()),
+    };
+    Ok(ConsensusLog {
+        address,
+        topics,
+        data,
+    })
+}
+
+fn parse_log_addresses(
+    filter: Option<&serde_json::Map<String, Value>>,
+) -> Result<Vec<[u8; 20]>, String> {
+    match filter.and_then(|m| m.get("address")) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(s)) => {
+            let a = decode_hex_fixed::<20>(s).map_err(|_| "address is not 20 bytes".to_string())?;
+            Ok(vec![a])
+        }
+        Some(Value::Array(arr)) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for x in arr {
+                let s = x
+                    .as_str()
+                    .ok_or_else(|| "address is not 20 bytes".to_string())?;
+                out.push(decode_hex_fixed::<20>(s).map_err(|_| "address is not 20 bytes")?);
+            }
+            Ok(out)
+        }
+        Some(_) => Err("address must be a 20-byte hex or array".into()),
+    }
+}
+
+fn parse_log_topics(
+    filter: Option<&serde_json::Map<String, Value>>,
+) -> Result<Vec<Option<Vec<[u8; 32]>>>, String> {
+    match filter.and_then(|m| m.get("topics")) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(arr)) => {
+            if arr.len() > MAX_LOG_TOPICS {
+                return Err("too many topics (max 4)".into());
+            }
+            let mut out = Vec::with_capacity(arr.len());
+            for t in arr {
+                out.push(parse_topic_spec(t)?);
+            }
+            Ok(out)
+        }
+        Some(_) => Err("topics must be an array".into()),
+    }
+}
+
+fn parse_topic_spec(v: &Value) -> Result<Option<Vec<[u8; 32]>>, String> {
+    match v {
+        Value::Null => Ok(None),
+        Value::String(s) => {
+            let t = decode_hex_fixed::<32>(s).map_err(|_| "topic is not 32 bytes".to_string())?;
+            Ok(Some(vec![t]))
+        }
+        Value::Array(arr) => {
+            let mut ors = Vec::with_capacity(arr.len());
+            for x in arr {
+                let s = x
+                    .as_str()
+                    .ok_or_else(|| "topic is not 32 bytes".to_string())?;
+                ors.push(decode_hex_fixed::<32>(s).map_err(|_| "topic is not 32 bytes")?);
+            }
+            Ok(Some(ors))
+        }
+        _ => Err("topic must be null, 32-byte hex, or array of 32-byte hex".into()),
+    }
+}
+
+fn log_matches(
+    log: &ConsensusLog,
+    addresses: &[[u8; 20]],
+    topics: &[Option<Vec<[u8; 32]>>],
+) -> bool {
+    if !addresses.is_empty() && !addresses.iter().any(|a| a == &log.address) {
+        return false;
+    }
+    if topics.len() > log.topics.len() {
+        return false;
+    }
+    for (i, spec) in topics.iter().enumerate() {
+        let Some(ors) = spec else {
+            continue;
+        };
+        if ors.is_empty() {
+            continue;
+        }
+        if !ors.iter().any(|t| t == &log.topics[i]) {
+            return false;
+        }
+    }
+    true
+}
+
+fn rpc_log_json(
+    log: &ConsensusLog,
+    hdr: &RpcBlockHeader,
+    tx_hash: Option<[u8; 32]>,
+    tx_index: u64,
+    log_index: u64,
+) -> Value {
+    let topics: Vec<Value> = log
+        .topics
+        .iter()
+        .map(|t| json!(format!("0x{}", hex::encode(t))))
+        .collect();
+    json!({
+        "address": format!("0x{}", hex::encode(log.address)),
+        "topics": topics,
+        "data": format!("0x{}", hex::encode(&log.data)),
+        "blockNumber": hdr.number,
+        "blockHash": hdr.hash,
+        "transactionHash": tx_hash.map(|h| format!("0x{}", hex::encode(h))),
+        "transactionIndex": format!("0x{tx_index:x}"),
+        "logIndex": format!("0x{log_index:x}"),
+        "removed": false,
+    })
+}
+
+fn log_filter_block_number(tag: Option<&str>, safe_number: u64, safe_hash: &str) -> Option<u64> {
+    match tag {
+        None | Some("") | Some("latest") | Some("safe") | Some("finalized") => Some(safe_number),
+        Some("pending") | Some("earliest") => None,
+        Some(t) if t.eq_ignore_ascii_case(safe_hash) => Some(safe_number),
+        Some(t) if t.starts_with("0x") || t.starts_with("0X") => {
+            if decode_hex_fixed::<32>(t).is_ok() {
+                None
+            } else {
+                decode_u64(t).ok()
+            }
+        }
+        _ => None,
+    }
 }
 
 fn rpc_block_json(hdr: &RpcBlockHeader, tx_hashes: &[[u8; 32]]) -> Value {
@@ -2126,7 +3343,7 @@ enum AccountField {
 }
 
 pub fn serve(node: Arc<Node>, listen: &str) -> Result<()> {
-    let server = Server::http(listen).map_err(|e| anyhow::anyhow!("bind {listen}: {e}"))?;
+    let server = Arc::new(Server::http(listen).map_err(|e| anyhow::anyhow!("bind {listen}: {e}"))?);
     eprintln!("helios-bsc RPC on http://{listen}  (wallet mode: latest→Safe)");
     let loopback_only = listen_is_loopback(listen);
     // Keep Safe inside the proof window while idle (~4 Fermi blocks).
@@ -2139,52 +3356,90 @@ pub fn serve(node: Arc<Node>, listen: &str) -> Result<()> {
                 eprintln!("background sync: {e}");
             }
         });
-    for mut req in server.incoming_requests() {
-        let host = req
-            .headers()
-            .iter()
-            .find(|h| h.field.equiv("Host"))
-            .map(|h| h.value.as_str().to_string());
-        if let Some(code) = rpc_http_host_reject(host.as_deref(), loopback_only) {
-            let _ = req.respond(Response::from_string("forbidden host").with_status_code(code));
-            continue;
-        }
-        if let Some(code) = rpc_http_reject(req.method() == &Method::Post, 0) {
-            if code == 405 {
-                let _ = req.respond(Response::from_string("POST only").with_status_code(405));
-                continue;
-            }
-        }
-        let content_type = req
-            .headers()
-            .iter()
-            .find(|h| h.field.equiv("Content-Type"))
-            .map(|h| h.value.as_str().to_string());
-        if let Some(code) = rpc_http_content_type_reject(content_type.as_deref()) {
-            let _ =
-                req.respond(Response::from_string("unsupported media type").with_status_code(code));
-            continue;
-        }
-        let mut buf = Vec::new();
-        let mut limited = req.as_reader().take((MAX_RPC_BODY as u64) + 1);
-        limited.read_to_end(&mut buf).ok();
-        if let Some(code) = rpc_http_reject(true, buf.len()) {
-            let _ = req.respond(Response::from_string("payload too large").with_status_code(code));
-            continue;
-        }
-        let out = node.dispatch_bytes(&buf);
-        if out.is_null() {
-            let _ = req.respond(Response::from_string("").with_status_code(204));
-            continue;
-        }
-        let mut resp = Response::from_string(out.to_string());
-        if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]) {
-            resp = resp.with_header(h);
-        }
-        // Never Access-Control-Allow-Origin: * — a page could then call 127.0.0.1:8545.
-        let _ = req.respond(resp);
+
+    let mut workers = Vec::with_capacity(RPC_WORKER_THREADS);
+    for i in 0..RPC_WORKER_THREADS {
+        let server = Arc::clone(&server);
+        let node = Arc::clone(&node);
+        workers.push(
+            std::thread::Builder::new()
+                .name(format!("helios-bsc-rpc-{i}"))
+                .spawn(move || {
+                    // `recv` hands each request to exactly one worker, so the listener
+                    // keeps answering while another worker is blocked in a sync.
+                    while let Ok(req) = server.recv() {
+                        serve_one(&node, req, loopback_only);
+                    }
+                })?,
+        );
+    }
+    for w in workers {
+        let _ = w.join();
     }
     Ok(())
+}
+
+fn serve_one(node: &Node, mut req: tiny_http::Request, loopback_only: bool) {
+    let host = req
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Host"))
+        .map(|h| h.value.as_str().to_string());
+    if let Some(code) = rpc_http_host_reject(host.as_deref(), loopback_only) {
+        let _ = req.respond(Response::from_string("forbidden host").with_status_code(code));
+        return;
+    }
+    // Metrics is the one GET route, and only when explicitly enabled. It sits
+    // after the Host check so DNS-rebinding protection still applies, and it is
+    // never reachable on the default (metrics-off) build.
+    if req.method() == &Method::Get {
+        let path = req.url().split('?').next().unwrap_or("");
+        if node.metrics_enabled() && path == "/metrics" {
+            let body = node.metrics_text();
+            let mut resp = Response::from_string(body);
+            if let Ok(h) = Header::from_bytes(
+                &b"Content-Type"[..],
+                &b"text/plain; version=0.0.4; charset=utf-8"[..],
+            ) {
+                resp.add_header(h);
+            }
+            let _ = req.respond(resp);
+            return;
+        }
+    }
+    if let Some(code) = rpc_http_reject(req.method() == &Method::Post, 0) {
+        if code == 405 {
+            let _ = req.respond(Response::from_string("POST only").with_status_code(405));
+            return;
+        }
+    }
+    let content_type = req
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Content-Type"))
+        .map(|h| h.value.as_str().to_string());
+    if let Some(code) = rpc_http_content_type_reject(content_type.as_deref()) {
+        let _ = req.respond(Response::from_string("unsupported media type").with_status_code(code));
+        return;
+    }
+    let mut buf = Vec::new();
+    let mut limited = req.as_reader().take((MAX_RPC_BODY as u64) + 1);
+    limited.read_to_end(&mut buf).ok();
+    if let Some(code) = rpc_http_reject(true, buf.len()) {
+        let _ = req.respond(Response::from_string("payload too large").with_status_code(code));
+        return;
+    }
+    let out = node.dispatch_bytes(&buf);
+    if out.is_null() {
+        let _ = req.respond(Response::from_string("").with_status_code(204));
+        return;
+    }
+    let mut resp = Response::from_string(out.to_string());
+    if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]) {
+        resp = resp.with_header(h);
+    }
+    // Never Access-Control-Allow-Origin: * — a page could then call 127.0.0.1:8545.
+    let _ = req.respond(resp);
 }
 
 /// `None` = accept. `Some(status)` = HTTP error (405 POST-only / 413 body cap).
@@ -2604,6 +3859,29 @@ mod tests {
         assert!(err.contains("too many"), "{err}");
         let err = bind_fee_result("eth_unknownFee", &json!("0x1")).unwrap_err();
         assert!(err.contains("unknown"), "{err}");
+        assert!(bind_fee_result("eth_feeHistory", &json!({"baseFeePerGas": ["0x1"]})).is_ok());
+        let err = bind_fee_result("eth_feeHistory", &json!({"oldestBlock": "latest"})).unwrap_err();
+        assert!(err.contains("oldestBlock"), "{err}");
+        let chain = vec![blk(1, 1), blk(100, 100), blk(110, 110)];
+        let safe = SafeHead {
+            number: 100,
+            hash: hash_hex(&chain[1]),
+            state_root: format!("0x{}", hex::encode(chain[1].state_root)),
+            distinct_sealers: 15,
+            required_sealers: 15,
+        };
+        assert!(bind_fee_oldest_block(&json!({"baseFeePerGas": ["0x1"]}), &safe, &chain).is_ok());
+        assert!(bind_fee_oldest_block(&json!({"oldestBlock": "0x64"}), &safe, &chain).is_ok());
+        assert!(bind_fee_oldest_block(&json!({"oldestBlock": "0x1"}), &safe, &chain).is_ok());
+        let (code, msg) =
+            bind_fee_oldest_block(&json!({"oldestBlock": "0x6e"}), &safe, &chain).unwrap_err();
+        assert_eq!(code, ERR_NOT_SYNCED, "{msg}");
+        let (code, msg) =
+            bind_fee_oldest_block(&json!({"oldestBlock": "0xff"}), &safe, &chain).unwrap_err();
+        assert_eq!(code, ERR_NOT_SYNCED, "{msg}");
+        let (code, msg) =
+            bind_fee_oldest_block(&json!({"oldestBlock": "latest"}), &safe, &chain).unwrap_err();
+        assert_eq!(code, ERR_PARAMS, "{msg}");
     }
 
     #[test]

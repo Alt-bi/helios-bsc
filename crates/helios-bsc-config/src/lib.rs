@@ -23,6 +23,7 @@ pub enum Network {
 }
 
 /// Mainnet fork times / heights from `BSCChainConfig` (v1.7.8).
+pub const LONDON_BLOCK: u64 = 31_302_048;
 pub const LUBAN_BLOCK: u64 = 29_020_050;
 pub const PLATO_BLOCK: u64 = 30_720_096;
 pub const BOHR_TIME: u64 = 1_727_317_200;

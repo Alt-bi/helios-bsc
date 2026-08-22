@@ -29,6 +29,13 @@ pub trait RpcUpstream: Send + Sync {
         Ok(vec![])
     }
 
+    /// Untrusted `eth_getBlockReceipts(blockHash)` JSON objects.
+    /// Default is empty (mocks / stubs). HTTP implementations must fetch.
+    fn block_receipts_json(&self, block_hash: &str) -> Result<Vec<Value>> {
+        let _ = block_hash;
+        Ok(vec![])
+    }
+
     fn get_proof(&self, address: &str, block: &str) -> Result<Value> {
         self.get_proof_keys(address, &[], block)
     }
@@ -117,6 +124,9 @@ impl RpcUpstream for Failover {
     fn block_raw_transactions(&self, block_hash: &str) -> Result<Vec<Vec<u8>>> {
         self.fallback(|u| u.block_raw_transactions(block_hash))
     }
+    fn block_receipts_json(&self, block_hash: &str) -> Result<Vec<Value>> {
+        self.fallback(|u| u.block_receipts_json(block_hash))
+    }
 }
 
 /// Data-plane client. `backup` is optional transport failover (not an oracle).
@@ -126,6 +136,74 @@ pub fn open_data_plane(primary: impl Into<String>, backup: Option<String>) -> Bo
         None => Box::new(primary),
         Some(b) => Box::new(Failover::new(Box::new(primary), Box::new(Upstream::new(b)))),
     }
+}
+
+/// Hard ceiling on one upstream JSON-RPC response body.
+///
+/// `Response::into_json` reads through `into_reader()`, which ureq does **not** bound
+/// (only `into_string()` carries a limit). The data plane is untrusted by definition, so
+/// without this a hostile or merely broken upstream could stream until the process is
+/// killed — and every per-item cap in this tree (`MAX_RAW_TX`, `MAX_ORDERED_TRIE_ITEMS`,
+/// `MAX_PROOF_NODES`) applies only *after* the body is already in memory.
+///
+/// 64 MiB is a DoS ceiling, not a protocol constant: the largest legitimate response is a
+/// full block's `eth_getBlockReceipts`, a couple of MiB at BSC's gas limit.
+pub const MAX_UPSTREAM_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+
+fn read_capped_json(resp: ureq::Response) -> Result<Value> {
+    read_capped(resp.into_reader())
+}
+
+fn read_capped(r: impl std::io::Read) -> Result<Value> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    r.take(MAX_UPSTREAM_RESPONSE_BYTES + 1)
+        .read_to_end(&mut buf)
+        .context("read response body")?;
+    if buf.len() as u64 > MAX_UPSTREAM_RESPONSE_BYTES {
+        return Err(anyhow!(
+            "upstream response exceeds {MAX_UPSTREAM_RESPONSE_BYTES} bytes"
+        ));
+    }
+    serde_json::from_slice(&buf).context("parse response body")
+}
+
+/// Re-associate one JSON-RPC batch's responses with the numbers that were requested.
+///
+/// Split out from the HTTP call so the adversarial shapes are unit-testable.
+fn headers_from_batch(arr: &[Value], from: u64, to: u64) -> Result<Vec<RpcBlockHeader>> {
+    // JSON-RPC batch responses may arrive in any order, so `id` is what re-associates
+    // a result with its request. An upstream that repeats or invents ids would make
+    // this list silently short or misordered; `verify_header_chain` would then reject
+    // it as a parent-link break, which reads like a reorg. Insist on exactly the
+    // requested set instead, so the real cause is the reported one.
+    let want = (to - from + 1) as usize;
+    if arr.len() != want {
+        return Err(anyhow!(
+            "batch returned {} responses for {want} requests",
+            arr.len()
+        ));
+    }
+    let mut rows: Vec<(u64, RpcBlockHeader)> = Vec::new();
+    for item in arr {
+        if let Some(err) = item.get("error") {
+            return Err(anyhow!("batch rpc error: {err}"));
+        }
+        let id = item
+            .get("id")
+            .and_then(Value::as_u64)
+            .filter(|id| (from..=to).contains(id))
+            .ok_or_else(|| anyhow!("batch response id outside {from}..={to}"))?;
+        if rows.iter().any(|(seen, _)| *seen == id) {
+            return Err(anyhow!("batch response repeats id {id}"));
+        }
+        let hdr: RpcBlockHeader =
+            serde_json::from_value(item.get("result").cloned().unwrap_or(Value::Null))
+                .with_context(|| format!("header {id}"))?;
+        rows.push((id, hdr));
+    }
+    rows.sort_by_key(|(id, _)| *id);
+    Ok(rows.into_iter().map(|(_, h)| h).collect())
 }
 
 /// HTTP JSON-RPC client (ureq).
@@ -139,8 +217,9 @@ impl Upstream {
     }
 
     fn post_json(&self, body: &Value) -> Result<Value> {
+        const ATTEMPTS: u64 = 4;
         let mut last = anyhow!("no attempt");
-        for attempt in 0..4 {
+        for attempt in 0..ATTEMPTS {
             match ureq::post(&self.url)
                 .set("Content-Type", "application/json")
                 .set("User-Agent", "helios-bsc")
@@ -148,11 +227,15 @@ impl Upstream {
                 .send_json(body)
             {
                 Ok(resp) => {
-                    return resp.into_json().context("upstream JSON");
+                    return read_capped_json(resp).context("upstream JSON");
                 }
                 Err(e) => {
                     last = anyhow!("upstream HTTP: {e}");
-                    std::thread::sleep(std::time::Duration::from_millis(400 * (attempt + 1)));
+                    // No backoff after the last attempt — the caller is about to see the
+                    // error either way, and 1.6 s of it was pure added latency on failure.
+                    if attempt + 1 < ATTEMPTS {
+                        std::thread::sleep(std::time::Duration::from_millis(400 * (attempt + 1)));
+                    }
                 }
             }
         }
@@ -184,19 +267,7 @@ impl Upstream {
         let arr = resp
             .as_array()
             .ok_or_else(|| anyhow!("batch response not array: {resp}"))?;
-        let mut rows: Vec<(u64, RpcBlockHeader)> = Vec::new();
-        for item in arr {
-            if let Some(err) = item.get("error") {
-                return Err(anyhow!("batch rpc error: {err}"));
-            }
-            let id = item.get("id").and_then(Value::as_u64).unwrap_or(0);
-            let hdr: RpcBlockHeader =
-                serde_json::from_value(item.get("result").cloned().unwrap_or(Value::Null))
-                    .with_context(|| format!("header {id}"))?;
-            rows.push((id, hdr));
-        }
-        rows.sort_by_key(|(id, _)| *id);
-        Ok(rows.into_iter().map(|(_, h)| h).collect())
+        headers_from_batch(arr, from, to)
     }
 
     fn header_chunks(from: u64, to: u64) -> Vec<(u64, u64)> {
@@ -364,11 +435,98 @@ impl RpcUpstream for Upstream {
         }
         Ok(raws)
     }
+
+    fn block_receipts_json(&self, block_hash: &str) -> Result<Vec<Value>> {
+        let v = self.call("eth_getBlockReceipts", json!([block_hash]))?;
+        if v.is_null() {
+            return Ok(Vec::new());
+        }
+        let arr = v
+            .as_array()
+            .ok_or_else(|| anyhow!("eth_getBlockReceipts: expected array"))?;
+        if arr.len() > MAX_ORDERED_TRIE_ITEMS {
+            return Err(anyhow!("too many receipts"));
+        }
+        Ok(arr.clone())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_header(n: u64) -> Value {
+        let path = format!(
+            "{}/../../fixtures/mainnet/header_{n}.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn batch_item(id: u64, n: u64) -> Value {
+        json!({"jsonrpc": "2.0", "id": id, "result": fixture_header(n)})
+    }
+
+    #[test]
+    fn batch_ids_reassociate_out_of_order_results() {
+        let arr = vec![
+            batch_item(116_664_001, 116_664_001),
+            batch_item(116_663_999, 116_663_999),
+            batch_item(116_664_000, 116_664_000),
+        ];
+        let got = headers_from_batch(&arr, 116_663_999, 116_664_001).unwrap();
+        let numbers: Vec<u64> = got
+            .iter()
+            .map(|h| u64::from_str_radix(h.number.trim_start_matches("0x"), 16).unwrap())
+            .collect();
+        assert_eq!(numbers, vec![116_663_999, 116_664_000, 116_664_001]);
+        // And the parent links line up, i.e. the reassociation was by id, not by position.
+        assert_eq!(got[1].parent_hash, got[0].hash);
+        assert_eq!(got[2].parent_hash, got[1].hash);
+    }
+
+    /// Each of these used to surface downstream as a parent-link break, i.e. as a reorg.
+    #[test]
+    fn malformed_batch_shapes_rejected() {
+        let ok = batch_item(116_663_999, 116_663_999);
+        let short = vec![ok.clone()];
+        assert!(headers_from_batch(&short, 116_663_999, 116_664_000)
+            .unwrap_err()
+            .to_string()
+            .contains("1 responses for 2 requests"));
+
+        // Two answers for the same block, none for the other.
+        let dup = vec![ok.clone(), ok.clone()];
+        assert!(headers_from_batch(&dup, 116_663_999, 116_664_000)
+            .unwrap_err()
+            .to_string()
+            .contains("repeats id"));
+
+        // An id nobody asked for.
+        let stray = vec![ok.clone(), batch_item(1, 116_664_000)];
+        assert!(headers_from_batch(&stray, 116_663_999, 116_664_000)
+            .unwrap_err()
+            .to_string()
+            .contains("outside"));
+
+        // A missing id is not silently treated as request 0.
+        let no_id = vec![ok, json!({"result": fixture_header(116_664_000)})];
+        assert!(headers_from_batch(&no_id, 116_663_999, 116_664_000).is_err());
+    }
+
+    /// `ureq`'s `into_reader()` is unbounded; only `into_string()` carries a limit.
+    #[test]
+    fn oversized_response_body_is_refused_not_buffered() {
+        use std::io::Read as _;
+        let flood = std::io::repeat(b'a').take(MAX_UPSTREAM_RESPONSE_BYTES * 4);
+        let err = read_capped(flood).unwrap_err().to_string();
+        assert!(err.contains("exceeds"), "{err}");
+
+        // A body right at the cap is still parsed (padded whitespace around a real value).
+        let mut body = vec![b' '; MAX_UPSTREAM_RESPONSE_BYTES as usize - 2];
+        body.extend_from_slice(b"{}");
+        assert_eq!(read_capped(&body[..]).unwrap(), json!({}));
+    }
 
     #[test]
     fn header_chunks_cover_inclusive_range() {

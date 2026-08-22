@@ -7,11 +7,11 @@ use helios_bsc::diff::{
     addr_key, diff_one, proof_error_retryable, rotate_front, soak_empty_burst, soak_list,
     soak_repeat_full_list, unmatched, DiffOutcome, DiffReport, SOAK_ADDRESSES,
 };
-use helios_bsc::rpc_server::{self, Node};
+use helios_bsc::rpc_server::{self, FinalityMode, Node};
 use helios_bsc::sync::{
     checkpoint_policy, confirm_checkpoint_with_oracle, doctor_checkpoint_line, env_host_line,
     env_independence_line, independent_rpc_hosts, rpc_host, safe_of, wait_until_in_window,
-    walk_from_checkpoint, walk_headers, write_checkpoint_file,
+    wait_until_in_window_with, walk_from_checkpoint, walk_headers, write_checkpoint_file,
 };
 use helios_bsc::upstream::{open_data_plane, RpcUpstream, Upstream};
 use helios_bsc_config::{
@@ -22,7 +22,7 @@ use helios_bsc_config::{
 };
 use helios_bsc_consensus::{
     assert_checkpoint_age, checkpoint_at_snapshot, proof_lag, sealing_set_from_activated_epoch,
-    within_proof_window, CHECKPOINT_WARN_AGE_SECS,
+    vote_keys_from_activated_epoch, within_proof_window, CHECKPOINT_WARN_AGE_SECS,
 };
 use helios_bsc_execution::{verify_eth_get_proof, EthAccountProof};
 use helios_bsc_types::{decode_hex_fixed, decode_u64, Checkpoint, RpcBlockHeader};
@@ -43,6 +43,14 @@ const WBNB: &str = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c";
 struct Cli {
     #[command(subcommand)]
     cmd: Commands,
+}
+
+/// `--finality` on `run`. Mirrors [`FinalityMode`]; kept separate so the CLI surface is
+/// not tied to an internal type's naming.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum FinalityArg {
+    ConfirmationDepth,
+    Fast,
 }
 
 #[derive(Subcommand, Debug)]
@@ -124,6 +132,17 @@ enum Commands {
         /// Opt-in: receipts/txs header-bound to Safe; gasPrice / feeHistory / maxPriorityFeePerGas unbound.
         #[arg(long)]
         allow_unverified_passthrough: bool,
+        /// Serve Prometheus metrics on `GET /metrics` (same bind; off by default).
+        #[arg(long)]
+        metrics: bool,
+        /// Which finality rule `latest` / `safe` / `finalized` resolve to.
+        ///
+        /// `confirmation-depth` (default) is ~106–113 blocks behind the tip. `fast` uses
+        /// the BEP-126 BLS-finalized head, ~2 blocks behind, and falls back to
+        /// confirmation depth whenever no finalized head is known — for instance from a
+        /// checkpoint without BLS vote keys. Opt-in until the ≥24h soak covers it.
+        #[arg(long, value_enum, default_value_t = FinalityArg::ConfirmationDepth)]
+        finality: FinalityArg,
     },
     /// Write a checkpoint JSON from a trusted header + operator sealing set.
     WriteCheckpoint {
@@ -186,6 +205,10 @@ enum Commands {
         /// If >0, keep soaking until this many seconds (1h = 3600) even after min-unique.
         #[arg(long, default_value_t = 0)]
         duration_secs: u64,
+        /// Which head to soak: confirmation depth (default) or the BEP-126 BLS
+        /// finalized head that `run --finality fast` serves.
+        #[arg(long, value_enum, default_value_t = FinalityArg::ConfirmationDepth)]
+        finality: FinalityArg,
     },
     /// Check a checkpoint file against upstream (and optional oracle). No header walk.
     VerifyCheckpoint {
@@ -263,6 +286,8 @@ async fn main() -> Result<()> {
             require_checkpoint,
             allow_non_loopback,
             allow_unverified_passthrough,
+            metrics,
+            finality,
         } => {
             info!(%listen, lookback, max_sync, "starting verified RPC");
             assert_listen_policy(&listen, allow_non_loopback)?;
@@ -303,6 +328,17 @@ async fn main() -> Result<()> {
             if has_backup {
                 node.set_backup_transport(true);
             }
+            if metrics {
+                node.set_metrics_enabled(true);
+                eprintln!("metrics on http://{listen}/metrics");
+            }
+            if finality == FinalityArg::Fast {
+                node.set_finality_mode(FinalityMode::Fast);
+                eprintln!(
+                    "finality: fast (BEP-126 BLS); falls back to confirmation depth \
+                     when no finalized head is known"
+                );
+            }
             rpc_server::serve(Arc::new(node), &listen)
         }
         Commands::WriteCheckpoint {
@@ -337,6 +373,7 @@ async fn main() -> Result<()> {
             burst,
             pause,
             duration_secs,
+            finality,
         } => soak(SoakArgs {
             upstream: &upstream,
             backup: backup.as_deref(),
@@ -355,6 +392,7 @@ async fn main() -> Result<()> {
             burst,
             pause,
             duration_secs,
+            fast_finality: finality == FinalityArg::Fast,
         }),
         Commands::VerifyCheckpoint {
             checkpoint,
@@ -592,10 +630,15 @@ fn write_checkpoint(
     let header = fetch_header(&up, block)?;
     let number = decode_u64(&header.number)?;
     let timestamp = decode_u64(&header.timestamp)?;
+    // Vote keys only ever come from an activated epoch's extraData, never from an
+    // operator-supplied address list — so `--sealing-set` yields a checkpoint that runs
+    // confirmation-depth until the client sees an epoch header for itself.
+    let mut vote_keys: Option<Vec<String>> = None;
     let set = match (sealing_set, sealing_set_from_epoch) {
         (Some(s), None) => parse_sealing_set(s)?,
         (None, Some(epoch_id)) => {
             let epoch_header = fetch_header(&up, epoch_id)?;
+            vote_keys = Some(vote_keys_from_activated_epoch(&epoch_header, number)?);
             sealing_set_from_activated_epoch(&epoch_header, number)?
         }
         (Some(_), Some(_)) => {
@@ -612,14 +655,19 @@ fn write_checkpoint(
         Some("helios-bsc write-checkpoint".into())
     };
     let cp = Checkpoint::from_rpc_header(&header, set, fork.name, attestation)?;
+    let cp = match vote_keys {
+        Some(keys) => cp.with_vote_keys(keys),
+        None => cp,
+    };
     cp.validate_basic()?;
     write_checkpoint_file(out, &cp)?;
     println!(
-        "wrote checkpoint {} hash={} n_seal={} fork={}",
+        "wrote checkpoint {} hash={} n_seal={} fork={} fastFinality={}",
         cp.number,
         cp.hash,
         cp.sealing_set.len(),
-        cp.fork_id
+        cp.fork_id,
+        if cp.vote_keys.is_some() { "yes" } else { "no" }
     );
     Ok(())
 }
@@ -776,6 +824,9 @@ fn probe_safe(args: ProbeSafeArgs<'_>) -> Result<()> {
                 lookback,
                 max_sync,
                 visit_all: false,
+                // probe-safe reports the confirmation-depth Safe above; diff the
+                // same head so the two numbers cannot disagree.
+                fast_finality: false,
             },
             &mut done,
         )?;
@@ -813,6 +864,8 @@ struct SoakArgs<'a> {
     burst: usize,
     pause: f64,
     duration_secs: u64,
+    /// Soak the head that `--finality fast` would serve, not confirmation depth.
+    fast_finality: bool,
 }
 
 struct SoakUntilOpts {
@@ -824,6 +877,8 @@ struct SoakUntilOpts {
     max_sync: u64,
     /// Re-diff every address once (duration soak after unique is full).
     visit_all: bool,
+    /// Compare at the BLS-finalized head instead of confirmation depth.
+    fast_finality: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -859,13 +914,14 @@ fn soak_until(
     let mut report = SoakReport::default();
     let mut empty = 0u32;
     while !pending.is_empty() && done.len() < unique_cap {
-        let (tip, safe) = match wait_until_in_window(
+        let (tip, safe) = match wait_until_in_window_with(
             up,
             chain,
             opts.lookback,
             opts.max_sync,
             snapshot.as_deref_mut(),
             Duration::from_secs(20),
+            opts.fast_finality,
         ) {
             Ok(v) => v,
             Err(e) => {
@@ -1060,6 +1116,7 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
                 lookback: args.lookback,
                 max_sync: args.max_sync,
                 visit_all,
+                fast_finality: args.fast_finality,
             },
             &mut done,
         )?;
@@ -1127,6 +1184,13 @@ fn verify_checkpoint(
     println!("hash:         {}", cp.hash);
     println!("stateRoot:    {}", cp.state_root);
     println!("n_seal:       {}", cp.sealing_set.len());
+    println!(
+        "fastFinality: {}",
+        match &cp.vote_keys {
+            Some(k) => format!("yes ({} BLS vote keys)", k.len()),
+            None => "no (confirmation-depth until an epoch activates)".into(),
+        }
+    );
     println!("age_s:        {age}");
     println!("upstream:     {}", rpc_host(upstream));
     if let Some(url) = oracle_url.filter(|u| !u.trim().is_empty()) {
