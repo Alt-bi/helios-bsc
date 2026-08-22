@@ -1119,6 +1119,12 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
 
     let mut tot = DiffReport::default();
     let mut fast_compared = 0u32;
+    // A wedged walk and a slow one look identical for one round. They stop looking
+    // identical quickly: the snapshot cannot skip a header, so a header it refuses is
+    // refused again every round, forever. A 24h run that hits one spends 24h printing
+    // the same error. Give up after a few barren rounds and say why.
+    let mut barren_rounds = 0u32;
+    const BARREN_ROUND_LIMIT: u32 = 3;
     let mut done: HashSet<String> = HashSet::new();
     let mut round = 0u32;
     loop {
@@ -1172,6 +1178,16 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
         );
         if tot.mismatched > 0 {
             bail!("oracle mismatch (fail-closed)");
+        }
+        if report.compared == 0 {
+            barren_rounds += 1;
+            if barren_rounds >= BARREN_ROUND_LIMIT {
+                bail!(
+                    "{barren_rounds} consecutive rounds compared nothing — the walk is stuck, not slow. The errors above are the reason; a header the snapshot refuses is refused again every round."
+                );
+            }
+        } else {
+            barren_rounds = 0;
         }
         let time_left = deadline.is_some_and(|d| Instant::now() < d);
         let more_fixed = deadline.is_none() && round < args.rounds;
