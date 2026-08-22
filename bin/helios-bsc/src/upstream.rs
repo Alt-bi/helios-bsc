@@ -150,8 +150,11 @@ pub fn open_data_plane(primary: impl Into<String>, backup: Option<String>) -> Bo
 /// full block's `eth_getBlockReceipts`, a couple of MiB at BSC's gas limit.
 pub const MAX_UPSTREAM_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 
-fn read_capped_json(resp: ureq::Response) -> Result<Value> {
-    read_capped(resp.into_reader())
+fn read_capped_json(resp: ureq::http::Response<ureq::Body>) -> Result<Value> {
+    // ureq 3 can cap the body itself (`with_config().limit()`), but keeping our own
+    // `take` means the bound stays one testable function rather than a call-site
+    // argument — see `oversized_response_body_is_refused_not_buffered`.
+    read_capped(resp.into_body().into_reader())
 }
 
 fn read_capped(r: impl std::io::Read) -> Result<Value> {
@@ -165,7 +168,20 @@ fn read_capped(r: impl std::io::Read) -> Result<Value> {
             "upstream response exceeds {MAX_UPSTREAM_RESPONSE_BYTES} bytes"
         ));
     }
-    serde_json::from_slice(&buf).context("parse response body")
+    serde_json::from_slice(&buf).with_context(|| {
+        // A free endpoint under load answers with an HTML error page or a plain-text
+        // rate-limit notice, and "expected value at line 1 column 1" sends the operator
+        // looking for a bug in the client. Show what actually came back.
+        let head: String = String::from_utf8_lossy(&buf[..buf.len().min(200)])
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        format!(
+            "parse response body ({} bytes, starts: {:?})",
+            buf.len(),
+            head.trim()
+        )
+    })
 }
 
 /// Re-associate one JSON-RPC batch's responses with the numbers that were requested.
@@ -221,9 +237,11 @@ impl Upstream {
         let mut last = anyhow!("no attempt");
         for attempt in 0..ATTEMPTS {
             match ureq::post(&self.url)
-                .set("Content-Type", "application/json")
-                .set("User-Agent", "helios-bsc")
-                .timeout(std::time::Duration::from_secs(30))
+                .config()
+                .timeout_global(Some(std::time::Duration::from_secs(30)))
+                .build()
+                .header("Content-Type", "application/json")
+                .header("User-Agent", "helios-bsc")
                 .send_json(body)
             {
                 Ok(resp) => {
@@ -343,11 +361,13 @@ impl RpcUpstream for Upstream {
         match self.headers_range_parallel(from, to) {
             Ok(v) => Ok(v),
             Err(e) => {
-                eprintln!("parallel header fetch failed ({e}); serial batches");
+                eprintln!("parallel header fetch failed ({e:#}); serial batches");
                 match self.headers_range_batch(from, to) {
                     Ok(v) => Ok(v),
                     Err(e2) => {
-                        eprintln!("batch fetch failed ({e2}); falling back to single-header calls");
+                        eprintln!(
+                            "batch fetch failed ({e2:#}); falling back to single-header calls"
+                        );
                         let mut out = Vec::new();
                         for n in from..=to {
                             out.push(self.header_by_number(n)?);

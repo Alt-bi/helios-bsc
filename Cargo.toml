@@ -37,9 +37,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
 tiny-keccak = { version = "2", features = ["keccak"] }
-secp256k1 = { version = "0.30", features = ["recovery", "global-context"] }
+secp256k1 = { version = "0.31", features = ["recovery", "global-context"] }
 blst = "0.3"
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "3", features = ["json"] }
 tiny_http = "0.12"
 
 [profile.release]
