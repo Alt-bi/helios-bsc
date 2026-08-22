@@ -1,6 +1,8 @@
 //! Sealing-set snapshot + epoch activation (`minerHistoryCheckLen`).
 
-use crate::seal::{verify_seal_coinbase, SealError};
+use crate::seal::{
+    milli_timestamp, verify_out_of_turn_backoff, verify_seal_coinbase, BackoffContext, SealError,
+};
 use crate::vote::{decode_vote_attestation, verify_attestation_signature, VoteData, VoteError};
 use helios_bsc_config::{
     miner_history_check_len, params_at, parse_extra, ExtraDataVersion, ExtraError,
@@ -90,6 +92,14 @@ pub struct Snapshot {
     /// Newest attestation accepted so far: its target is the justified block and its
     /// source is the finalized one (`GetJustifiedNumberAndHash` / `GetFinalizedHeader`).
     pub attestation: Option<VoteData>,
+    /// `MilliTimestamp` of the block at `number`, i.e. the parent of the next header.
+    /// `None` until one header has actually been walked — the checkpoint carries a unix
+    /// second, not a millisecond, so it cannot seed this.
+    last_milli: Option<u64>,
+    /// Lowest block number this snapshot has walked. Below it `recents` is simply unknown
+    /// (the walk starts empty at the checkpoint), which is *not* the same as "nobody
+    /// sealed there" — see [`Snapshot::recents_window_walked`].
+    walk_start: u64,
 }
 
 impl Snapshot {
@@ -134,6 +144,8 @@ impl Snapshot {
             // The checkpoint set is the set at the checkpoint, so nothing is "recent".
             set_changed_at: 0,
             attestation: None,
+            last_milli: None,
+            walk_start: cp.number.saturating_add(1),
         })
     }
 
@@ -351,6 +363,39 @@ impl Snapshot {
         false
     }
 
+    /// True when every block geth's `countRecents` would scan has actually been walked.
+    ///
+    /// v1.7.8 `consensus/parlia/snapshot.go` `countRecents` scans `seen > leftHistoryBound`
+    /// with `leftHistoryBound = s.Number - minerHistoryCheckLen()`, so the window is
+    /// `(left_bound, self.number]`. A client that started at a checkpoint has no entries
+    /// below `walk_start`, and a *missing* entry lowers a count — which would flip
+    /// `signRecentlyByCounts` from `true` to `false` and let the backoff floor demand more
+    /// than geth does. Extra entries are harmless (they only ever raise a count, pushing
+    /// the check toward its no-op branch), so this only guards against gaps.
+    fn recents_window_walked(&self) -> bool {
+        let left_bound = self.number.saturating_sub(self.delay());
+        left_bound.saturating_add(1) >= self.walk_start
+    }
+
+    /// Facts for [`verify_out_of_turn_backoff`], erring toward "unknown" everywhere.
+    fn backoff_context(&self) -> BackoffContext {
+        let known = self.enforce_inturn
+            && self.turn_length > 0
+            && !self.validators.is_empty()
+            && self.last_milli.is_some()
+            && self.recents_window_walked();
+        BackoffContext {
+            parent_milli: self.last_milli.unwrap_or(0),
+            known,
+            // No known in-turn validator means geth's `delay` may have been zeroed by a
+            // validator we cannot identify: treat that as "signed recently" and stand down.
+            in_turn_signed_recently: self
+                .inturn_validator()
+                .map(|v| self.sign_recently(&v))
+                .unwrap_or(true),
+        }
+    }
+
     pub fn sealing_set_hex(&self) -> Vec<String> {
         self.validators.iter().map(format_address).collect()
     }
@@ -400,6 +445,11 @@ impl Snapshot {
         if self.sign_recently(&signer) {
             return Err(SnapshotError::RecentlySigned(format_address(&signer)));
         }
+
+        // geth's order in `verifyCascadingFields`: unauthorized → `SignRecently` →
+        // difficulty → `blockTimeVerifyForRamanujanFork`. Running last matters — the three
+        // checks above are what let the backoff floor drop `backOffTime`'s zero branches.
+        verify_out_of_turn_backoff(self.backoff_context(), header)?;
 
         let extra = decode_hex(&header.extra_data)?;
         let is_epoch = number % self.epoch_length == 0;
@@ -479,6 +529,7 @@ impl Snapshot {
 
         self.number = number;
         self.hash = hash;
+        self.last_milli = Some(milli_timestamp(header)?);
         Ok(())
     }
 
@@ -606,6 +657,146 @@ mod tests {
         assert_eq!(snap.validators[0], addr(30));
         assert_eq!(snap.recents.len(), 1);
         assert!(snap.recents.values().all(|a| *a == RECENT_EPOCH_SENTINEL));
+    }
+
+    /// Post-Fermi wall clock for the synthetic walk: 450ms per block from the checkpoint.
+    const BASE_MILLI: u64 = 1_768_357_801_000;
+
+    fn set_milli(h: &mut RpcBlockHeader, milli: u64) {
+        h.timestamp = format!("0x{:x}", milli / 1000);
+        let mut mix = [0u8; 32];
+        mix[30..32].copy_from_slice(&u16::try_from(milli % 1000).unwrap().to_be_bytes());
+        h.mix_hash = format!("0x{}", hex::encode(mix));
+    }
+
+    fn milli_at(number: u64) -> u64 {
+        BASE_MILLI + (number - 1000) * 450
+    }
+
+    /// Walk in-turn headers `from..=to` with realistic 450ms spacing.
+    fn walk_inturn(snap: &mut Snapshot, from: u64, to: u64) {
+        let mut parent = snap.hash;
+        for n in from..=to {
+            let mut hash = [0u8; 32];
+            hash[0..8].copy_from_slice(&n.to_be_bytes());
+            let signer = snap.inturn_validator().expect("inturn");
+            let mut h = dummy_header(n, parent, hash);
+            h.difficulty = format!("0x{:x}", snap.expected_difficulty(&signer));
+            set_milli(&mut h, milli_at(n));
+            snap.apply_verified(&h, signer)
+                .unwrap_or_else(|e| panic!("block {n}: {e}"));
+            parent = hash;
+        }
+    }
+
+    /// Walk from the checkpoint's first block.
+    fn walk_to(snap: &mut Snapshot, to: u64) {
+        walk_inturn(snap, 1001, to);
+    }
+
+    /// The `countRecents` window reaches back `minerHistoryCheckLen` (87) blocks. Until the
+    /// walk covers it, `recents` has holes the client cannot distinguish from "nobody
+    /// sealed", so the backoff floor must not fire at all.
+    #[test]
+    fn backoff_stays_off_until_the_recents_window_is_walked() {
+        let mut snap = Snapshot::from_checkpoint(&cp()).unwrap();
+        assert_eq!(snap.delay(), 87);
+        assert_eq!(snap.walk_start, 1001);
+
+        walk_to(&mut snap, 1086);
+        assert_eq!(snap.number, 1086);
+        assert!(
+            !snap.recents_window_walked(),
+            "window (999, 1086] is not covered by a walk that starts at 1001"
+        );
+        assert!(!snap.backoff_context().known);
+
+        walk_inturn(&mut snap, 1087, 1087);
+        assert!(
+            snap.recents_window_walked(),
+            "window (1000, 1087] is covered"
+        );
+        assert!(snap.backoff_context().known);
+    }
+
+    /// An early out-of-turn header is a no-op before the window is covered and a rejection
+    /// after — same header, same snapshot shape, only the gate differs.
+    #[test]
+    fn early_out_of_turn_header_rejected_once_context_is_known() {
+        // Before: 87 blocks short of a covered window.
+        let mut early_snap = Snapshot::from_checkpoint(&cp()).unwrap();
+        walk_to(&mut early_snap, 1010);
+        let ctx = early_snap.backoff_context();
+        assert!(!ctx.known);
+
+        let mut h = dummy_header(1011, early_snap.hash, [0xab; 32]);
+        h.difficulty = format!("0x{DIFF_NO_TURN:x}");
+        // One interval after the parent: clears the Ramanujan floor, not the backoff floor.
+        set_milli(&mut h, milli_at(1010) + 450);
+        let out_of_turn = pick_out_of_turn(&early_snap);
+        early_snap
+            .apply_verified(&h, out_of_turn)
+            .expect("unknown context => backoff rule must not fire");
+
+        // After: the same situation with a fully walked window.
+        let mut snap = Snapshot::from_checkpoint(&cp()).unwrap();
+        walk_to(&mut snap, 1090);
+        let ctx = snap.backoff_context();
+        assert!(ctx.known);
+        assert!(
+            !ctx.in_turn_signed_recently,
+            "mid-turn validator has signed fewer than turnLength times"
+        );
+        assert_eq!(ctx.parent_milli, milli_at(1090));
+
+        let signer = pick_out_of_turn(&snap);
+        let floor = milli_at(1090) + 450 + crate::seal::LORENTZ_INITIAL_BACKOFF_MS;
+
+        let mut too_early = dummy_header(1091, snap.hash, [0xcd; 32]);
+        too_early.difficulty = format!("0x{DIFF_NO_TURN:x}");
+        set_milli(&mut too_early, floor - 1);
+        let err = snap.clone().apply_verified(&too_early, signer).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SnapshotError::Seal(SealError::OutOfTurnTooEarly { backoff: 2000, .. })
+            ),
+            "{err}"
+        );
+
+        let mut at_floor = too_early.clone();
+        set_milli(&mut at_floor, floor);
+        snap.apply_verified(&at_floor, signer)
+            .expect("exactly at geth's floor is legal");
+    }
+
+    /// A padded/unknown sealing set makes `inturn` meaningless, so the rule must stand down.
+    #[test]
+    fn backoff_is_a_noop_without_a_real_sealing_set() {
+        let mut snap = Snapshot::from_checkpoint(&cp()).unwrap();
+        walk_to(&mut snap, 1090);
+        assert!(snap.backoff_context().known);
+
+        snap.enforce_inturn = false;
+        assert!(!snap.backoff_context().known);
+
+        let signer = pick_out_of_turn(&snap);
+        let mut h = dummy_header(1091, snap.hash, [0xef; 32]);
+        h.difficulty = format!("0x{DIFF_NO_TURN:x}");
+        set_milli(&mut h, milli_at(1090) + 450);
+        snap.apply_verified(&h, signer)
+            .expect("no trustworthy set => no timing constraint");
+    }
+
+    /// A set member that is neither in-turn nor a recent signer — the only shape that can
+    /// legitimately produce a `diffNoTurn` header.
+    fn pick_out_of_turn(snap: &Snapshot) -> [u8; 20] {
+        let inturn = snap.inturn_validator().expect("inturn");
+        *snap
+            .validators
+            .iter()
+            .find(|v| **v != inturn && !snap.sign_recently(v))
+            .expect("a fresh out-of-turn validator")
     }
 
     #[test]

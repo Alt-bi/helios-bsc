@@ -54,6 +54,16 @@ pub enum SealError {
         parent: u64,
         interval: u64,
     },
+    #[error(
+        "out-of-turn block MilliTimestamp {got} < parent {parent} + interval {interval}ms \
+         + backoff {backoff}ms"
+    )]
+    OutOfTurnTooEarly {
+        got: u64,
+        parent: u64,
+        interval: u64,
+        backoff: u64,
+    },
     #[error("gasLimit {got} outside parent {parent} ± bound {bound}")]
     GasLimitBound { got: u64, parent: u64, bound: u64 },
     #[error("header timestamp {time} is in the future (now {now})")]
@@ -423,8 +433,12 @@ pub fn verify_extra_layout(header: &RpcBlockHeader) -> Result<(), SealError> {
     Ok(())
 }
 
-/// Parent-dependent checks: Ramanujan floor `parent.milli + BlockInterval` (backoff not
-/// applied — needs recents) and Lorentz+ gasLimit bound (`|Δ| < parent/1024`, min 5000).
+/// Parent-dependent checks: Ramanujan floor `parent.milli + BlockInterval` and Lorentz+
+/// gasLimit bound (`|Δ| < parent/1024`, min 5000).
+///
+/// This is the whole rule for in-turn headers, where geth's `backOffTime` is `0`. The
+/// out-of-turn refinement needs snapshot state and lives in [`verify_out_of_turn_backoff`],
+/// which `Snapshot::apply_verified` applies on top of this floor.
 ///
 /// `parent_gas_limit == 0` skips (unknown parent fields, e.g. dummy test genesis).
 pub fn verify_cascading_vs_parent(
@@ -463,6 +477,140 @@ pub fn verify_cascading_vs_parent(
             got: gas,
             parent: parent_gas_limit,
             bound,
+        });
+    }
+    Ok(())
+}
+
+/// v1.7.8 `consensus/parlia/parlia.go` `wiggleTime` — per-step backoff spacing.
+pub const WIGGLE_TIME_MS: u64 = 1000;
+/// v1.7.8 `consensus/parlia/parlia.go` `lorentzInitialBackOffTime`.
+pub const LORENTZ_INITIAL_BACKOFF_MS: u64 = 2000;
+/// v1.7.8 `consensus/parlia/parlia.go` `defaultInitialBackOffTime` (pre-Lorentz parents).
+pub const DEFAULT_INITIAL_BACKOFF_MS: u64 = 1000;
+
+/// Parent-snapshot facts needed to bound `backOffTime` for an out-of-turn header.
+///
+/// Every field is "what the snapshot at the **parent** knows"; see
+/// [`verify_out_of_turn_backoff`] for how each one is used.
+#[derive(Debug, Clone, Copy)]
+pub struct BackoffContext {
+    /// `parent.MilliTimestamp()`.
+    pub parent_milli: u64,
+    /// False whenever the client cannot reproduce geth's inputs — no sealing set, a
+    /// padded set (`enforce_inturn == false`), or a `countRecents` window that was not
+    /// fully walked. Makes the whole check a no-op.
+    pub known: bool,
+    /// `snap.signRecentlyByCounts(snap.inturnValidator(), snap.countRecents())`.
+    ///
+    /// Must be `true` whenever the client is not certain it is `false`: geth zeroes the
+    /// initial backoff in that case, so a wrong `false` here would reject an honest block.
+    pub in_turn_signed_recently: bool,
+}
+
+/// Out-of-turn backoff floor — the enforceable part of Parlia's `backOffTime`.
+///
+/// v1.7.8 `consensus/parlia/ramanujanfork.go` `blockTimeVerifyForRamanujanFork` shows this
+/// is a **verifier** rule, not just a sealing rule (`verifyCascadingFields` calls it):
+///
+/// ```text
+/// func (p *Parlia) blockTimeVerifyForRamanujanFork(snap *Snapshot, header, parent *types.Header) error {
+///     if p.chainConfig.IsRamanujan(header.Number) {
+///         if header.MilliTimestamp() < parent.MilliTimestamp()+snap.BlockInterval+p.backOffTime(snap, parent, header, header.Coinbase) {
+///             return consensus.ErrFutureBlock
+///         }
+///     }
+///     return nil
+/// }
+/// ```
+///
+/// `backOffTime` (v1.7.8 `consensus/parlia/parlia.go`) returns `0` for an in-turn sealer,
+/// so for `difficulty == diffInTurn` this collapses to the plain Ramanujan floor already
+/// enforced by [`verify_cascading_vs_parent`]. The out-of-turn branch, for a parent past
+/// Lorentz (so `IsPlanck` and `IsBohr` also hold — the only combination mainnet runs), is:
+///
+/// ```text
+/// delay := defaultInitialBackOffTime
+/// isParerntLorentz := p.chainConfig.IsLorentz(parent.Number, parent.Time)
+/// if isParerntLorentz {
+///     delay = lorentzInitialBackOffTime
+/// }
+/// ...
+///     inTurnAddr := snap.inturnValidator()
+///     if snap.signRecentlyByCounts(inTurnAddr, counts) {
+///         delay = 0
+///     }
+/// ...
+/// if delay == 0 && isParerntLorentz {
+///     if backOffSteps[idx] == 0 {
+///         return 0
+///     }
+///     return lorentzInitialBackOffTime + (backOffSteps[idx]-1)*wiggleTime
+/// }
+/// delay += backOffSteps[idx] * wiggleTime
+/// return delay
+/// ```
+///
+/// `backOffSteps` is `[0..n)` shuffled by `rand.New(rand.NewSource(randSeed)).Shuffle` —
+/// Go's `math/rand` additive lagged-Fibonacci generator, whose state is seeded from a
+/// 607-entry table baked into Go's runtime. That term is **not** reproduced here.
+///
+/// What *is* reproduced is a bound that holds whatever the shuffle produces. `backOffTime`
+/// has exactly four `0` returns, and `verifyCascadingFields` has already excluded three of
+/// them by the time this runs:
+///
+/// - `snap.inturn(val)` — excluded: the caller has matched `difficulty` against
+///   `snap.inturn`, so a `diffNoTurn` header's sealer is not the in-turn validator.
+/// - `snap.signRecentlyByCounts(val, counts)` — excluded: `errRecentlySigned` rejects the
+///   header before the timing check.
+/// - `idx < 0` — excluded: the sealer is in the set, is not in-turn and has not signed
+///   recently, so it survives both exclusion filters and has an index.
+/// - `delay == 0 && backOffSteps[idx] == 0` — this is the one that depends on the shuffle,
+///   and it is reachable **only** when `delay` was zeroed, i.e. only when the in-turn
+///   validator signed recently. [`BackoffContext::in_turn_signed_recently`] gates it.
+///
+/// So when the in-turn validator has *not* signed recently, `delay` keeps its initial value
+/// and the function returns `delay + backOffSteps[idx]*wiggleTime >= delay`. The floor below
+/// uses `delay` alone, dropping the non-negative shuffled term. It is therefore a strict
+/// **under**-estimate of geth's `backOffTime`: every header geth accepts, this accepts.
+///
+/// `interval_ms` likewise comes from the header's fork rather than geth's `snap.BlockInterval`
+/// (which is the parent's, and never smaller, since intervals only shrink across forks) —
+/// again erring low on purpose.
+pub fn verify_out_of_turn_backoff(
+    ctx: BackoffContext,
+    header: &RpcBlockHeader,
+) -> Result<(), SealError> {
+    // Any uncertainty, or a possibly-zeroed `delay`, means no constraint at all.
+    if !ctx.known || ctx.in_turn_signed_recently {
+        return Ok(());
+    }
+    if decode_u64(&header.difficulty)? != DIFF_NO_TURN {
+        return Ok(());
+    }
+    // `IsLorentz(parent.Number, parent.Time)` — deliberately the *parent's* clock, as geth
+    // notes: `header.Time` is temporarily `now+1` while mining, so it cannot gate the fork.
+    let parent_time = ctx.parent_milli / 1000;
+    let backoff = if parent_time >= LORENTZ_TIME {
+        LORENTZ_INITIAL_BACKOFF_MS
+    } else {
+        DEFAULT_INITIAL_BACKOFF_MS
+    };
+
+    let number = decode_u64(&header.number)?;
+    let time = decode_u64(&header.timestamp)?;
+    let interval = params_at(number, time).block_interval_ms;
+    let got = milli_timestamp(header)?;
+    let floor = ctx
+        .parent_milli
+        .saturating_add(interval)
+        .saturating_add(backoff);
+    if got < floor {
+        return Err(SealError::OutOfTurnTooEarly {
+            got,
+            parent: ctx.parent_milli,
+            interval,
+            backoff,
         });
     }
     Ok(())
@@ -650,6 +798,129 @@ mod tests {
             verify_cascading_vs_parent(p_milli, p_gas, &gas).unwrap_err(),
             SealError::InvalidGasLimit { got: 1 } | SealError::GasLimitBound { .. }
         ));
+    }
+
+    /// Rewrite a header's `MilliTimestamp` (Lorentz+ splits it across `time` and `mixDigest`).
+    fn set_milli(h: &mut RpcBlockHeader, milli: u64) {
+        h.timestamp = format!("0x{:x}", milli / 1000);
+        let mut mix = [0u8; 32];
+        let ms = u16::try_from(milli % 1000).unwrap();
+        mix[30..32].copy_from_slice(&ms.to_be_bytes());
+        h.mix_hash = format!("0x{}", hex::encode(mix));
+    }
+
+    fn ctx(parent_milli: u64) -> BackoffContext {
+        BackoffContext {
+            parent_milli,
+            known: true,
+            in_turn_signed_recently: false,
+        }
+    }
+
+    /// Boundary is geth's, not ours: `parent.MilliTimestamp() + snap.BlockInterval +
+    /// lorentzInitialBackOffTime`, with the shuffled `backOffSteps[idx]*wiggleTime` term
+    /// dropped (it is non-negative, so dropping it can only loosen the check).
+    #[test]
+    fn out_of_turn_floor_is_interval_plus_initial_backoff() {
+        let mut h = load("header_116664001.json");
+        h.difficulty = format!("0x{DIFF_NO_TURN:x}");
+        // Post-Fermi fixture: snap.BlockInterval = 450ms, parent is well past Lorentz.
+        let parent_milli = 1_787_059_567_700u64;
+        let interval = params_at(
+            decode_u64(&h.number).unwrap(),
+            decode_u64(&h.timestamp).unwrap(),
+        )
+        .block_interval_ms;
+        assert_eq!(interval, 450);
+        let floor = parent_milli + interval + LORENTZ_INITIAL_BACKOFF_MS;
+        assert_eq!(floor, parent_milli + 2450);
+
+        set_milli(&mut h, floor);
+        verify_out_of_turn_backoff(ctx(parent_milli), &h).expect("exactly at the floor is legal");
+
+        set_milli(&mut h, floor + WIGGLE_TIME_MS);
+        verify_out_of_turn_backoff(ctx(parent_milli), &h).expect("later is always legal");
+
+        set_milli(&mut h, floor - 1);
+        let err = verify_out_of_turn_backoff(ctx(parent_milli), &h).unwrap_err();
+        assert!(
+            matches!(err, SealError::OutOfTurnTooEarly { backoff: 2000, .. }),
+            "{err}"
+        );
+
+        // The plain Ramanujan floor would have accepted this: the refinement is real.
+        set_milli(&mut h, parent_milli + interval);
+        let p_gas = decode_u64(&load("header_116664000.json").gas_limit).unwrap();
+        verify_cascading_vs_parent(parent_milli, p_gas, &h)
+            .expect("one interval clears the Ramanujan floor");
+        assert!(verify_out_of_turn_backoff(ctx(parent_milli), &h).is_err());
+    }
+
+    /// `isParerntLorentz` reads the *parent's* clock, so a pre-Lorentz parent keeps
+    /// `defaultInitialBackOffTime` (1000ms) with the 3000ms pre-Lorentz interval.
+    #[test]
+    fn pre_lorentz_parent_uses_default_initial_backoff() {
+        let mut h = load("header_116664001.json");
+        h.difficulty = format!("0x{DIFF_NO_TURN:x}");
+        let parent_milli = (LORENTZ_TIME - 10) * 1000;
+        let floor = parent_milli + 3000 + DEFAULT_INITIAL_BACKOFF_MS;
+
+        h.timestamp = format!("0x{:x}", floor / 1000);
+        assert_eq!(milli_timestamp(&h).unwrap(), floor);
+        verify_out_of_turn_backoff(ctx(parent_milli), &h).unwrap();
+
+        h.timestamp = format!("0x{:x}", (floor / 1000) - 1);
+        let err = verify_out_of_turn_backoff(ctx(parent_milli), &h).unwrap_err();
+        assert!(
+            matches!(err, SealError::OutOfTurnTooEarly { backoff: 1000, .. }),
+            "{err}"
+        );
+    }
+
+    /// `backOffTime` returns 0 for an in-turn sealer, so `diffInTurn` headers keep the
+    /// plain Ramanujan floor. Every mainnet fixture is in-turn and spaced one interval.
+    #[test]
+    fn in_turn_fixtures_unaffected_by_backoff_rule() {
+        let names = [
+            "header_116663998.json",
+            "header_116663999.json",
+            "header_116664000.json",
+            "header_116664001.json",
+            "header_116664002.json",
+        ];
+        let headers: Vec<_> = names.iter().map(|n| load(n)).collect();
+        for w in headers.windows(2) {
+            let p_milli = milli_timestamp(&w[0]).unwrap();
+            assert_eq!(decode_u64(&w[1].difficulty).unwrap(), DIFF_IN_TURN);
+            // Spacing is 450ms — far below the 2450ms out-of-turn floor, so this would
+            // fail loudly if the rule ever leaked into the in-turn path.
+            assert!(milli_timestamp(&w[1]).unwrap() - p_milli < LORENTZ_INITIAL_BACKOFF_MS);
+            verify_out_of_turn_backoff(ctx(p_milli), &w[1])
+                .unwrap_or_else(|e| panic!("{} -> {}: {e}", w[0].number, w[1].number));
+        }
+    }
+
+    /// Both no-op gates: unknown context, and a possibly-zeroed `delay`.
+    #[test]
+    fn backoff_rule_is_a_noop_without_context() {
+        let mut h = load("header_116664001.json");
+        h.difficulty = format!("0x{DIFF_NO_TURN:x}");
+        let parent_milli = 1_787_059_567_700u64;
+        set_milli(&mut h, parent_milli + 450);
+        assert!(verify_out_of_turn_backoff(ctx(parent_milli), &h).is_err());
+
+        let unknown = BackoffContext {
+            known: false,
+            ..ctx(parent_milli)
+        };
+        verify_out_of_turn_backoff(unknown, &h).expect("no sealing set => no constraint");
+
+        let zeroed = BackoffContext {
+            in_turn_signed_recently: true,
+            ..ctx(parent_milli)
+        };
+        verify_out_of_turn_backoff(zeroed, &h)
+            .expect("geth zeroes delay, so any backOffSteps[idx] may be 0");
     }
 
     #[test]
