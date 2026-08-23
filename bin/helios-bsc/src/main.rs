@@ -465,7 +465,7 @@ fn print_info() -> Result<()> {
         "checkpoint:   --checkpoint FILE; --require-multisource-checkpoint + --checkpoint-oracle"
     );
     println!(
-        "soak:         soak --oracle URL [--min-unique 10] [--duration-secs 3600]  (MPT vs independent host)"
+        "soak:         soak --oracle URL [--min-unique 10] [--duration-secs 86400] [--state F]  (balance/nonce/slot0/eth_call vs independent host; --state resumes after a crash)"
     );
     println!(
         "verify:       verify-checkpoint --checkpoint FILE [--require-multisource-checkpoint]"
