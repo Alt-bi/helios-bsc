@@ -91,9 +91,13 @@ pub struct SoakState {
     /// Comparisons that reached each best-effort sub-check. Carried across sessions so a
     /// long soak can say what it actually exercised, not just how many times it ran.
     #[serde(default)]
+    pub checked_balance: u32,
+    #[serde(default)]
     pub checked_nonce: u32,
     #[serde(default)]
     pub checked_slot0: u32,
+    #[serde(default)]
+    pub checked_call: u32,
     /// Addresses matched at least once, lowercased.
     pub unique: Vec<String>,
     /// Sessions in start order. The soaked total is their sum, never

@@ -4,8 +4,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use helios_bsc::bind::assert_listen_policy;
 use helios_bsc::diff::{
-    addr_key, diff_one, proof_error_retryable, rotate_front, soak_empty_burst, soak_list,
-    soak_repeat_full_list, unmatched, DiffOutcome, DiffReport, SOAK_ADDRESSES,
+    addr_key, diff_call_one, diff_one, proof_error_retryable, rotate_front, soak_empty_burst,
+    soak_list, soak_repeat_full_list, unmatched, DiffOutcome, DiffReport, SOAK_ADDRESSES,
 };
 use helios_bsc::rpc_server::{self, FinalityMode, Node};
 use helios_bsc::soak_state::{human_secs, SoakFingerprint, SoakState};
@@ -901,8 +901,10 @@ struct SoakReport {
     /// Comparisons that ran at the BLS-finalized head rather than confirmation depth.
     /// "Asked for fast finality" and "ran at fast finality" are different facts.
     compared_at_fast: u32,
+    checked_balance: u32,
     checked_nonce: u32,
     checked_slot0: u32,
+    checked_call: u32,
 }
 
 fn soak_until(
@@ -978,6 +980,7 @@ fn soak_until(
                     report.compared += 1;
                     report.matched += 1;
                     compared_this += 1;
+                    report.checked_balance += 1;
                     report.checked_nonce += u32::from(checks.nonce);
                     report.checked_slot0 += u32::from(checks.slot0);
                     if at_fast {
@@ -1007,6 +1010,31 @@ fn soak_until(
                 DiffOutcome::SkipOracle(e) => {
                     report.skipped += 1;
                     eprintln!("  {name}  SKIP oracle: {e}");
+                }
+            }
+
+            // A second, independent comparison for the same address: the EVM path rather
+            // than the account trie. `None` means this address has no probe.
+            if let Some(outcome) = diff_call_one(up, oracle, addr, &safe, chain) {
+                match outcome {
+                    DiffOutcome::Match { local, remote, .. } => {
+                        report.compared += 1;
+                        report.matched += 1;
+                        compared_this += 1;
+                        report.checked_call += 1;
+                        if at_fast {
+                            report.compared_at_fast += 1;
+                        }
+                        eprintln!("  {name}  local={local}  oracle={remote}  OK [eth_call]");
+                    }
+                    DiffOutcome::Mismatch { local, remote } => {
+                        eprintln!("  {name}  local={local}  oracle={remote}  MISMATCH");
+                        bail!("oracle eth_call mismatch on {name} (fail-closed)");
+                    }
+                    DiffOutcome::SkipProof(e) | DiffOutcome::SkipOracle(e) => {
+                        report.skipped += 1;
+                        eprintln!("  {name}  SKIP call: {e}");
+                    }
                 }
             }
         }
@@ -1188,8 +1216,10 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
         tot.matched = st.matched;
         tot.mismatched = st.mismatched;
         tot.skipped = st.skipped;
+        tot.checked_balance = st.checked_balance;
         tot.checked_nonce = st.checked_nonce;
         tot.checked_slot0 = st.checked_slot0;
+        tot.checked_call = st.checked_call;
         fast_compared = st.compared_at_fast;
     }
     // A wedged walk and a slow one look identical for one round. They stop looking
@@ -1258,8 +1288,10 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
         tot.matched += report.matched;
         tot.mismatched += report.mismatched;
         tot.skipped += report.skipped;
+        tot.checked_balance += report.checked_balance;
         tot.checked_nonce += report.checked_nonce;
         tot.checked_slot0 += report.checked_slot0;
+        tot.checked_call += report.checked_call;
         fast_compared += report.compared_at_fast;
         println!(
             "  round unique={}  compared={}  match={}  mismatch={}  skip={}",
@@ -1277,8 +1309,10 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
             st.mismatched = tot.mismatched;
             st.skipped = tot.skipped;
             st.compared_at_fast = fast_compared;
+            st.checked_balance = tot.checked_balance;
             st.checked_nonce = tot.checked_nonce;
             st.checked_slot0 = tot.checked_slot0;
+            st.checked_call = tot.checked_call;
             st.unique = {
                 let mut v: Vec<String> = done.iter().cloned().collect();
                 v.sort();
@@ -1319,8 +1353,8 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
     // means the oracle never served it and the trie went untested, which no amount of
     // OK lines would otherwise reveal.
     println!(
-        "# CHECKED  balance={}  nonce={}  slot0={}",
-        tot.compared, tot.checked_nonce, tot.checked_slot0
+        "# CHECKED  balance={}  nonce={}  slot0={}  eth_call={}",
+        tot.checked_balance, tot.checked_nonce, tot.checked_slot0, tot.checked_call
     );
     // Duration is a gate input, so it is reported as what it is: a sum over sessions,
     // with the worst interruption named. A reader must never have to assume continuity.

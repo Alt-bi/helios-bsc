@@ -2,8 +2,10 @@
 
 use crate::upstream::RpcUpstream;
 use anyhow::{anyhow, Context, Result};
+use helios_bsc_consensus::VerifiedBlock;
 use helios_bsc_execution::{
-    encode_qty, qty_equal, verify_eth_get_proof, verify_storage_slot, EthAccountProof,
+    encode_qty, eth_call_verified, qty_equal, verify_eth_get_proof, verify_storage_slot, CallTx,
+    EthAccountProof,
 };
 use helios_bsc_types::{decode_hex_fixed, SafeHead};
 use std::collections::HashSet;
@@ -56,8 +58,10 @@ pub struct DiffReport {
     /// behaviour and a silent one: an oracle that never serves storage would leave the
     /// trie untested while every line still printed OK. Counted so the summary can say
     /// what was actually exercised, the same reason the gate counts `at_fast_head`.
+    pub checked_balance: u32,
     pub checked_nonce: u32,
     pub checked_slot0: u32,
+    pub checked_call: u32,
 }
 
 impl DiffReport {
@@ -66,8 +70,10 @@ impl DiffReport {
         self.matched += other.matched;
         self.mismatched += other.mismatched;
         self.skipped += other.skipped;
+        self.checked_balance += other.checked_balance;
         self.checked_nonce += other.checked_nonce;
         self.checked_slot0 += other.checked_slot0;
+        self.checked_call += other.checked_call;
     }
 }
 
@@ -130,11 +136,128 @@ pub enum DiffOutcome {
     SkipOracle(String),
 }
 
+/// `totalSupply()` — `keccak256("totalSupply()")[..4]`.
+///
+/// The one cross-check worth running blind: it is a zero-argument view whose answer is a
+/// pure function of verified state, so local and oracle must agree byte for byte at the
+/// same block. Anything taking an argument would mean inventing one, and anything reading
+/// block context would compare two different instants.
+pub const TOTAL_SUPPLY_SELECTOR: [u8; 4] = [0x18, 0x16, 0x0d, 0xdd];
+
+/// Addresses that answer `totalSupply()` — the ERC-20s in [`SOAK_ADDRESSES`].
+///
+/// Deliberately a short allow-list rather than "try it everywhere": a router or an EOA
+/// reverts, and a soak that logged expected reverts would train its reader to ignore the
+/// column that is supposed to mean something.
+pub fn call_probe(addr: &str) -> Option<[u8; 4]> {
+    const ERC20: &[&str] = &[
+        "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", // WBNB
+        "0x55d398326f99059ff775485246999027b3197955", // USDT
+        "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d", // USDC
+        "0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82", // Cake
+        "0xe9e7cea3dedca5984780bafc599bd69add087d56", // BUSD
+        "0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3", // DAI
+        "0xcf6bb5389c92bdda8a3747ddb454cb7a64626c63", // XVS
+        "0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c", // BTCB
+        "0x2170ed0880ac9a755fd29b2688956bd959f933f8", // ETH
+    ];
+    ERC20
+        .contains(&addr_key(addr).as_str())
+        .then_some(TOTAL_SUPPLY_SELECTOR)
+}
+
+/// Cross-check one `eth_call` against the oracle at the same verified block.
+///
+/// `None` means there is nothing to compare here — no probe for this address, or the
+/// Safe head is not a block this client has in `chain`. Neither is a failure.
+///
+/// This is the only live coverage the **EVM** path gets: `eth_call` executes proven
+/// state through revm, and until now the soak never touched it. A wrong answer here is
+/// as serious as a wrong balance, because both come back from methods this client calls
+/// verified.
+pub fn diff_call_one(
+    proofs: &dyn RpcUpstream,
+    oracle: &dyn RpcUpstream,
+    addr: &str,
+    safe: &SafeHead,
+    chain: &[VerifiedBlock],
+) -> Option<DiffOutcome> {
+    let selector = call_probe(addr)?;
+    let to = decode_hex_fixed::<20>(addr).ok()?;
+    let hash = decode_hex_fixed::<32>(&safe.hash).ok()?;
+    let local_block = chain
+        .iter()
+        .find(|b| b.number == safe.number && b.hash == hash)?;
+    let block = crate::rpc_server::call_block_from_verified(local_block, chain);
+    let tx = CallTx {
+        from: [0u8; 20],
+        to,
+        data: selector.to_vec(),
+        value: [0u8; 32],
+        gas: None,
+        access_list: Vec::new(),
+    };
+
+    let prover = crate::rpc_server::UpstreamProve { up: proofs };
+    let local = match eth_call_verified(&prover, &block, &tx) {
+        Ok(out) => format!("0x{}", hex::encode(out)),
+        // Proof-window and budget misses are the same transient conditions the balance
+        // path already treats as retryable, and an unsupported precompile is a refusal
+        // by design. Never a mismatch.
+        Err(e) => return Some(DiffOutcome::SkipProof(format!("eth_call: {e}"))),
+    };
+    let remote = match oracle_call(oracle, addr, &selector, safe) {
+        Ok(v) => v,
+        Err(e) => return Some(DiffOutcome::SkipOracle(format!("eth_call: {e}"))),
+    };
+    if !storage_word_equal(&local, &remote) {
+        return Some(DiffOutcome::Mismatch {
+            local: format!("totalSupply {local}"),
+            remote: format!("totalSupply {remote}"),
+        });
+    }
+    Some(DiffOutcome::Match {
+        local,
+        remote,
+        checks: DiffChecks {
+            call: true,
+            ..DiffChecks::default()
+        },
+    })
+}
+
+fn oracle_call(
+    oracle: &dyn RpcUpstream,
+    addr: &str,
+    selector: &[u8; 4],
+    safe: &SafeHead,
+) -> Result<String> {
+    let data = format!("0x{}", hex::encode(selector));
+    let at = |block: String| {
+        oracle
+            .unverified_call(
+                "eth_call",
+                &serde_json::json!([{ "to": addr, "data": data }, block]),
+            )
+            .and_then(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| anyhow!("eth_call returned {v}"))
+            })
+    };
+    at(safe.hash.clone())
+        .or_else(|_| at(format!("0x{:x}", safe.number)))
+        .map_err(|e| anyhow!("oracle call skip: {e}"))
+}
+
 /// Which best-effort sub-checks a matching comparison reached.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DiffChecks {
     pub nonce: bool,
     pub slot0: bool,
+    /// An `eth_call` cross-check ran. Tracked separately because it is a whole extra
+    /// comparison, not a field of the account one.
+    pub call: bool,
 }
 
 impl DiffChecks {
@@ -146,6 +269,10 @@ impl DiffChecks {
         }
         if self.slot0 {
             v.push("slot0");
+        }
+        if self.call {
+            // A call comparison stands alone; it does not carry a balance.
+            return "eth_call".into();
         }
         v.join(",")
     }
@@ -346,6 +473,7 @@ pub fn diff_vs_oracle(
             } => {
                 r.compared += 1;
                 r.matched += 1;
+                r.checked_balance += 1;
                 r.checked_nonce += u32::from(checks.nonce);
                 r.checked_slot0 += u32::from(checks.slot0);
                 eprintln!(
@@ -429,16 +557,20 @@ mod tests {
             matched: 2,
             mismatched: 0,
             skipped: 1,
+            checked_balance: 2,
             checked_nonce: 2,
             checked_slot0: 1,
+            checked_call: 0,
         };
         tot.accumulate(&DiffReport {
             compared: 3,
             matched: 2,
             mismatched: 1,
             skipped: 0,
+            checked_balance: 3,
             checked_nonce: 3,
             checked_slot0: 0,
+            checked_call: 2,
         });
         assert_eq!(tot.compared, 5);
         assert_eq!(tot.matched, 4);
@@ -460,7 +592,8 @@ mod tests {
         assert_eq!(
             DiffChecks {
                 nonce: true,
-                slot0: false
+                slot0: false,
+                call: false
             }
             .label(),
             "balance,nonce"
@@ -468,10 +601,21 @@ mod tests {
         assert_eq!(
             DiffChecks {
                 nonce: true,
-                slot0: true
+                slot0: true,
+                call: false
             }
             .label(),
             "balance,nonce,slot0"
+        );
+        // A call comparison stands alone -- it never carries a balance, so labelling it
+        // `balance,eth_call` would claim a check that did not run.
+        assert_eq!(
+            DiffChecks {
+                call: true,
+                ..DiffChecks::default()
+            }
+            .label(),
+            "eth_call"
         );
     }
 
