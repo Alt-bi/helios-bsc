@@ -2,7 +2,9 @@
 
 use crate::upstream::RpcUpstream;
 use anyhow::{anyhow, Context, Result};
-use helios_bsc_execution::{encode_qty, qty_equal, verify_eth_get_proof, EthAccountProof};
+use helios_bsc_execution::{
+    encode_qty, qty_equal, verify_eth_get_proof, verify_storage_slot, EthAccountProof,
+};
 use helios_bsc_types::{decode_hex_fixed, SafeHead};
 use std::collections::HashSet;
 
@@ -47,6 +49,15 @@ pub struct DiffReport {
     pub matched: u32,
     pub mismatched: u32,
     pub skipped: u32,
+    /// How many comparisons actually reached each sub-check.
+    ///
+    /// Every sub-check past the balance is best-effort -- an oracle that cannot serve
+    /// historical nonces or storage is a skip, not a failure. That is the right
+    /// behaviour and a silent one: an oracle that never serves storage would leave the
+    /// trie untested while every line still printed OK. Counted so the summary can say
+    /// what was actually exercised, the same reason the gate counts `at_fast_head`.
+    pub checked_nonce: u32,
+    pub checked_slot0: u32,
 }
 
 impl DiffReport {
@@ -55,6 +66,8 @@ impl DiffReport {
         self.matched += other.matched;
         self.mismatched += other.mismatched;
         self.skipped += other.skipped;
+        self.checked_nonce += other.checked_nonce;
+        self.checked_slot0 += other.checked_slot0;
     }
 }
 
@@ -103,10 +116,39 @@ pub fn rotate_front<T>(items: &mut [T], n: usize) {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffOutcome {
-    Match { local: String, remote: String },
-    Mismatch { local: String, remote: String },
+    Match {
+        local: String,
+        remote: String,
+        /// Sub-checks this comparison reached, for the OK line and the tally.
+        checks: DiffChecks,
+    },
+    Mismatch {
+        local: String,
+        remote: String,
+    },
     SkipProof(String),
     SkipOracle(String),
+}
+
+/// Which best-effort sub-checks a matching comparison reached.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiffChecks {
+    pub nonce: bool,
+    pub slot0: bool,
+}
+
+impl DiffChecks {
+    /// `balance,nonce,slot0` — the balance is never optional, so it always leads.
+    pub fn label(&self) -> String {
+        let mut v = vec!["balance"];
+        if self.nonce {
+            v.push("nonce");
+        }
+        if self.slot0 {
+            v.push("slot0");
+        }
+        v.join(",")
+    }
 }
 
 /// Retry after catch-up unless the verifier already rejected the proof (MPT).
@@ -145,6 +187,7 @@ pub fn diff_one(
             remote: remote_bal,
         };
     }
+    let mut checks = DiffChecks::default();
     if let Ok(remote_n) = oracle_nonce(oracle, addr, safe) {
         if !qty_equal(&local.nonce, &remote_n) {
             return DiffOutcome::Mismatch {
@@ -152,16 +195,74 @@ pub fn diff_one(
                 remote: format!("nonce {remote_n}"),
             };
         }
+        checks.nonce = true;
+    }
+    // An oracle that cannot serve historical storage is a skip, exactly as for the
+    // nonce; an oracle that answers and disagrees is a mismatch.
+    if let (Some(local_s), Ok(remote_s)) = (&local.slot0, oracle_slot0(oracle, addr, safe)) {
+        if !storage_word_equal(local_s, &remote_s) {
+            return DiffOutcome::Mismatch {
+                local: format!("slot0 {local_s}"),
+                remote: format!("slot0 {remote_s}"),
+            };
+        }
+        checks.slot0 = true;
     }
     DiffOutcome::Match {
         local: local.balance,
         remote: remote_bal,
+        checks,
     }
 }
 
 pub struct VerifiedQty {
     pub balance: String,
     pub nonce: String,
+    /// Slot 0, MPT-verified against the account's `storageRoot`.
+    ///
+    /// `None` when the upstream answered without a `storageProof` entry for it. Not
+    /// every provider honours `storageKeys`, and losing the balance comparison over a
+    /// missing extra would trade away a check we have for one we merely wanted. An entry
+    /// that *is* present and does not verify stays fatal: that is a lying upstream, not
+    /// a thin one.
+    pub slot0: Option<String>,
+}
+
+/// The storage word every soaked address is cross-checked on.
+///
+/// Slot 0 needs no ABI: it is the first storage word of any contract and simply absent
+/// for an EOA, and the trie has to answer both correctly. It rides along on the
+/// `eth_getProof` the balance already costs -- one extra key on a request being made
+/// anyway -- and it is the only live differential coverage the **storage** trie gets.
+/// Balances only ever exercise the account trie.
+pub const SOAK_STORAGE_SLOT: [u8; 32] = [0u8; 32];
+
+/// Did the upstream actually answer for this storage key? Keys are compared as
+/// quantities: `0x0` and a zero-padded 32-byte word name the same slot.
+fn proof_carries_slot(proof: &EthAccountProof, slot_hex: &str) -> bool {
+    proof
+        .storage_proof
+        .iter()
+        .any(|e| storage_word_equal(&e.key, slot_hex))
+}
+
+fn slot0_hex() -> String {
+    format!("0x{}", hex::encode(SOAK_STORAGE_SLOT))
+}
+
+/// `eth_getStorageAt` returns a full 32-byte word; `verify_storage_slot` returns the
+/// RLP-stripped integer. Compare them as quantities, not as strings.
+fn storage_word_equal(local: &str, remote: &str) -> bool {
+    fn strip(v: &str) -> String {
+        let h = v.trim_start_matches("0x").trim_start_matches("0X");
+        let t = h.trim_start_matches('0');
+        if t.is_empty() {
+            "0".into()
+        } else {
+            t.to_ascii_lowercase()
+        }
+    }
+    strip(local) == strip(remote)
 }
 
 pub fn verified_account(
@@ -170,15 +271,25 @@ pub fn verified_account(
     safe: &SafeHead,
 ) -> Result<VerifiedQty> {
     let raw = proofs
-        .get_proof_at_safe(addr, &[], &safe.hash, safe.number)
+        .get_proof_at_safe(addr, &[slot0_hex()], &safe.hash, safe.number)
         .context("eth_getProof")?;
     let proof: EthAccountProof = serde_json::from_value(raw).context("decode eth_getProof")?;
     let root = decode_hex_fixed::<32>(&safe.state_root)?;
     let want = decode_hex_fixed::<20>(addr)?;
     let acc = verify_eth_get_proof(&root, &want, &proof)?;
+    // Presence is decided before verification so that "the provider did not send it"
+    // and "the provider sent something wrong" stay different answers.
+    let slot0 = if proof_carries_slot(&proof, &slot0_hex()) {
+        let raw = verify_storage_slot(&acc, &SOAK_STORAGE_SLOT, &proof)
+            .context("verify storage slot 0")?;
+        Some(encode_qty(&raw))
+    } else {
+        None
+    };
     Ok(VerifiedQty {
         balance: encode_qty(&acc.balance_wei),
         nonce: format!("0x{:x}", acc.nonce),
+        slot0,
     })
 }
 
@@ -191,6 +302,24 @@ pub fn oracle_balance(oracle: &dyn RpcUpstream, addr: &str, safe: &SafeHead) -> 
         .get_balance(addr, &safe.hash)
         .or_else(|_| oracle.get_balance(addr, &format!("0x{:x}", safe.number)))
         .map_err(|e| anyhow!("oracle historical skip: {e}"))
+}
+
+pub fn oracle_slot0(oracle: &dyn RpcUpstream, addr: &str, safe: &SafeHead) -> Result<String> {
+    let at = |block: String| {
+        oracle
+            .unverified_call(
+                "eth_getStorageAt",
+                &serde_json::json!([addr, slot0_hex(), block]),
+            )
+            .and_then(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| anyhow!("eth_getStorageAt returned {v}"))
+            })
+    };
+    at(safe.hash.clone())
+        .or_else(|_| at(format!("0x{:x}", safe.number)))
+        .map_err(|e| anyhow!("oracle storage skip: {e}"))
 }
 
 pub fn oracle_nonce(oracle: &dyn RpcUpstream, addr: &str, safe: &SafeHead) -> Result<String> {
@@ -210,10 +339,19 @@ pub fn diff_vs_oracle(
     let mut r = DiffReport::default();
     for (name, addr) in addresses {
         match diff_one(proofs, oracle, name, addr, safe) {
-            DiffOutcome::Match { local, remote } => {
+            DiffOutcome::Match {
+                local,
+                remote,
+                checks,
+            } => {
                 r.compared += 1;
                 r.matched += 1;
-                eprintln!("  {name}  local={local}  oracle={remote}  OK");
+                r.checked_nonce += u32::from(checks.nonce);
+                r.checked_slot0 += u32::from(checks.slot0);
+                eprintln!(
+                    "  {name}  local={local}  oracle={remote}  OK [{}]",
+                    checks.label()
+                );
             }
             DiffOutcome::Mismatch { local, remote } => {
                 r.compared += 1;
@@ -291,17 +429,71 @@ mod tests {
             matched: 2,
             mismatched: 0,
             skipped: 1,
+            checked_nonce: 2,
+            checked_slot0: 1,
         };
         tot.accumulate(&DiffReport {
             compared: 3,
             matched: 2,
             mismatched: 1,
             skipped: 0,
+            checked_nonce: 3,
+            checked_slot0: 0,
         });
         assert_eq!(tot.compared, 5);
         assert_eq!(tot.matched, 4);
         assert_eq!(tot.mismatched, 1);
         assert_eq!(tot.skipped, 1);
+        // The sub-check tallies must accumulate too, or a long soak would report only
+        // the last round's coverage.
+        assert_eq!(tot.checked_nonce, 5);
+        assert_eq!(
+            tot.checked_slot0, 1,
+            "an oracle that stopped serving storage"
+        );
+    }
+
+    /// The label is what an operator reads to see a sub-check silently going missing.
+    #[test]
+    fn check_label_names_what_actually_ran() {
+        assert_eq!(DiffChecks::default().label(), "balance");
+        assert_eq!(
+            DiffChecks {
+                nonce: true,
+                slot0: false
+            }
+            .label(),
+            "balance,nonce"
+        );
+        assert_eq!(
+            DiffChecks {
+                nonce: true,
+                slot0: true
+            }
+            .label(),
+            "balance,nonce,slot0"
+        );
+    }
+
+    /// `eth_getStorageAt` pads to 32 bytes, `verify_storage_slot` returns the stripped
+    /// integer. Comparing those as strings would call every slot a mismatch.
+    #[test]
+    fn storage_words_compare_as_quantities() {
+        assert!(storage_word_equal(
+            "0x1",
+            "0x0000000000000000000000000000000000000000000000000000000000000001"
+        ));
+        assert!(storage_word_equal(
+            "0x0",
+            "0x0000000000000000000000000000000000000000000000000000000000000000"
+        ));
+        // WBNB slot 0 is the packed `name` string, not a small integer.
+        assert!(storage_word_equal(
+            "0x5772617070656420424e42000000000000000000000000000000000000000016",
+            "0x5772617070656420424E42000000000000000000000000000000000000000016"
+        ));
+        assert!(!storage_word_equal("0x1", "0x2"));
+        assert!(!storage_word_equal("0x0", "0x1"));
     }
 
     #[test]

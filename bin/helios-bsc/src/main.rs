@@ -901,6 +901,8 @@ struct SoakReport {
     /// Comparisons that ran at the BLS-finalized head rather than confirmation depth.
     /// "Asked for fast finality" and "ran at fast finality" are different facts.
     compared_at_fast: u32,
+    checked_nonce: u32,
+    checked_slot0: u32,
 }
 
 fn soak_until(
@@ -968,17 +970,26 @@ fn soak_until(
         let mut compared_this = 0u32;
         for &(name, addr) in &pending[..n] {
             match diff_one(up, oracle, name, addr, &safe) {
-                DiffOutcome::Match { local, remote } => {
+                DiffOutcome::Match {
+                    local,
+                    remote,
+                    checks,
+                } => {
                     report.compared += 1;
                     report.matched += 1;
                     compared_this += 1;
+                    report.checked_nonce += u32::from(checks.nonce);
+                    report.checked_slot0 += u32::from(checks.slot0);
                     if at_fast {
                         report.compared_at_fast += 1;
                     }
                     if done.insert(addr_key(addr)) {
                         gained += 1;
                     }
-                    eprintln!("  {name}  local={local}  oracle={remote}  OK");
+                    eprintln!(
+                        "  {name}  local={local}  oracle={remote}  OK [{}]",
+                        checks.label()
+                    );
                 }
                 DiffOutcome::Mismatch { local, remote } => {
                     eprintln!("  {name}  local={local}  oracle={remote}  MISMATCH");
@@ -1177,6 +1188,8 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
         tot.matched = st.matched;
         tot.mismatched = st.mismatched;
         tot.skipped = st.skipped;
+        tot.checked_nonce = st.checked_nonce;
+        tot.checked_slot0 = st.checked_slot0;
         fast_compared = st.compared_at_fast;
     }
     // A wedged walk and a slow one look identical for one round. They stop looking
@@ -1245,6 +1258,8 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
         tot.matched += report.matched;
         tot.mismatched += report.mismatched;
         tot.skipped += report.skipped;
+        tot.checked_nonce += report.checked_nonce;
+        tot.checked_slot0 += report.checked_slot0;
         fast_compared += report.compared_at_fast;
         println!(
             "  round unique={}  compared={}  match={}  mismatch={}  skip={}",
@@ -1262,6 +1277,8 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
             st.mismatched = tot.mismatched;
             st.skipped = tot.skipped;
             st.compared_at_fast = fast_compared;
+            st.checked_nonce = tot.checked_nonce;
+            st.checked_slot0 = tot.checked_slot0;
             st.unique = {
                 let mut v: Vec<String> = done.iter().cloned().collect();
                 v.sort();
@@ -1297,6 +1314,13 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
     println!(
         "# SUMMARY  compared={}  match={}  mismatch={}  skip={}  unique_best={}  at_fast_head={fast_compared}",
         tot.compared, tot.matched, tot.mismatched, tot.skipped, unique_best
+    );
+    // Which sub-checks the run actually reached. A storage or nonce column stuck at 0
+    // means the oracle never served it and the trie went untested, which no amount of
+    // OK lines would otherwise reveal.
+    println!(
+        "# CHECKED  balance={}  nonce={}  slot0={}",
+        tot.compared, tot.checked_nonce, tot.checked_slot0
     );
     // Duration is a gate input, so it is reported as what it is: a sum over sessions,
     // with the worst interruption named. A reader must never have to assume continuity.
