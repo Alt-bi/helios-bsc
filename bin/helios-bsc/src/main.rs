@@ -8,6 +8,7 @@ use helios_bsc::diff::{
     soak_repeat_full_list, unmatched, DiffOutcome, DiffReport, SOAK_ADDRESSES,
 };
 use helios_bsc::rpc_server::{self, FinalityMode, Node};
+use helios_bsc::soak_state::{human_secs, SoakFingerprint, SoakState};
 use helios_bsc::sync::{
     checkpoint_policy, confirm_checkpoint_with_oracle, doctor_checkpoint_line, env_host_line,
     env_independence_line, independent_rpc_hosts, rpc_host, safe_of, wait_until_in_window,
@@ -209,6 +210,11 @@ enum Commands {
         /// finalized head that `run --finality fast` serves.
         #[arg(long, value_enum, default_value_t = FinalityArg::ConfirmationDepth)]
         finality: FinalityArg,
+        /// Carry the tally in this file so a crashed host resumes instead of restarting
+        /// the duration clock. Soak time is summed over sessions and the gaps are
+        /// reported, never folded into the total.
+        #[arg(long)]
+        state: Option<PathBuf>,
     },
     /// Check a checkpoint file against upstream (and optional oracle). No header walk.
     VerifyCheckpoint {
@@ -374,6 +380,7 @@ async fn main() -> Result<()> {
             pause,
             duration_secs,
             finality,
+            state,
         } => soak(SoakArgs {
             upstream: &upstream,
             backup: backup.as_deref(),
@@ -393,6 +400,7 @@ async fn main() -> Result<()> {
             pause,
             duration_secs,
             fast_finality: finality == FinalityArg::Fast,
+            state: state.as_deref(),
         }),
         Commands::VerifyCheckpoint {
             checkpoint,
@@ -866,6 +874,8 @@ struct SoakArgs<'a> {
     duration_secs: u64,
     /// Soak the head that `--finality fast` would serve, not confirmation depth.
     fast_finality: bool,
+    /// Resumable tally; `None` keeps the old in-memory-only behaviour.
+    state: Option<&'a std::path::Path>,
 }
 
 struct SoakUntilOpts {
@@ -1074,11 +1084,54 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
         args.duration_secs
     );
 
-    let deadline = if args.duration_secs > 0 {
-        Some(Instant::now() + Duration::from_secs(args.duration_secs))
-    } else {
-        None
+    // Resume before the clock is set: a crashed host must continue the duration gate,
+    // not restart it.
+    let fingerprint = SoakFingerprint {
+        upstream: rpc_host(args.upstream),
+        oracle: rpc_host(args.oracle),
+        fast_finality: args.fast_finality,
+        addresses: addrs.iter().map(|(_, a)| addr_key(a)).collect(),
     };
+    let mut state = match args.state {
+        Some(path) => {
+            let resumed = SoakState::load(path, &fingerprint)?;
+            let st = resumed.unwrap_or_else(|| SoakState::new(fingerprint.clone()));
+            if st.soaked_secs() > 0 {
+                println!(
+                    "resume   {} soaked over {} session(s), compared={} unique={}{}",
+                    human_secs(st.soaked_secs()),
+                    st.sessions.len(),
+                    st.compared,
+                    st.unique.len(),
+                    match st.largest_gap_secs() {
+                        Some(g) => format!(", largest gap {}", human_secs(g)),
+                        None => String::new(),
+                    }
+                );
+            }
+            Some(st)
+        }
+        None => None,
+    };
+
+    // With a state file the target is the *total*, so a resumed run asks only for what
+    // is left. Without one this is unchanged.
+    let this_session_secs = match (&state, args.duration_secs) {
+        (_, 0) => 0,
+        (Some(st), target) => st.remaining_secs(target),
+        (None, target) => target,
+    };
+    // Already at the target: report and go straight to the summary. Falling through to
+    // the fixed-round path would soak four more rounds right after saying there was
+    // nothing left to do.
+    let target_already_met = args.duration_secs > 0 && this_session_secs == 0;
+    if target_already_met {
+        println!(
+            "already soaked {} >= --duration-secs {} — nothing left to run",
+            human_secs(state.as_ref().map_or(0, SoakState::soaked_secs)),
+            human_secs(args.duration_secs)
+        );
+    }
 
     let tip0 = up.block_number().context("eth_blockNumber")?;
     let mut snap_hold = None;
@@ -1119,16 +1172,41 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
 
     let mut tot = DiffReport::default();
     let mut fast_compared = 0u32;
+    if let Some(st) = state.as_ref() {
+        tot.compared = st.compared;
+        tot.matched = st.matched;
+        tot.mismatched = st.mismatched;
+        tot.skipped = st.skipped;
+        fast_compared = st.compared_at_fast;
+    }
     // A wedged walk and a slow one look identical for one round. They stop looking
     // identical quickly: the snapshot cannot skip a header, so a header it refuses is
     // refused again every round, forever. A 24h run that hits one spends 24h printing
     // the same error. Give up after a few barren rounds and say why.
     let mut barren_rounds = 0u32;
     const BARREN_ROUND_LIMIT: u32 = 3;
-    let mut done: HashSet<String> = HashSet::new();
+    let mut done: HashSet<String> = state.as_ref().map(SoakState::done_set).unwrap_or_default();
+    // Both start *after* the catch-up walk. Walking a checkpoint forward can take
+    // minutes, and charging that to the soak budget would let setup consume the window
+    // -- with a short target it consumes all of it, and the recorded session would then
+    // claim time during which nothing was compared.
+    if !target_already_met {
+        if let (Some(st), Some(path)) = (state.as_mut(), args.state) {
+            st.open_session(now_unix());
+            st.save(path)?;
+        }
+    }
+    let deadline = if this_session_secs > 0 {
+        Some(Instant::now() + Duration::from_secs(this_session_secs))
+    } else {
+        None
+    };
     let mut round = 0u32;
     loop {
         round += 1;
+        if target_already_met {
+            break;
+        }
         if deadline.is_none() && round > args.rounds {
             break;
         }
@@ -1176,6 +1254,22 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
             report.mismatched,
             report.skipped
         );
+        // Persist before the bails below: a run that stops for any reason should leave
+        // the hours it did complete on disk.
+        if let (Some(st), Some(path)) = (state.as_mut(), args.state) {
+            st.compared = tot.compared;
+            st.matched = tot.matched;
+            st.mismatched = tot.mismatched;
+            st.skipped = tot.skipped;
+            st.compared_at_fast = fast_compared;
+            st.unique = {
+                let mut v: Vec<String> = done.iter().cloned().collect();
+                v.sort();
+                v
+            };
+            st.touch_session(now_unix());
+            st.save(path)?;
+        }
         if tot.mismatched > 0 {
             bail!("oracle mismatch (fail-closed)");
         }
@@ -1204,6 +1298,24 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
         "# SUMMARY  compared={}  match={}  mismatch={}  skip={}  unique_best={}  at_fast_head={fast_compared}",
         tot.compared, tot.matched, tot.mismatched, tot.skipped, unique_best
     );
+    // Duration is a gate input, so it is reported as what it is: a sum over sessions,
+    // with the worst interruption named. A reader must never have to assume continuity.
+    if let Some(st) = state.as_ref() {
+        println!(
+            "# SOAKED   {} over {} session(s){}{}",
+            human_secs(st.soaked_secs()),
+            st.sessions.len(),
+            match st.largest_gap_secs() {
+                Some(g) => format!("  largest_gap={}", human_secs(g)),
+                None => "  (uninterrupted)".to_string(),
+            },
+            if args.duration_secs > 0 {
+                format!("  target={}", human_secs(args.duration_secs))
+            } else {
+                String::new()
+            }
+        );
+    }
     if tot.mismatched > 0 {
         bail!("oracle mismatch (fail-closed)");
     }
@@ -1223,6 +1335,21 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
             "--finality fast was requested but all {} comparisons ran at confirmation depth — no BLS-finalized head was ever reached",
             tot.compared
         );
+    }
+    // A resumable soak can be stopped early and restarted; without this the last
+    // session would print PASS on a tally that never reached the target.
+    if args.duration_secs > 0 {
+        if let Some(st) = state.as_ref() {
+            let short = st.remaining_secs(args.duration_secs);
+            if short > 0 {
+                bail!(
+                    "soaked {} of --duration-secs {} — {} short. Re-run with the same --state to continue.",
+                    human_secs(st.soaked_secs()),
+                    human_secs(args.duration_secs),
+                    human_secs(short)
+                );
+            }
+        }
     }
     println!("GATE:         PASS  unique={unique_best}  at_fast_head={fast_compared}");
     Ok(())

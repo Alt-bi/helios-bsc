@@ -445,7 +445,7 @@ pub fn write_checkpoint_file(path: &std::path::Path, cp: &Checkpoint) -> Result<
 /// `sync_all` before the rename matters for the same reason: without it the rename can
 /// publish a name whose contents are still in the page cache, which is the truncated file
 /// the temp-then-rename dance is supposed to rule out.
-fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

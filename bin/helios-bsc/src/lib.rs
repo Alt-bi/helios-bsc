@@ -3,6 +3,7 @@
 pub mod bind;
 pub mod diff;
 pub mod rpc_server;
+pub mod soak_state;
 pub mod sync;
 pub mod upstream;
 
