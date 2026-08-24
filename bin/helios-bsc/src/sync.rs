@@ -280,17 +280,26 @@ pub fn append_new_with_snapshot(
                 verify_cascading_vs_parent(prev.milli_timestamp, prev.gas_limit, h)
                     .with_context(|| format!("cascading {}", h.number))?;
             }
+            // Decoded *before* `apply_header`, for the same reason the cascading check
+            // runs before it: a `?` after the snapshot advanced would strand it one block
+            // ahead of `chain`, and every later sync would fail the parent-link check for
+            // good. The comment above stated the invariant; these five decodes broke it.
+            let block = VerifiedBlock {
+                number: decode_u64(&h.number)?,
+                hash: decode_hex_fixed::<32>(&h.hash)?,
+                state_root: decode_hex_fixed::<32>(&h.state_root)?,
+                // Replaced by the recovered signer once the snapshot has accepted it.
+                miner: [0u8; 20],
+                milli_timestamp: milli_timestamp(h)?,
+                gas_limit: decode_u64(&h.gas_limit)?,
+                header: Some(h.clone()),
+            };
             let signer = snap
                 .apply_header(h)
                 .with_context(|| format!("snapshot {}", h.number))?;
             chain.push(VerifiedBlock {
-                number: decode_u64(&h.number)?,
-                hash: decode_hex_fixed::<32>(&h.hash)?,
-                state_root: decode_hex_fixed::<32>(&h.state_root)?,
                 miner: signer,
-                milli_timestamp: milli_timestamp(h)?,
-                gas_limit: decode_u64(&h.gas_limit)?,
-                header: Some(h.clone()),
+                ..block
             });
         }
     } else {

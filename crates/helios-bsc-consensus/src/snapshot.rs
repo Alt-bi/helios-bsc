@@ -6,8 +6,9 @@ use crate::seal::{
 use crate::vote::{decode_vote_attestation, verify_attestation_signature, VoteData, VoteError};
 use helios_bsc_config::{
     attestation_target_window, miner_history_check_len, params_at, parse_extra, ExtraDataVersion,
-    ExtraError, SealingValidator, DIFF_IN_TURN, DIFF_NO_TURN, K_ANCESTOR_GENERATION_DEPTH,
-    MAXWELL_EPOCH_LENGTH, MAXWELL_TIME,
+    ExtraError, SealingValidator, DEFAULT_EPOCH_LENGTH, DIFF_IN_TURN, DIFF_NO_TURN,
+    K_ANCESTOR_GENERATION_DEPTH, LORENTZ_EPOCH_LENGTH, LORENTZ_TIME, MAXWELL_EPOCH_LENGTH,
+    MAXWELL_TIME,
 };
 use helios_bsc_types::{
     decode_hex, decode_hex_fixed, decode_u64, format_address, Checkpoint, RpcBlockHeader,
@@ -581,6 +582,48 @@ impl Snapshot {
         self.validators.iter().map(format_address).collect()
     }
 
+    /// v1.7.8 `Snapshot.apply`:
+    ///
+    /// ```text
+    /// epochLength := snap.EpochLength
+    /// nextBlockNumber := header.Number.Uint64() + 1
+    /// if snap.EpochLength == defaultEpochLength && chainConfig.IsLorentz(...) &&
+    ///     nextBlockNumber%lorentzEpochLength == 0 {
+    ///     snap.EpochLength = lorentzEpochLength
+    /// }
+    /// if snap.EpochLength == lorentzEpochLength && chainConfig.IsMaxwell(...) &&
+    ///     nextBlockNumber%maxwellEpochLength == 0 {
+    ///     snap.EpochLength = maxwellEpochLength
+    /// }
+    /// ```
+    ///
+    /// The epoch length is snapshot state that climbs a ladder, not a constant read from
+    /// the fork table. `from_checkpoint` seeds it from `params_at`, which is right for a
+    /// checkpoint taken today and wrong for a snapshot that walks across the step — and
+    /// getting it wrong means `number % epoch_length == 0` picks different blocks than
+    /// geth, so epoch `extraData` is parsed at the wrong heights and missed at the right
+    /// ones.
+    ///
+    /// Dormant on mainnet: Maxwell is long past and Fermi and Pasteur both keep 1000. It
+    /// is here so the next fork that moves it does not do so silently.
+    fn advance_epoch_length(&mut self, number: u64, time: u64) {
+        // Keyed on the *next* block, so the length only ever changes at a height where
+        // the old and new boundaries coincide.
+        let next = number.saturating_add(1);
+        if self.epoch_length == DEFAULT_EPOCH_LENGTH
+            && time >= LORENTZ_TIME
+            && next % LORENTZ_EPOCH_LENGTH == 0
+        {
+            self.epoch_length = LORENTZ_EPOCH_LENGTH;
+        }
+        if self.epoch_length == LORENTZ_EPOCH_LENGTH
+            && time >= MAXWELL_TIME
+            && next % MAXWELL_EPOCH_LENGTH == 0
+        {
+            self.epoch_length = MAXWELL_EPOCH_LENGTH;
+        }
+    }
+
     /// Apply a fully verified header (signer already recovered).
     pub fn apply_verified(
         &mut self,
@@ -678,6 +721,11 @@ impl Snapshot {
         if time >= MAXWELL_TIME {
             self.prune_recents_to_finalized();
         }
+
+        // After the prune and before the set switch, as in geth. The switch below still
+        // uses the length this block was read with: `pending.activate_at` was computed at
+        // the epoch block, from the length in force there.
+        self.advance_epoch_length(number, time);
 
         if let Some(pending) = self.pending.clone() {
             if number == pending.activate_at {
@@ -1387,5 +1435,40 @@ mod tests {
             Err(SnapshotError::SeedAfterWalk { .. })
         ));
         assert_eq!(snap.turn_length, 16, "a refused seed changes nothing");
+    }
+    /// The epoch length is snapshot state in geth, not a fork-table constant. A snapshot
+    /// walking across the step must climb the same ladder or it parses epoch `extraData`
+    /// at different heights than the chain does.
+    #[test]
+    fn epoch_length_climbs_the_ladder_geth_climbs() {
+        let mut snap = Snapshot::from_checkpoint(&cp()).unwrap();
+
+        // Pre-Lorentz: nothing moves, whatever the height.
+        snap.epoch_length = DEFAULT_EPOCH_LENGTH;
+        snap.advance_epoch_length(LORENTZ_EPOCH_LENGTH - 1, LORENTZ_TIME - 1);
+        assert_eq!(snap.epoch_length, DEFAULT_EPOCH_LENGTH);
+
+        // Lorentz is live, but only the block whose successor lands on the new boundary
+        // steps it up.
+        snap.advance_epoch_length(LORENTZ_EPOCH_LENGTH - 2, LORENTZ_TIME);
+        assert_eq!(snap.epoch_length, DEFAULT_EPOCH_LENGTH, "not this block");
+        snap.advance_epoch_length(LORENTZ_EPOCH_LENGTH - 1, LORENTZ_TIME);
+        assert_eq!(snap.epoch_length, LORENTZ_EPOCH_LENGTH);
+
+        // And it cannot skip a rung: Maxwell only applies from the Lorentz length.
+        snap.advance_epoch_length(MAXWELL_EPOCH_LENGTH - 1, MAXWELL_TIME);
+        assert_eq!(snap.epoch_length, MAXWELL_EPOCH_LENGTH);
+
+        // Terminal — Fermi and Pasteur both keep 1000, so nothing moves again.
+        snap.advance_epoch_length(2 * MAXWELL_EPOCH_LENGTH - 1, MAXWELL_TIME + 10_000_000);
+        assert_eq!(snap.epoch_length, MAXWELL_EPOCH_LENGTH);
+    }
+
+    /// A checkpoint written today starts at the top of the ladder, so the mainnet path is
+    /// unaffected by the rungs above.
+    #[test]
+    fn a_current_checkpoint_starts_at_the_maxwell_length() {
+        let snap = Snapshot::from_checkpoint(&cp()).unwrap();
+        assert_eq!(snap.epoch_length, MAXWELL_EPOCH_LENGTH);
     }
 }

@@ -2550,3 +2550,86 @@ fn a_panicking_request_is_answered_not_fatal() {
 fn a_caught_panic_is_internal_error_not_invalid_request() {
     assert_eq!(helios_bsc_rpc::ERR_INTERNAL, -32603);
 }
+
+/// The dispatch table's fallback arm used to test `unverified_passthrough_ok`, which
+/// could never be true there: every method on that list already has its own arm. Deleting
+/// the dead branch is only safe while that stays true, so assert it — a passthrough
+/// method that lost its arm would silently answer `method_unsupported` with the flag on.
+#[test]
+fn every_passthrough_method_has_its_own_arm() {
+    let chain = distinct_sealer_chain(15);
+    let node = node_from_chain(chain, json!({}));
+    let hash = format!("0x{}", "11".repeat(32));
+    // Gated at the top of their handler, so with the flag off they say so.
+    for (method, params) in [
+        ("eth_getTransactionByHash", json!([hash])),
+        ("eth_getRawTransactionByHash", json!([hash])),
+        ("eth_gasPrice", json!([])),
+        ("eth_maxPriorityFeePerGas", json!([])),
+        ("eth_feeHistory", json!([])),
+        ("eth_blobBaseFee", json!([])),
+    ] {
+        assert!(
+            helios_bsc_rpc::unverified_passthrough_ok(method),
+            "{method} left the allow-list"
+        );
+        let v = node.handle(&req(method, params));
+        assert_eq!(
+            v["error"]["message"].as_str().unwrap_or_default(),
+            "unverified_passthrough_disabled",
+            "{method} fell through to the default arm: {v}"
+        );
+    }
+    // `eth_getTransactionReceipt` is on the allow-list but is not pure passthrough: when
+    // the receipt's block is in the local chain it is rebuilt from the verified receipts
+    // trie, and only the pending / receipts-omitted fallback needs the flag. So the
+    // invariant to pin for it is the weaker one that still makes the dead arm dead.
+    let v = node.handle(&req("eth_getTransactionReceipt", json!([hash])));
+    assert_ne!(
+        v["error"]["message"].as_str().unwrap_or_default(),
+        "method_unsupported",
+        "eth_getTransactionReceipt fell through to the default arm: {v}"
+    );
+}
+
+/// `method_policy` is the specification of what this client serves, but the dispatcher no
+/// longer consults it — the fallback arm answered the same for every policy, so keeping
+/// the call was decoration. The table can now only drift silently, so pin the agreement:
+/// anything the table calls `Unsupported` must be refused, and anything it does not must
+/// not be refused *as unsupported*.
+#[test]
+fn the_dispatcher_agrees_with_the_method_policy_table() {
+    use helios_bsc_rpc::{method_policy, MethodPolicy};
+    let chain = distinct_sealer_chain(15);
+    let node = node_from_chain(chain, json!({}));
+    for m in [
+        "eth_chainId",
+        "eth_blockNumber",
+        "eth_getBalance",
+        "eth_call",
+        "eth_getLogs",
+        "eth_sendRawTransaction",
+        "eth_gasPrice",
+        "helios_bsc_syncStatus",
+        "eth_newFilter",
+        "eth_subscribe",
+        "debug_traceTransaction",
+        "parlia_getJustifiedNumber",
+        "bsc_health",
+        "personal_sign",
+        "engine_forkchoiceUpdatedV1",
+        "eth_thisDoesNotExist",
+    ] {
+        let v = node.handle(&req(m, json!([])));
+        let unsupported = v["error"]["message"].as_str() == Some("method_unsupported");
+        match method_policy(m) {
+            MethodPolicy::Unsupported => {
+                assert!(unsupported, "{m} is Unsupported but was not refused: {v}")
+            }
+            MethodPolicy::Verified | MethodPolicy::Unverified => assert!(
+                !unsupported,
+                "{m} is in the table but the dispatcher has no arm: {v}"
+            ),
+        }
+    }
+}

@@ -27,11 +27,10 @@ use helios_bsc_execution::{
     MAX_RAW_TX, MAX_RECEIPT_LOGS,
 };
 use helios_bsc_rpc::{
-    jsonrpc_id_ok, jsonrpc_is_v2, jsonrpc_params_len, jsonrpc_params_ok, method_policy, rpc_err,
-    rpc_err_data, rpc_ok, unverified_passthrough_ok, wallet_block_number_allowed,
-    wallet_block_tag_str, BlockId, MethodPolicy, ERR_EXECUTION, ERR_INTERNAL, ERR_INVALID,
-    ERR_METHOD, ERR_NOT_SYNCED, ERR_PARAMS, ERR_PARSE, ERR_PROOF_FAILED, ERR_STATE_ROOT,
-    MAX_PROOF_STORAGE_KEYS, MAX_RPC_BATCH, MAX_RPC_METHOD, MAX_RPC_PARAMS,
+    jsonrpc_id_ok, jsonrpc_is_v2, jsonrpc_params_len, jsonrpc_params_ok, rpc_err, rpc_err_data,
+    rpc_ok, wallet_block_number_allowed, wallet_block_tag_str, BlockId, ERR_EXECUTION,
+    ERR_INTERNAL, ERR_INVALID, ERR_METHOD, ERR_NOT_SYNCED, ERR_PARAMS, ERR_PARSE, ERR_PROOF_FAILED,
+    ERR_STATE_ROOT, MAX_PROOF_STORAGE_KEYS, MAX_RPC_BATCH, MAX_RPC_METHOD, MAX_RPC_PARAMS,
 };
 use helios_bsc_types::{
     decode_hex, decode_hex_fixed, decode_u64, keccak256, Checkpoint, RpcBlockHeader, SafeHead,
@@ -985,14 +984,14 @@ impl Node {
                 self.unverified_qty(id, req, method)
             }
             "helios_bsc_getVerificationStatus" => self.verification_status(id),
-            _ => match method_policy(method) {
-                MethodPolicy::Unsupported => rpc_err(id, ERR_METHOD, "method_unsupported"),
-                MethodPolicy::Unverified if unverified_passthrough_ok(method) => {
-                    rpc_err(id, ERR_METHOD, "unverified_passthrough_disabled")
-                }
-                MethodPolicy::Unverified => rpc_err(id, ERR_METHOD, "method_unsupported"),
-                MethodPolicy::Verified => rpc_err(id, ERR_METHOD, "method_unsupported"),
-            },
+            // Every method the passthrough allow-list names has an explicit arm above,
+            // which is where `unverified_passthrough_disabled` comes from. This arm is
+            // only reached by a method with no handler at all, and each `MethodPolicy`
+            // used to answer exactly the same thing here — including a guard on
+            // `unverified_passthrough_ok` that could never be true. The table is still
+            // the specification; `every_passthrough_method_has_its_own_arm` and
+            // `the_dispatcher_agrees_with_the_method_policy_table` keep the two aligned.
+            _ => rpc_err(id, ERR_METHOD, "method_unsupported"),
         }
     }
 
