@@ -140,6 +140,13 @@ struct FinalityView {
     synced_at: Option<Instant>,
 }
 
+/// A request whose handling panicked and was caught.
+///
+/// Deliberately empty: the panic payload is already on stderr through the default hook,
+/// and none of it belongs in a reply to a caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestPanicked;
+
 /// Request threads serving the local JSON-RPC listener.
 ///
 /// More than one because the listener must stay answerable while a request is blocked:
@@ -888,10 +895,11 @@ impl Node {
     /// `AssertUnwindSafe` is the honest annotation rather than a workaround: everything
     /// this touches is behind a mutex, and a panic that leaves one poisoned makes every
     /// later access panic too — caught here, reported, never silently used.
-    pub fn dispatch_caught(&self, buf: &[u8]) -> std::result::Result<Value, ()> {
+    pub fn dispatch_caught(&self, buf: &[u8]) -> std::result::Result<Value, RequestPanicked> {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.dispatch_bytes(buf))).map_err(
             |_| {
                 self.panics.fetch_add(1, Ordering::Relaxed);
+                RequestPanicked
             },
         )
     }
@@ -3528,7 +3536,7 @@ fn serve_one(node: &Node, mut req: tiny_http::Request, loopback_only: bool) {
     }
     let out = match node.dispatch_caught(&buf) {
         Ok(v) => v,
-        Err(()) => {
+        Err(RequestPanicked) => {
             // A panic here used to end the worker: `serve_one` is called from
             // `while let Ok(req) = server.recv()`, so the thread simply left the loop.
             // Four of those and the listener accepted connections nobody answered, while
