@@ -971,6 +971,10 @@ fn soak_until(
     // Once per round, not per address: `parlia_*` is served by few providers and the
     // ones that do serve it throttle hard.
     let mut finality_checked = false;
+    // Bounded so an oracle that simply does not serve `parlia_*` costs a few lines per
+    // round rather than one per burst. The zero it leaves in `# CHECKED` is the signal.
+    let mut finality_attempts = 0u32;
+    const FINALITY_ATTEMPTS_PER_ROUND: u32 = 3;
     while !pending.is_empty() && done.len() < unique_cap {
         let (tip, safe) = match wait_until_in_window_with(
             up,
@@ -1003,32 +1007,40 @@ fn soak_until(
             opts.fast_finality && safe_of(chain).is_ok_and(|conf| conf.number != safe.number);
         // Compare this client's BEP-126 heads with geth's own answer at the block our
         // snapshot is actually at -- the only direct coverage the attestation path gets.
-        if !finality_checked {
-            finality_checked = true;
-            if let Some(outcome) = snapshot.as_deref().and_then(|snap| {
+        //
+        // Once per round is the sampling rate, but "once" must mean one *verdict*, not
+        // one attempt. The snapshot has adopted no attestation yet for the first bursts
+        // after a bootstrap, and an oracle blip returns a skip; marking the round done on
+        // either of those buys a silent `parlia_finality=0` in the summary, which is the
+        // same fail-open shape the `# CHECKED` tally exists to expose.
+        if !finality_checked && finality_attempts < FINALITY_ATTEMPTS_PER_ROUND {
+            // `None` means the snapshot carries no attestation to compare, which costs no
+            // oracle call and so must not spend an attempt.
+            match snapshot.as_deref().and_then(|snap| {
                 snap.justified()
                     .zip(snap.finalized())
                     .and_then(|((j, _), (f, _))| {
                         diff_finality_one(oracle, snap.number, snap.hash, (j, f))
                     })
             }) {
-                match outcome {
-                    DiffOutcome::Match { local, remote, .. } => {
-                        report.compared += 1;
-                        report.matched += 1;
-                        report.checked_finality += 1;
-                        eprintln!(
-                            "  finality  local={local}  oracle={remote}  OK [parlia_finality]"
-                        );
-                    }
-                    DiffOutcome::Mismatch { local, remote } => {
-                        eprintln!("  finality  local={local}  oracle={remote}  MISMATCH");
-                        bail!("parlia finality mismatch (fail-closed)");
-                    }
-                    DiffOutcome::SkipProof(e) | DiffOutcome::SkipOracle(e) => {
-                        eprintln!("  finality  SKIP: {e}");
-                    }
+                Some(DiffOutcome::Match { local, remote, .. }) => {
+                    finality_checked = true;
+                    finality_attempts += 1;
+                    report.compared += 1;
+                    report.matched += 1;
+                    report.checked_finality += 1;
+                    eprintln!("  finality  local={local}  oracle={remote}  OK [parlia_finality]");
                 }
+                Some(DiffOutcome::Mismatch { local, remote }) => {
+                    eprintln!("  finality  local={local}  oracle={remote}  MISMATCH");
+                    bail!("parlia finality mismatch (fail-closed)");
+                }
+                Some(DiffOutcome::SkipProof(e) | DiffOutcome::SkipOracle(e)) => {
+                    finality_attempts += 1;
+                    let left = FINALITY_ATTEMPTS_PER_ROUND - finality_attempts;
+                    eprintln!("  finality  SKIP ({left} attempt(s) left this round): {e}");
+                }
+                None => {}
             }
         }
         let n = burst.min(pending.len());
@@ -1472,6 +1484,16 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
             tot.compared
         );
     }
+    // Same rule one level down. `--finality fast` gates the BEP-126 path, and the only
+    // check that actually exercises attestation bookkeeping against geth is the
+    // `parlia_*` cross-check. A run where it never produced a verdict — an oracle that
+    // does not serve the namespace, or a snapshot that never adopted an attestation —
+    // has not tested the thing it is about to certify.
+    if args.fast_finality && tot.checked_finality == 0 {
+        bail!(
+            "--finality fast was requested but the parlia_* finality cross-check never ran (see the SKIP lines above). The soak oracle must serve parlia_getJustifiedNumber / parlia_getFinalizedNumber."
+        );
+    }
     // A resumable soak can be stopped early and restarted; without this the last
     // session would print PASS on a tally that never reached the target.
     if args.duration_secs > 0 {
@@ -1487,7 +1509,10 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
             }
         }
     }
-    println!("GATE:         PASS  unique={unique_best}  at_fast_head={fast_compared}");
+    println!(
+        "GATE:         PASS  unique={unique_best}  at_fast_head={fast_compared}  parlia_finality={}",
+        tot.checked_finality
+    );
     Ok(())
 }
 
