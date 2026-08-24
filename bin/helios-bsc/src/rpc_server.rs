@@ -42,6 +42,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tiny_http::{Header, Method, Response, Server};
 
 /// JSON-RPC is POST-only. Caps memory if a client streams a huge body.
@@ -129,6 +130,11 @@ struct FinalityView {
     /// `safe` printed beside it.
     read_head: Option<SafeHead>,
     read_head_is_fast: bool,
+    /// When the sync that produced this view finished. `None` until the first one does.
+    ///
+    /// Lives here rather than in its own field so a reader cannot pair a freshness stamp
+    /// with a different sample than the one it describes.
+    synced_at: Option<Instant>,
 }
 
 /// Request threads serving the local JSON-RPC listener.
@@ -626,14 +632,48 @@ impl Node {
         }
     }
 
-    /// Catch up to the live tip. Used on every wallet read and by the background poller.
+    /// Catch up to the live tip. The background poller. Always goes to the upstream: it is what keeps the coalescing
+    /// window below fed, so a coalesced answer is never older than one poll interval.
     pub fn poll_sync(&self) -> Result<(u64, SafeHead)> {
-        self.refresh()
+        self.refresh_now()
     }
 
+    /// Reuse the last published sync if the chain cannot have moved since.
+    ///
+    /// Every served method calls this first, and it used to mean one upstream
+    /// `eth_blockNumber` per request — so a single 64-element JSON-RPC batch, well inside
+    /// `MAX_RPC_BATCH`, fired 64 upstream calls and burned the operator's quota from one
+    /// request. Each of those also serialised behind the chain lock, so four worker
+    /// threads answered like one.
+    ///
+    /// The window is the fork's block interval, because that is the fastest the chain can
+    /// produce anything new: inside it a fresh poll cannot return a different head, so
+    /// skipping it costs no accuracy at all. It is not a cache with a staleness budget.
     fn refresh(&self) -> Result<(u64, SafeHead)> {
-        let mut chain = self.chain.lock().expect("chain lock");
-        let mut snapshot = self.snapshot.lock().expect("snapshot lock");
+        if let Some(fresh) = self.published_if_fresh() {
+            return Ok(fresh);
+        }
+        self.refresh_now()
+    }
+
+    /// `(head, read head)` from the last sync, or `None` if it is older than one block.
+    fn published_if_fresh(&self) -> Option<(u64, SafeHead)> {
+        let view = self.finality.lock().expect("finality lock");
+        let window = Duration::from_millis(mainnet_current_fork().block_interval_ms);
+        if view.synced_at?.elapsed() >= window {
+            return None;
+        }
+        Some((view.head, view.read_head.clone()?))
+    }
+
+    fn refresh_now(&self) -> Result<(u64, SafeHead)> {
+        // Outside the locks on purpose. This is a network call with a 30 s cap and three
+        // backoff retries behind it; holding `chain` and `snapshot` across it let one slow
+        // upstream stall every worker for minutes. A tip that goes stale while we wait for
+        // the locks is harmless — `resync_locked` treats an already-passed height as a
+        // no-op, and the head published below is read back off the chain, never from this
+        // number, so no consumer can see a head the client has not verified.
+        //
         // Transport failure here is not a verification failure — count it apart so a
         // flaky provider never looks like a lying one on the metrics dashboard.
         let tip = match self.up.block_number() {
@@ -643,6 +683,8 @@ impl Node {
                 return Err(e);
             }
         };
+        let mut chain = self.chain.lock().expect("chain lock");
+        let mut snapshot = self.snapshot.lock().expect("snapshot lock");
         let (safe, conf_safe, verified_this, grew) =
             match self.resync_locked(&mut chain, &mut snapshot, tip) {
                 Ok(v) => v,
@@ -651,24 +693,31 @@ impl Node {
                     return Err(e);
                 }
             };
+        // The head is the highest header this client actually verified, read back off the
+        // chain rather than taken from the `tip` sampled before the locks. A concurrent
+        // sync can have advanced past that number while this thread waited, and pairing an
+        // older tip with a newer chain is how a head, its lag and its source end up
+        // describing different instants.
+        let head = chain.last().map(|b| b.number).unwrap_or(tip);
         // Read the fast-finality heads while the snapshot is still locked, and keep them
         // together with the head they are measured against. Everything published below
         // comes from this one sample, so no consumer can mix two instants.
         let mut view = match snapshot.as_ref() {
             Some(s) => FinalityView {
-                head: tip,
+                head,
                 available: s.fast_finality_available(),
                 justified: s.justified(),
                 finalized: s.finalized(),
                 ..FinalityView::default()
             },
             None => FinalityView {
-                head: tip,
+                head,
                 ..FinalityView::default()
             },
         };
         view.read_head_is_fast = safe.number != conf_safe.number;
         view.read_head = Some(safe.clone());
+        view.synced_at = Some(Instant::now());
         // Publish **while the chain lock is still held**. `docs/slo.md` promises that
         // `helios_bsc_tip_block` and the finality gauges are "published together", and
         // publishing after the drop broke that with four worker threads: the whole sync
@@ -678,7 +727,7 @@ impl Node {
         // staying there until the next sync. These are plain atomic stores plus one
         // uncontended mutex, no I/O, so the critical section does not grow measurably.
         // `/metrics` still reads only atomics and never takes this lock.
-        self.last_tip.store(tip, Ordering::Relaxed);
+        self.last_tip.store(head, Ordering::Relaxed);
         // `last_safe` is the confirmation-depth head, whatever tags resolve to — the SLO
         // bound and its alerts are defined against that rule, so the gauge must not start
         // meaning something else when the flag is on.
@@ -701,7 +750,7 @@ impl Node {
         if grew {
             self.persist_verified_tip();
         }
-        Ok((tip, safe))
+        Ok((head, safe))
     }
 
     /// Advance the locked chain to `tip`. Returns `(safe, newly_verified, grew)`.

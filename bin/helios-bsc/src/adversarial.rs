@@ -42,6 +42,8 @@ struct MockUpstream {
     /// When set, `send_raw_transaction` returns this hash instead of keccak(raw).
     lie_raw_hash: Option<String>,
     receipts: Vec<Value>,
+    /// Upstream `eth_blockNumber` calls, shared with the test that wants to count them.
+    block_number_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl MockUpstream {
@@ -63,6 +65,7 @@ impl MockUpstream {
             code: Vec::new(),
             lie_raw_hash: None,
             receipts: Vec::new(),
+            block_number_calls: std::sync::Arc::default(),
         })
     }
 
@@ -79,12 +82,15 @@ impl MockUpstream {
             code: Vec::new(),
             lie_raw_hash: None,
             receipts: Vec::new(),
+            block_number_calls: std::sync::Arc::default(),
         }
     }
 }
 
 impl RpcUpstream for MockUpstream {
     fn block_number(&self) -> Result<u64> {
+        self.block_number_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(self.tip)
     }
 
@@ -194,6 +200,16 @@ fn safe_chain_with_fixture_root() -> (Vec<VerifiedBlock>, MockRpc) {
 fn node_from_chain(chain: Vec<VerifiedBlock>, proof: Value) -> Node {
     let up = MockUpstream::for_chain(&chain, proof);
     Node::from_parts(Box::new(up), 130, chain)
+}
+
+/// Like [`node_from_chain`], but hands back the upstream's `eth_blockNumber` counter.
+fn node_counting_block_number(
+    chain: Vec<VerifiedBlock>,
+    proof: Value,
+) -> (Node, std::sync::Arc<std::sync::atomic::AtomicU64>) {
+    let up = MockUpstream::for_chain(&chain, proof);
+    let calls = std::sync::Arc::clone(&up.block_number_calls);
+    (Node::from_parts(Box::new(up), 130, chain), calls)
 }
 
 fn load_wbnb_code() -> Vec<u8> {
@@ -2444,4 +2460,41 @@ fn get_transaction_receipt_verified_without_flag() {
     assert_eq!(v["result"]["transactionHash"], json!(txh), "{v}");
     let blk = node.handle(&req("eth_getBlockReceipts", json!(["latest"])));
     assert_eq!(blk["result"].as_array().map(|a| a.len()), Some(1), "{blk}");
+}
+
+/// A 64-element batch is inside `MAX_RPC_BATCH`, and each element used to call
+/// `refresh` — so one request in the size limit fired 64 upstream `eth_blockNumber`
+/// calls and spent the operator's quota on itself. Inside one block interval the chain
+/// cannot have moved, so the published sync answers them all.
+#[test]
+fn a_full_batch_costs_one_upstream_poll() {
+    let chain = distinct_sealer_chain(15);
+    let (node, calls) = node_counting_block_number(chain, json!({}));
+    let batch: Vec<Value> = (0..MAX_RPC_BATCH)
+        .map(|i| json!({"jsonrpc": "2.0", "id": i + 1, "method": "eth_blockNumber"}))
+        .collect();
+    let out = node.dispatch(&Value::Array(batch));
+    assert_eq!(
+        out.as_array().map(Vec::len),
+        Some(MAX_RPC_BATCH),
+        "every element must still be answered"
+    );
+    let n = calls.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(n, 1, "{MAX_RPC_BATCH} requests took {n} upstream polls");
+}
+
+/// The coalescing window must not swallow the background poller: it is what keeps the
+/// window fed, so a poller that answered from its own cache would freeze the chain.
+#[test]
+fn the_background_poller_always_reaches_the_upstream() {
+    let chain = distinct_sealer_chain(15);
+    let (node, calls) = node_counting_block_number(chain, json!({}));
+    for _ in 0..3 {
+        let _ = node.poll_sync();
+    }
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "poll_sync must not coalesce"
+    );
 }
