@@ -32,6 +32,12 @@ const HEADER_FILES: [&str; 5] = [
 /// forged attestation below would be silently ignored rather than rejected.
 const VOTE_KEY_EPOCH_FILE: &str = "header_116663000.json";
 
+/// The two epoch boundaries below the fixture window, newest first.
+///
+/// Bootstrap reads both to learn `turnLength` and to tell an already-activated epoch from
+/// a pending one, so a mock that cannot serve them cannot exercise the real walk.
+const EPOCH_HEADER_FILES: [&str; 2] = ["header_116663000.json", "header_116662000.json"];
+
 /// Voters left after [`Scenario::DowngradedQuorum`] — one short of the `ceil(2*21/3)` = 14
 /// super-majority.
 pub const DOWNGRADED_VOTES: u32 = 13;
@@ -382,6 +388,15 @@ fn load_header(name: &str) -> Result<RpcBlockHeader> {
     let path = fixtures_dir().join(name);
     let raw = std::fs::read_to_string(&path).with_context(|| format!("{path:?}"))?;
     serde_json::from_str(&raw).with_context(|| format!("{name} json"))
+}
+
+/// Epoch headers below the fixture window, for [`RpcUpstream::header_by_number`] mocks.
+pub fn epoch_headers() -> Result<Vec<RpcBlockHeader>> {
+    EPOCH_HEADER_FILES
+        .iter()
+        .copied()
+        .map(load_header)
+        .collect()
 }
 
 fn load_fixtures() -> Result<LoadedFixtures> {

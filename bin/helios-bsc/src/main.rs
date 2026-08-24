@@ -23,8 +23,9 @@ use helios_bsc_config::{
     PROVIDER_PROOF_LOOKBACK,
 };
 use helios_bsc_consensus::{
-    assert_checkpoint_age, checkpoint_at_snapshot, proof_lag, sealing_set_from_activated_epoch,
-    vote_keys_from_activated_epoch, within_proof_window, CHECKPOINT_WARN_AGE_SECS,
+    assert_checkpoint_age, checkpoint_at_snapshot, epoch_seed_at, proof_lag,
+    sealing_set_from_activated_epoch, vote_keys_from_activated_epoch, within_proof_window,
+    EpochSeed, CHECKPOINT_WARN_AGE_SECS,
 };
 use helios_bsc_execution::{verify_eth_get_proof, EthAccountProof};
 use helios_bsc_types::{decode_hex_fixed, decode_u64, Checkpoint, RpcBlockHeader};
@@ -628,6 +629,37 @@ fn fetch_header(up: &Upstream, block: &str) -> Result<RpcBlockHeader> {
     up.header_by_number(n)
 }
 
+/// Fail a checkpoint whose block sits between an epoch boundary and the height at which
+/// that epoch's sealing set takes effect.
+///
+/// `walk_from_checkpoint` refuses such a checkpoint because adopting the announced set
+/// would mean trusting an unverified header; catching it at write time turns a restart
+/// failure into an immediate one, with a block number the operator can use instead.
+fn assert_outside_activation_window(up: &Upstream, number: u64, epoch_length: u64) -> Result<()> {
+    if epoch_length == 0 {
+        return Ok(());
+    }
+    let epoch_block = (number / epoch_length) * epoch_length;
+    let Some(prev_block) = epoch_block.checked_sub(epoch_length) else {
+        return Ok(());
+    };
+    let epoch_header = fetch_header(up, &format!("0x{epoch_block:x}"))?;
+    let prev_header = fetch_header(up, &format!("0x{prev_block:x}"))?;
+    match epoch_seed_at(number, epoch_length, &epoch_header, &prev_header)? {
+        EpochSeed::Active { turn_length, .. } => {
+            println!("epoch     {epoch_block} active, turnLength={turn_length}");
+            Ok(())
+        }
+        EpochSeed::PendingActivation {
+            epoch_block,
+            activate_at,
+        } => bail!(
+            "block {number} is inside epoch {epoch_block}'s activation window (the set announced there takes effect at {activate_at}) — write the checkpoint at block {} instead",
+            epoch_block.saturating_sub(1)
+        ),
+    }
+}
+
 fn write_checkpoint(
     url: &str,
     block: &str,
@@ -669,6 +701,10 @@ fn write_checkpoint(
         None => cp,
     };
     cp.validate_basic()?;
+    // Refuse here what `walk_from_checkpoint` would refuse at run time, so the operator
+    // finds out while writing the file rather than at the next restart. Roughly one block
+    // in twelve falls in this window.
+    assert_outside_activation_window(&up, number, fork.epoch_length)?;
     write_checkpoint_file(out, &cp)?;
     println!(
         "wrote checkpoint {} hash={} n_seal={} fork={} fastFinality={}",

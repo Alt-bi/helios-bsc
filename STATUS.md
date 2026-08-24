@@ -1,6 +1,6 @@
 # helios-bsc status
 
-**Updated:** 2026-08-21
+**Updated:** 2026-08-24
 
 | Milestone | State |
 |-----------|--------|
@@ -37,6 +37,7 @@
 | Unverified passthrough (opt-in) | **Done** — `--allow-unverified-passthrough`: receipts/txs header-bound to Safe **and** to the requested 32-byte hash; `chainId`=56, address fields including `contractAddress`, `status` ∈ {0,1}, structural `logs[]`, `input`/`data` ≤512 KiB, `logsBloom` 256 B. Fee oracles: hex qty / feeHistory object (arrays ≤1024; `oldestBlock` if present is a local verified header ≤ Safe). Default still `-32601`. `eth_getProof` ≤64 storage keys (hex ≤32 B, validated before fetch); served fields overwritten from the verified account. Account methods reject non-20-byte addresses locally. `pending`/`earliest` rejected. |
 | Operator SLOs | **Done** — `docs/slo.md`; `doctor` slo=ok/warn/fail; `syncStatus.safeLagWithinBound`. |
 | Prometheus metrics | **Done** — opt-in `run --metrics` → `GET /metrics` (only non-POST route; loopback `Host` check still applies). All design-doc metrics except `helios_bsc_sync_lag_blocks` (deliberately not implemented — the client has no view of "the network tip" independent of the upstream it is already asking, so it would restate `tip_block`), plus tip/safe/passthrough gauges and the three fast-finality gauges. Scrape is **lock-free and does no network I/O** (gauges published to atomics after each sync) — an earlier build took the chain mutex and a live scrape **hung 180 s** behind a serial header walk; `metrics_do_not_take_the_chain_lock` guards it. Unknown reports `-1`, never `0`. Verified live 2026-08-21: scrape ~2 ms, `safe_lag=106` blocks / 47 s. |
+| Bootstrap epoch state | **Done** — a checkpoint carries no `turnLength` and cannot say whether a set switch is pending, so both are read back from the two epoch headers around it. `turnLength` is seeded from the chain (the fork table's 8 is a guess; v1.7.8 `parlia.go` anticipates 16 and every fixture here is 8, so nothing would have noticed). A checkpoint inside an epoch's activation window — 87 blocks in 1000 — is **refused** at both `write-checkpoint` and walk time rather than seeded, because adopting the announced set would mean taking a future sealing set from an unverified header. Verified live 2026-08-24 against `bsc-dataseed`: block `E+40` refused with the activation height and a usable alternative, `E-1` accepted with `turnLength=8` read from epoch `117814000`. |
 | In-turn difficulty | **Done** — range on all headers; `inturn_validator` on checkpoint walks (padded fixture sets cannot satisfy live in-turn). |
 | SignRecently (Bohr recents) | **Done** — `seenTimes >= turnLength` in `minerHistoryCheckLen`; recents cleared on set switch. Maxwell FF prune applied (see the row below). |
 | Unsealed header fields | **Done** — empty uncles, gasUsed/gasLimit, `baseFeePerGas` (see below), Lorentz mixDigest ms, Bohr zero `parentBeaconRoot`, extraData ≤100KiB, empty `withdrawalsRoot`, `header.Time ≤ now+15s`, Parlia nonce empty. Epoch extraData must parse (n≥1 **unique** validators, Bohr `turnLength` 1..=64); membership still needs `--checkpoint`. |

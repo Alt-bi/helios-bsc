@@ -29,6 +29,9 @@ use serde_json::{json, Value};
 struct MockUpstream {
     tip: u64,
     headers: Vec<RpcBlockHeader>,
+    /// Epoch boundaries below `headers`. Served by number only: they must not appear in a
+    /// `headers_range` walk, which is why they are a separate list rather than prepended.
+    epoch_headers: Vec<RpcBlockHeader>,
     proof: Value,
     /// When set, `header_by_hash` lies about `stateRoot` (hash/number still match).
     lie_state_root: bool,
@@ -46,6 +49,7 @@ impl MockUpstream {
         Ok(Self {
             tip: rpc.tip_number()?,
             headers: rpc.headers().to_vec(),
+            epoch_headers: helios_bsc_mock::epoch_headers()?,
             proof: rpc.proof_json(),
             lie_state_root: false,
             balance: rpc
@@ -66,6 +70,7 @@ impl MockUpstream {
         Self {
             tip: chain.last().map(|b| b.number).unwrap_or(0),
             headers: headers_from_chain(chain),
+            epoch_headers: Vec::new(),
             proof,
             lie_state_root: false,
             balance: "0x0".into(),
@@ -86,6 +91,7 @@ impl RpcUpstream for MockUpstream {
     fn header_by_number(&self, n: u64) -> Result<RpcBlockHeader> {
         self.headers
             .iter()
+            .chain(self.epoch_headers.iter())
             .find(|h| decode_u64(&h.number).ok() == Some(n))
             .cloned()
             .ok_or_else(|| anyhow!("header {n} missing"))

@@ -22,7 +22,7 @@ pub use seal::{
     verify_extra_layout, verify_header_hash, verify_seal_coinbase, verify_timestamp_not_future,
     verify_unsealed_fields, SealError, MAX_FUTURE_SKEW_SECS,
 };
-pub use snapshot::{Snapshot, SnapshotError};
+pub use snapshot::{epoch_seed_at, EpochSeed, Snapshot, SnapshotError};
 pub use vote::{
     decode_vote_attestation, min_votes_for_finality, verify_attestation_signature,
     voted_validators, VoteAttestation, VoteData, VoteError, BLS_PUBLIC_KEY_LEN, BLS_SIGNATURE_LEN,

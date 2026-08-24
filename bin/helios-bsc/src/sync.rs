@@ -4,9 +4,9 @@ use crate::upstream::RpcUpstream;
 use anyhow::{bail, Context, Result};
 use helios_bsc_config::{mainnet_n_seal, max_reorg_depth, PROVIDER_PROOF_LOOKBACK};
 use helios_bsc_consensus::{
-    checkpoint_slo_label, header_matches_checkpoint, milli_timestamp, newest_safe, proof_lag,
-    verify_cascading_vs_parent, verify_seal_coinbase, ConsensusError, LightEngine, Snapshot,
-    VerifiedBlock,
+    checkpoint_slo_label, epoch_seed_at, header_matches_checkpoint, milli_timestamp, newest_safe,
+    proof_lag, verify_cascading_vs_parent, verify_seal_coinbase, ConsensusError, EpochSeed,
+    LightEngine, Snapshot, VerifiedBlock,
 };
 use helios_bsc_types::{decode_hex_fixed, decode_u64, Checkpoint, RpcBlockHeader, SafeHead};
 use std::time::{Duration, Instant};
@@ -333,13 +333,77 @@ pub fn walk_from_checkpoint_inturn(
         .into());
     }
     let header = up.header_by_number(checkpoint.number)?;
+    let cp_number = checkpoint.number;
     let mut engine = LightEngine::from_checkpoint_and_header(checkpoint, &header)?;
     engine.snapshot.enforce_inturn = enforce_inturn;
+    // Only on the live path. A padded synthetic set has no epoch header behind it, and
+    // `enforce_inturn == false` already says this snapshot is not being held to the
+    // chain's turn schedule.
+    if enforce_inturn {
+        seed_epoch_state(up, &mut engine.snapshot, cp_number)?;
+    }
     if to > engine.tip_number() {
         let headers = up.headers_range(engine.tip_number() + 1, to)?;
         engine.apply_headers(&headers)?;
     }
     Ok((engine.chain, engine.snapshot))
+}
+
+/// Read back the epoch state a checkpoint cannot carry, and refuse the ones we must not
+/// guess at.
+///
+/// Two facts live in epoch `extraData` and nowhere else: the active `turnLength`, and
+/// whether a validator-set switch is still pending. [`Snapshot::from_checkpoint`] fills
+/// both from the fork table, which is a guess that happens to be right today.
+///
+/// The pending case is refused rather than seeded. Adopting it would mean taking a future
+/// sealing set from a header this client has not verified and cannot cheaply link to the
+/// checkpoint — an upstream that forged it would choose who signs blocks for us after the
+/// activation. Refusing costs the operator one retry at a different block and imports no
+/// trust, so that is the trade taken. `turnLength` is different and is seeded: a forged
+/// one cannot be accepted, only detected, because the very next header's in-turn
+/// difficulty is computed from it.
+fn seed_epoch_state(
+    up: &dyn RpcUpstream,
+    snapshot: &mut Snapshot,
+    checkpoint_number: u64,
+) -> Result<()> {
+    let epoch_length = snapshot.epoch_length;
+    if epoch_length == 0 {
+        return Ok(());
+    }
+    let epoch_block = (checkpoint_number / epoch_length) * epoch_length;
+    // Genesis-adjacent: there is no previous epoch to measure the activation against.
+    // Unreachable on mainnet, where any usable checkpoint is ~10^8 blocks up.
+    let Some(prev_block) = epoch_block.checked_sub(epoch_length) else {
+        return Ok(());
+    };
+    let epoch_header = up
+        .header_by_number(epoch_block)
+        .with_context(|| format!("epoch header {epoch_block} (checkpoint turnLength)"))?;
+    let prev_header = up
+        .header_by_number(prev_block)
+        .with_context(|| format!("epoch header {prev_block} (checkpoint turnLength)"))?;
+    match epoch_seed_at(
+        checkpoint_number,
+        epoch_length,
+        &epoch_header,
+        &prev_header,
+    )? {
+        EpochSeed::Active { turn_length, .. } => {
+            snapshot.seed_turn_length(turn_length)?;
+            Ok(())
+        }
+        EpochSeed::PendingActivation {
+            epoch_block,
+            activate_at,
+        } => bail!(
+            // One line on purpose: rustfmt turns a `\`-continued literal into runs of
+            // literal spaces, and an operator reads this message in a terminal.
+            "checkpoint {checkpoint_number} sits inside epoch {epoch_block}'s activation window — the sealing set announced at {epoch_block} takes effect at {activate_at}, which this client would miss. Use a checkpoint at block {} or at or above {activate_at}.",
+            epoch_block.saturating_sub(1)
+        ),
+    }
 }
 
 /// Host of an RPC URL (`https://rpc.ankr.com/bsc/KEY` → `rpc.ankr.com`).
