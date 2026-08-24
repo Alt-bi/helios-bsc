@@ -98,6 +98,8 @@ pub struct SoakState {
     pub checked_slot0: u32,
     #[serde(default)]
     pub checked_call: u32,
+    #[serde(default)]
+    pub checked_finality: u32,
     /// Addresses matched at least once, lowercased.
     pub unique: Vec<String>,
     /// Sessions in start order. The soaked total is their sum, never

@@ -4,8 +4,9 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use helios_bsc::bind::assert_listen_policy;
 use helios_bsc::diff::{
-    addr_key, diff_call_one, diff_one, proof_error_retryable, rotate_front, soak_empty_burst,
-    soak_list, soak_repeat_full_list, unmatched, DiffOutcome, DiffReport, SOAK_ADDRESSES,
+    addr_key, diff_call_one, diff_finality_one, diff_one, proof_error_retryable, rotate_front,
+    soak_empty_burst, soak_list, soak_repeat_full_list, unmatched, DiffOutcome, DiffReport,
+    SOAK_ADDRESSES,
 };
 use helios_bsc::rpc_server::{self, FinalityMode, Node};
 use helios_bsc::soak_state::{human_secs, SoakFingerprint, SoakState};
@@ -905,6 +906,7 @@ struct SoakReport {
     checked_nonce: u32,
     checked_slot0: u32,
     checked_call: u32,
+    checked_finality: u32,
 }
 
 fn soak_until(
@@ -930,6 +932,9 @@ fn soak_until(
     };
     let mut report = SoakReport::default();
     let mut empty = 0u32;
+    // Once per round, not per address: `parlia_*` is served by few providers and the
+    // ones that do serve it throttle hard.
+    let mut finality_checked = false;
     while !pending.is_empty() && done.len() < unique_cap {
         let (tip, safe) = match wait_until_in_window_with(
             up,
@@ -960,6 +965,36 @@ fn soak_until(
         // `read_head_is_fast`.
         let at_fast =
             opts.fast_finality && safe_of(chain).is_ok_and(|conf| conf.number != safe.number);
+        // Compare this client's BEP-126 heads with geth's own answer at the block our
+        // snapshot is actually at -- the only direct coverage the attestation path gets.
+        if !finality_checked {
+            finality_checked = true;
+            if let Some(outcome) = snapshot.as_deref().and_then(|snap| {
+                snap.justified()
+                    .zip(snap.finalized())
+                    .and_then(|((j, _), (f, _))| {
+                        diff_finality_one(oracle, snap.number, snap.hash, (j, f))
+                    })
+            }) {
+                match outcome {
+                    DiffOutcome::Match { local, remote, .. } => {
+                        report.compared += 1;
+                        report.matched += 1;
+                        report.checked_finality += 1;
+                        eprintln!(
+                            "  finality  local={local}  oracle={remote}  OK [parlia_finality]"
+                        );
+                    }
+                    DiffOutcome::Mismatch { local, remote } => {
+                        eprintln!("  finality  local={local}  oracle={remote}  MISMATCH");
+                        bail!("parlia finality mismatch (fail-closed)");
+                    }
+                    DiffOutcome::SkipProof(e) | DiffOutcome::SkipOracle(e) => {
+                        eprintln!("  finality  SKIP: {e}");
+                    }
+                }
+            }
+        }
         let n = burst.min(pending.len());
         println!(
             "  burst n={n}  safe={}  tip={tip}  lag={lag}  head={}  unique={}/{}",
@@ -1220,6 +1255,7 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
         tot.checked_nonce = st.checked_nonce;
         tot.checked_slot0 = st.checked_slot0;
         tot.checked_call = st.checked_call;
+        tot.checked_finality = st.checked_finality;
         fast_compared = st.compared_at_fast;
     }
     // A wedged walk and a slow one look identical for one round. They stop looking
@@ -1292,6 +1328,7 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
         tot.checked_nonce += report.checked_nonce;
         tot.checked_slot0 += report.checked_slot0;
         tot.checked_call += report.checked_call;
+        tot.checked_finality += report.checked_finality;
         fast_compared += report.compared_at_fast;
         println!(
             "  round unique={}  compared={}  match={}  mismatch={}  skip={}",
@@ -1313,6 +1350,7 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
             st.checked_nonce = tot.checked_nonce;
             st.checked_slot0 = tot.checked_slot0;
             st.checked_call = tot.checked_call;
+            st.checked_finality = tot.checked_finality;
             st.unique = {
                 let mut v: Vec<String> = done.iter().cloned().collect();
                 v.sort();
@@ -1353,8 +1391,12 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
     // means the oracle never served it and the trie went untested, which no amount of
     // OK lines would otherwise reveal.
     println!(
-        "# CHECKED  balance={}  nonce={}  slot0={}  eth_call={}",
-        tot.checked_balance, tot.checked_nonce, tot.checked_slot0, tot.checked_call
+        "# CHECKED  balance={}  nonce={}  slot0={}  eth_call={}  parlia_finality={}",
+        tot.checked_balance,
+        tot.checked_nonce,
+        tot.checked_slot0,
+        tot.checked_call,
+        tot.checked_finality
     );
     // Duration is a gate input, so it is reported as what it is: a sum over sessions,
     // with the worst interruption named. A reader must never have to assume continuity.

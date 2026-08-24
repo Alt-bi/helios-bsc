@@ -71,6 +71,7 @@ pub struct DiffReport {
     pub checked_nonce: u32,
     pub checked_slot0: u32,
     pub checked_call: u32,
+    pub checked_finality: u32,
 }
 
 impl DiffReport {
@@ -83,6 +84,7 @@ impl DiffReport {
         self.checked_nonce += other.checked_nonce;
         self.checked_slot0 += other.checked_slot0;
         self.checked_call += other.checked_call;
+        self.checked_finality += other.checked_finality;
     }
 }
 
@@ -263,6 +265,84 @@ fn oracle_call(
         .map_err(|e| anyhow!("oracle call skip: {e}"))
 }
 
+/// Cross-check this client's BEP-126 heads against geth's own answer at the same block.
+///
+/// `parlia_getJustifiedNumber` / `parlia_getFinalizedNumber` are defined in v1.7.8
+/// `consensus/parlia/api.go` as `snapshot(at that header).Attestation.TargetNumber` and
+/// `.SourceNumber` -- word for word what [`Snapshot::justified`] and
+/// [`Snapshot::finalized`] return. Both are taken **at a named block**, so this is an
+/// exact equality, not a race between two moving tips.
+///
+/// It is the only direct coverage the attestation path gets. Everything else about
+/// BEP-126 here is fixtures plus the indirect evidence that a walk did not wedge -- and
+/// both bugs found in it this week (the Fermi ancestor window, the missing
+/// `source < target` rule) were found by walking mainnet, not by the suite.
+///
+/// `None` when this client has no attestation yet. Skips cover an oracle that does not
+/// expose the `parlia` namespace at all (most do not) and an oracle that is not on our
+/// chain at that height -- neither is evidence of anything.
+pub fn diff_finality_one(
+    oracle: &dyn RpcUpstream,
+    snap_number: u64,
+    snap_hash: [u8; 32],
+    local: (u64, u64),
+) -> Option<DiffOutcome> {
+    let (local_justified, local_finalized) = local;
+    let block = format!("0x{snap_number:x}");
+
+    // Same height is not the same block. Confirm the oracle is on our chain here before
+    // comparing, or a reorg on either side reads as a finality disagreement.
+    match oracle.header_by_number(snap_number) {
+        Ok(h) => match decode_hex_fixed::<32>(&h.hash) {
+            Ok(remote_hash) if remote_hash == snap_hash => {}
+            Ok(_) => {
+                return Some(DiffOutcome::SkipOracle(
+                    "finality: oracle is on another block at this height".into(),
+                ))
+            }
+            Err(e) => return Some(DiffOutcome::SkipOracle(format!("finality: {e}"))),
+        },
+        Err(e) => return Some(DiffOutcome::SkipOracle(format!("finality: {e}"))),
+    }
+
+    let ask = |method: &str| -> Result<u64> {
+        let v = oracle.unverified_call(method, &serde_json::json!([block]))?;
+        match &v {
+            serde_json::Value::Number(n) => {
+                n.as_u64().ok_or_else(|| anyhow!("{method} returned {v}"))
+            }
+            serde_json::Value::String(t) => {
+                u64::from_str_radix(t.trim_start_matches("0x").trim_start_matches("0X"), 16)
+                    .map_err(|e| anyhow!("{method} returned {v}: {e}"))
+            }
+            _ => Err(anyhow!("{method} returned {v}")),
+        }
+    };
+    let remote_justified = match ask("parlia_getJustifiedNumber") {
+        Ok(v) => v,
+        Err(e) => return Some(DiffOutcome::SkipOracle(format!("finality: {e}"))),
+    };
+    let remote_finalized = match ask("parlia_getFinalizedNumber") {
+        Ok(v) => v,
+        Err(e) => return Some(DiffOutcome::SkipOracle(format!("finality: {e}"))),
+    };
+
+    if local_justified != remote_justified || local_finalized != remote_finalized {
+        return Some(DiffOutcome::Mismatch {
+            local: format!("justified {local_justified} finalized {local_finalized}"),
+            remote: format!("justified {remote_justified} finalized {remote_finalized}"),
+        });
+    }
+    Some(DiffOutcome::Match {
+        local: format!("justified {local_justified} finalized {local_finalized}"),
+        remote: format!("justified {remote_justified} finalized {remote_finalized}"),
+        checks: DiffChecks {
+            finality: true,
+            ..DiffChecks::default()
+        },
+    })
+}
+
 /// Which best-effort sub-checks a matching comparison reached.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DiffChecks {
@@ -271,6 +351,8 @@ pub struct DiffChecks {
     /// An `eth_call` cross-check ran. Tracked separately because it is a whole extra
     /// comparison, not a field of the account one.
     pub call: bool,
+    /// A `parlia_*` finality cross-check ran. Also a standalone comparison.
+    pub finality: bool,
 }
 
 impl DiffChecks {
@@ -286,6 +368,9 @@ impl DiffChecks {
         if self.call {
             // A call comparison stands alone; it does not carry a balance.
             return "eth_call".into();
+        }
+        if self.finality {
+            return "parlia_finality".into();
         }
         v.join(",")
     }
@@ -565,25 +650,25 @@ mod tests {
 
     #[test]
     fn accumulate_sums_rounds() {
+        // `..Default::default()` on purpose: this test is about accumulation, and a new
+        // counter should not make it fail to compile.
         let mut tot = DiffReport {
             compared: 2,
             matched: 2,
-            mismatched: 0,
             skipped: 1,
             checked_balance: 2,
             checked_nonce: 2,
             checked_slot0: 1,
-            checked_call: 0,
+            ..DiffReport::default()
         };
         tot.accumulate(&DiffReport {
             compared: 3,
             matched: 2,
             mismatched: 1,
-            skipped: 0,
             checked_balance: 3,
             checked_nonce: 3,
-            checked_slot0: 0,
             checked_call: 2,
+            ..DiffReport::default()
         });
         assert_eq!(tot.compared, 5);
         assert_eq!(tot.matched, 4);
@@ -605,8 +690,7 @@ mod tests {
         assert_eq!(
             DiffChecks {
                 nonce: true,
-                slot0: false,
-                call: false
+                ..DiffChecks::default()
             }
             .label(),
             "balance,nonce"
@@ -615,7 +699,7 @@ mod tests {
             DiffChecks {
                 nonce: true,
                 slot0: true,
-                call: false
+                ..DiffChecks::default()
             }
             .label(),
             "balance,nonce,slot0"
@@ -629,6 +713,14 @@ mod tests {
             }
             .label(),
             "eth_call"
+        );
+        assert_eq!(
+            DiffChecks {
+                finality: true,
+                ..DiffChecks::default()
+            }
+            .label(),
+            "parlia_finality"
         );
     }
 
