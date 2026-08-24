@@ -2200,8 +2200,8 @@ fn revert_rpc(data: &[u8]) -> (i64, String, Option<String>) {
 }
 
 /// Untrusted Safe proofs/code only — never proxies `eth_call` / `eth_estimateGas`.
-struct UpstreamProve<'a> {
-    up: &'a dyn RpcUpstream,
+pub(crate) struct UpstreamProve<'a> {
+    pub(crate) up: &'a dyn RpcUpstream,
 }
 
 impl ProveAtSafe for UpstreamProve<'_> {
@@ -2258,7 +2258,10 @@ fn historical_hashes_at_safe(chain: &[VerifiedBlock], safe_number: u64) -> Vec<(
     out
 }
 
-fn call_block_from_verified(local: &VerifiedBlock, chain: &[VerifiedBlock]) -> CallBlock {
+pub(crate) fn call_block_from_verified(
+    local: &VerifiedBlock,
+    chain: &[VerifiedBlock],
+) -> CallBlock {
     let mut block = CallBlock {
         number: local.number,
         hash: local.hash,

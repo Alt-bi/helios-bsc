@@ -6,7 +6,7 @@ Inspired by [a16z/helios](https://github.com/a16z/helios) for Ethereum. BSC has 
 
 | | |
 |--|--|
-| **Status** | **Demo Slice closed.** 1h re-diff soak GATE PASS (2026-08-19). **24h soak** is still the MVP-1 GA live gate. |
+| **Status** | **Demo Slice closed.** 1h re-diff soak GATE PASS (2026-08-19). **24h soak** is still the MVP-1 GA live gate; the longest clean run so far is **13.9h** (compared=4129, mismatch=0), ended by the host, not by the client. |
 | **Repo** | https://github.com/Alt-bi/helios-bsc |
 | **License** | MIT OR Apache-2.0 |
 | **Design** | [docs/design.md](docs/design.md) · [RPC matrix](docs/rpc-matrix.md) · [wallet guide](docs/wallet-guide.md) · [checkpoints](docs/checkpointing.md) · [fast finality](docs/fast-finality.md) · [SLOs](docs/slo.md) · [threat model](docs/threat-model.md) |
@@ -96,6 +96,10 @@ Soak vs an independent oracle (not the proof upstream):
 # MPT-verified, no local RPC server. Retries skipped addresses after recatch.
 # Demo Slice gate: --min-unique 10. 1h re-diff closed 2026-08-19; 24h still for GA.
 cargo run -p helios-bsc -- soak --oracle https://bsc-mainnet.public.blastapi.io --once --min-unique 10
+
+# The GA gate. --state accumulates soak time across sessions, so a host that dies at
+# hour 14 resumes instead of restarting the clock; re-run the same command to continue.
+cargo run --release -p helios-bsc -- soak   --upstream https://bsc-mainnet.public.blastapi.io   --oracle https://bsc-rpc.publicnode.com   --checkpoint checkpoint.json --finality fast   --duration-secs 86400 --state soak-state.json
 
 # or loop a running helios-bsc RPC
 python scripts/soak_vs_oracle.py --once
