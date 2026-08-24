@@ -643,6 +643,7 @@ Run a pruned/fast BSC node on a **separate cheap VPS** or spare disk—**not** a
 | `helios_bsc_safe_lag_seconds` | gauge | Wall-clock Safe lag (**live ~50s** @ 0.45s / T=8; historical ~1–2 min @ T=16) |
 | `helios_bsc_finality_mode` | gauge/enum | 0=conf-depth, 1=FF (a BLS-finalized head is known) |
 | `helios_bsc_upstream_errors_total` | counter | Provider health |
+| `helios_bsc_request_panics_total` | counter | Requests whose handling panicked and were answered `-32603`. Alert on any value above zero: the client is serving errors and needs a restart. |
 | `helios_bsc_finalized_block` | gauge | BLS-finalized head — newest attestation's **source** (added with FF) |
 | `helios_bsc_justified_block` | gauge | BLS-justified head — newest attestation's **target** (added with FF) |
 | `helios_bsc_finalized_lag_blocks` | gauge | Tip − finalized (**live 2**, vs 106–113 for Safe) |

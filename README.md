@@ -98,7 +98,13 @@ Soak vs an independent oracle (not the proof upstream):
 cargo run -p helios-bsc -- soak --oracle https://bsc-mainnet.public.blastapi.io --once --min-unique 10
 
 # The GA gate. --state accumulates soak time across sessions, so a host that dies at
-# hour 14 resumes instead of restarting the clock; re-run the same command to continue.
+# hour 14 resumes instead of restarting the clock; re-run the same command to continue;
+# it is saved after every burst, not once a round.
+#
+# With --finality fast the oracle must serve the parlia_ namespace: the run cross-checks
+# this client's justified/finalized pair against geth's own answer, and fails closed if
+# that check never produced a verdict. Most public BSC endpoints answer -32601 for it;
+# bsc-rpc.publicnode.com serves it, which is why it is the oracle here.
 cargo run --release -p helios-bsc -- soak   --upstream https://bsc-mainnet.public.blastapi.io   --oracle https://bsc-rpc.publicnode.com   --checkpoint checkpoint.json --finality fast   --duration-secs 86400 --state soak-state.json
 
 # or loop a running helios-bsc RPC
