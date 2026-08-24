@@ -855,7 +855,8 @@ fn probe_safe(args: ProbeSafeArgs<'_>) -> Result<()> {
             safe.number
         );
         let mut done = HashSet::new();
-        let report = soak_until(
+        let mut report = SoakReport::default();
+        soak_until(
             up.as_ref(),
             &oracle,
             &addrs,
@@ -873,7 +874,13 @@ fn probe_safe(args: ProbeSafeArgs<'_>) -> Result<()> {
                 // same head so the two numbers cannot disagree.
                 fast_finality: false,
             },
-            &mut done,
+            SoakSink {
+                done: &mut done,
+                report: &mut report,
+                // probe-safe keeps no state file, so there is nothing to persist between
+                // bursts — the run is a one-shot diagnostic, not a duration gate.
+                persist: &mut |_, _| Ok(()),
+            },
         )?;
         println!(
             "diff:         compared={} match={} mismatch={} skip={} unique={}",
@@ -945,6 +952,54 @@ struct SoakReport {
     checked_finality: u32,
 }
 
+/// Everything a round writes to.
+///
+/// `persist` is called after every burst. A round runs for minutes; saving only when
+/// [`soak_until`] returns meant a crashed host lost the whole round, and a round that
+/// bailed saved nothing at all — `?` propagated straight past the caller's save. For a
+/// module whose entire purpose is surviving a dead host, one round was the wrong
+/// granularity.
+struct SoakSink<'a> {
+    done: &'a mut HashSet<String>,
+    report: &'a mut SoakReport,
+    persist: &'a mut dyn FnMut(&SoakReport, &HashSet<String>) -> Result<()>,
+}
+
+/// Write `base + round` to the soak state file, closing the open session at now.
+///
+/// Split out so the same accounting runs after every burst and again when the round
+/// ends, however it ends. A partial round is real soak time and real comparisons; losing
+/// them because the round did not finish is the overstatement's mirror image.
+fn persist_soak(
+    state: Option<&mut SoakState>,
+    path: Option<&std::path::Path>,
+    base: &DiffReport,
+    base_fast: u32,
+    round: &SoakReport,
+    done: &HashSet<String>,
+) -> Result<()> {
+    let (Some(st), Some(path)) = (state, path) else {
+        return Ok(());
+    };
+    st.compared = base.compared + round.compared;
+    st.matched = base.matched + round.matched;
+    st.mismatched = base.mismatched + round.mismatched;
+    st.skipped = base.skipped + round.skipped;
+    st.compared_at_fast = base_fast + round.compared_at_fast;
+    st.checked_balance = base.checked_balance + round.checked_balance;
+    st.checked_nonce = base.checked_nonce + round.checked_nonce;
+    st.checked_slot0 = base.checked_slot0 + round.checked_slot0;
+    st.checked_call = base.checked_call + round.checked_call;
+    st.checked_finality = base.checked_finality + round.checked_finality;
+    st.unique = {
+        let mut v: Vec<String> = done.iter().cloned().collect();
+        v.sort();
+        v
+    };
+    st.touch_session(now_unix());
+    st.save(path)
+}
+
 fn soak_until(
     up: &dyn RpcUpstream,
     oracle: &Upstream,
@@ -952,8 +1007,13 @@ fn soak_until(
     chain: &mut Vec<helios_bsc_consensus::VerifiedBlock>,
     mut snapshot: Option<&mut helios_bsc_consensus::Snapshot>,
     opts: SoakUntilOpts,
-    done: &mut HashSet<String>,
-) -> Result<SoakReport> {
+    sink: SoakSink<'_>,
+) -> Result<()> {
+    let SoakSink {
+        done,
+        report,
+        persist,
+    } = sink;
     let burst = opts.burst.max(1);
     let mut give_up: HashSet<String> = HashSet::new();
     let mut pending = if opts.visit_all {
@@ -966,7 +1026,6 @@ fn soak_until(
     } else {
         opts.min_unique as usize
     };
-    let mut report = SoakReport::default();
     let mut empty = 0u32;
     // Once per round, not per address: `parlia_*` is served by few providers and the
     // ones that do serve it throttle hard.
@@ -1121,6 +1180,7 @@ fn soak_until(
                 }
             }
         }
+        persist(report, done)?;
         if opts.visit_all {
             pending = pending.split_off(n.min(pending.len()));
         } else {
@@ -1144,7 +1204,7 @@ fn soak_until(
         }
     }
     report.unique = done.len() as u32;
-    Ok(report)
+    Ok(())
 }
 
 fn soak(args: SoakArgs<'_>) -> Result<()> {
@@ -1350,24 +1410,37 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
         } else {
             args.min_unique
         };
-        let report = soak_until(
-            up.as_ref(),
-            &oracle,
-            &addrs,
-            &mut chain,
-            snap_hold.as_mut(),
-            SoakUntilOpts {
-                burst: args.burst,
-                pause: args.pause,
-                min_unique: round_target,
-                max_empty: 8,
-                lookback: args.lookback,
-                max_sync: args.max_sync,
-                visit_all,
-                fast_finality: args.fast_finality,
-            },
-            &mut done,
-        )?;
+        let mut report = SoakReport::default();
+        let base = tot.clone();
+        let base_fast = fast_compared;
+        let outcome = {
+            let mut st = state.as_mut();
+            let mut persist = |r: &SoakReport, d: &HashSet<String>| {
+                persist_soak(st.as_deref_mut(), args.state, &base, base_fast, r, d)
+            };
+            soak_until(
+                up.as_ref(),
+                &oracle,
+                &addrs,
+                &mut chain,
+                snap_hold.as_mut(),
+                SoakUntilOpts {
+                    burst: args.burst,
+                    pause: args.pause,
+                    min_unique: round_target,
+                    max_empty: 8,
+                    lookback: args.lookback,
+                    max_sync: args.max_sync,
+                    visit_all,
+                    fast_finality: args.fast_finality,
+                },
+                SoakSink {
+                    done: &mut done,
+                    report: &mut report,
+                    persist: &mut persist,
+                },
+            )
+        };
         tot.compared += report.compared;
         tot.matched += report.matched;
         tot.mismatched += report.mismatched;
@@ -1386,27 +1459,18 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
             report.mismatched,
             report.skipped
         );
-        // Persist before the bails below: a run that stops for any reason should leave
-        // the hours it did complete on disk.
-        if let (Some(st), Some(path)) = (state.as_mut(), args.state) {
-            st.compared = tot.compared;
-            st.matched = tot.matched;
-            st.mismatched = tot.mismatched;
-            st.skipped = tot.skipped;
-            st.compared_at_fast = fast_compared;
-            st.checked_balance = tot.checked_balance;
-            st.checked_nonce = tot.checked_nonce;
-            st.checked_slot0 = tot.checked_slot0;
-            st.checked_call = tot.checked_call;
-            st.checked_finality = tot.checked_finality;
-            st.unique = {
-                let mut v: Vec<String> = done.iter().cloned().collect();
-                v.sort();
-                v
-            };
-            st.touch_session(now_unix());
-            st.save(path)?;
-        }
+        // Persist before the bails below — including `outcome` itself. A run that stops
+        // for any reason should leave the hours it did complete on disk, and the round
+        // that failed still soaked for as long as it ran.
+        persist_soak(
+            state.as_mut(),
+            args.state,
+            &tot,
+            fast_compared,
+            &SoakReport::default(),
+            &done,
+        )?;
+        outcome?;
         if tot.mismatched > 0 {
             bail!("oracle mismatch (fail-closed)");
         }
