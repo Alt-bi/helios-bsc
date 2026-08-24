@@ -29,8 +29,8 @@ use helios_bsc_execution::{
 use helios_bsc_rpc::{
     jsonrpc_id_ok, jsonrpc_is_v2, jsonrpc_params_len, jsonrpc_params_ok, method_policy, rpc_err,
     rpc_err_data, rpc_ok, unverified_passthrough_ok, wallet_block_number_allowed,
-    wallet_block_tag_str, BlockId, MethodPolicy, ERR_EXECUTION, ERR_INVALID, ERR_METHOD,
-    ERR_NOT_SYNCED, ERR_PARAMS, ERR_PARSE, ERR_PROOF_FAILED, ERR_STATE_ROOT,
+    wallet_block_tag_str, BlockId, MethodPolicy, ERR_EXECUTION, ERR_INTERNAL, ERR_INVALID,
+    ERR_METHOD, ERR_NOT_SYNCED, ERR_PARAMS, ERR_PARSE, ERR_PROOF_FAILED, ERR_STATE_ROOT,
     MAX_PROOF_STORAGE_KEYS, MAX_RPC_BATCH, MAX_RPC_METHOD, MAX_RPC_PARAMS,
 };
 use helios_bsc_types::{
@@ -65,6 +65,9 @@ pub struct Node {
     header_verify_fail: AtomicU64,
     /// Upstream `eth_blockNumber` failures (transport, not verification).
     upstream_errors: AtomicU64,
+    /// Requests whose handling panicked and was caught. Never expected to move; if it
+    /// does, the answers around it are `-32603` and the client needs a restart.
+    panics: AtomicU64,
     /// Last observed tip / Safe, published after each sync so `/metrics` never has to
     /// take the chain lock. [`NO_BLOCK`] means "not known yet".
     last_tip: AtomicU64,
@@ -169,6 +172,7 @@ impl Node {
             headers_verified: AtomicU64::new(n),
             header_verify_fail: AtomicU64::new(0),
             upstream_errors: AtomicU64::new(0),
+            panics: AtomicU64::new(0),
             last_tip: AtomicU64::new(tip),
             last_safe: AtomicU64::new(safe.number),
             // Lookback bootstrap carries no snapshot, so no attestation is known yet.
@@ -219,6 +223,7 @@ impl Node {
             headers_verified: AtomicU64::new(n),
             header_verify_fail: AtomicU64::new(0),
             upstream_errors: AtomicU64::new(0),
+            panics: AtomicU64::new(0),
             last_tip: AtomicU64::new(tip),
             last_safe: AtomicU64::new(safe.number),
             last_justified: AtomicU64::new(justified.unwrap_or(NO_BLOCK)),
@@ -250,6 +255,7 @@ impl Node {
             headers_verified: AtomicU64::new(0),
             header_verify_fail: AtomicU64::new(0),
             upstream_errors: AtomicU64::new(0),
+            panics: AtomicU64::new(0),
             last_tip: AtomicU64::new(NO_BLOCK),
             last_safe: AtomicU64::new(NO_BLOCK),
             last_justified: AtomicU64::new(NO_BLOCK),
@@ -286,6 +292,7 @@ impl Node {
             headers_verified: AtomicU64::new(0),
             header_verify_fail: AtomicU64::new(0),
             upstream_errors: AtomicU64::new(0),
+            panics: AtomicU64::new(0),
             last_tip: AtomicU64::new(NO_BLOCK),
             last_safe: AtomicU64::new(NO_BLOCK),
             last_justified: AtomicU64::new(NO_BLOCK),
@@ -471,6 +478,11 @@ impl Node {
             "helios_bsc_upstream_errors_total",
             "Upstream transport failures fetching the tip (not a verification failure).",
             self.upstream_errors.load(Ordering::Relaxed),
+        );
+        counter(
+            "helios_bsc_request_panics_total",
+            "Requests whose handling panicked and was answered -32603. Alert on any increase.",
+            self.panics.load(Ordering::Relaxed),
         );
 
         let mut gauge = |name: &str, help: &str, v: String| {
@@ -868,6 +880,20 @@ impl Node {
             }
             _ => rpc_err(Value::Null, ERR_INVALID, "invalid_request"),
         }
+    }
+
+    /// [`Node::dispatch_bytes`], with a panic turned into `Err(())` instead of unwinding
+    /// into the worker loop. See the call site in `serve_one` for why that matters.
+    ///
+    /// `AssertUnwindSafe` is the honest annotation rather than a workaround: everything
+    /// this touches is behind a mutex, and a panic that leaves one poisoned makes every
+    /// later access panic too — caught here, reported, never silently used.
+    pub fn dispatch_caught(&self, buf: &[u8]) -> std::result::Result<Value, ()> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.dispatch_bytes(buf))).map_err(
+            |_| {
+                self.panics.fetch_add(1, Ordering::Relaxed);
+            },
+        )
     }
 
     pub fn dispatch_bytes(&self, buf: &[u8]) -> Value {
@@ -3417,9 +3443,14 @@ pub fn serve(node: Arc<Node>, listen: &str) -> Result<()> {
     let _ = std::thread::Builder::new()
         .name("helios-bsc-sync".into())
         .spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_millis(1800));
-            if let Err(e) = poller.poll_sync() {
-                eprintln!("background sync: {e}");
+            std::thread::sleep(Duration::from_millis(1800));
+            // Caught for the same reason as a request: an uncaught panic here ends the
+            // thread, and nothing restarts it. The chain would then only advance on a
+            // request that misses the coalescing window, with no log line saying why.
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| poller.poll_sync())) {
+                Ok(Err(e)) => eprintln!("background sync: {e}"),
+                Err(_) => eprintln!("background sync panicked; poller continues"),
+                Ok(Ok(_)) => {}
             }
         });
 
@@ -3495,7 +3526,30 @@ fn serve_one(node: &Node, mut req: tiny_http::Request, loopback_only: bool) {
         let _ = req.respond(Response::from_string("payload too large").with_status_code(code));
         return;
     }
-    let out = node.dispatch_bytes(&buf);
+    let out = match node.dispatch_caught(&buf) {
+        Ok(v) => v,
+        Err(()) => {
+            // A panic here used to end the worker: `serve_one` is called from
+            // `while let Ok(req) = server.recv()`, so the thread simply left the loop.
+            // Four of those and the listener accepted connections nobody answered, while
+            // the process stayed up and `/metrics` — which reads only atomics — kept
+            // reporting a healthy client. Silent and total.
+            //
+            // Answering `-32603` keeps the worker in its loop. A panic that poisoned a
+            // state lock will then panic again on the next request and be caught again,
+            // so the failure is a visible per-request error instead of a dead server, and
+            // `helios_bsc_request_panics_total` is there to alert on.
+            let mut resp = Response::from_string(
+                rpc_err(Value::Null, ERR_INTERNAL, "internal_error").to_string(),
+            )
+            .with_status_code(500);
+            if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]) {
+                resp = resp.with_header(h);
+            }
+            let _ = req.respond(resp);
+            return;
+        }
+    };
     if out.is_null() {
         let _ = req.respond(Response::from_string("").with_status_code(204));
         return;

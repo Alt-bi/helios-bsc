@@ -44,6 +44,10 @@ struct MockUpstream {
     receipts: Vec<Value>,
     /// Upstream `eth_blockNumber` calls, shared with the test that wants to count them.
     block_number_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Name of a method that should panic instead of answering. `headers_range` panics
+    /// from inside `resync_locked`, i.e. while the chain and snapshot locks are held,
+    /// which is the case that used to take the whole RPC surface down with it.
+    panic_in: Option<&'static str>,
 }
 
 impl MockUpstream {
@@ -66,6 +70,7 @@ impl MockUpstream {
             lie_raw_hash: None,
             receipts: Vec::new(),
             block_number_calls: std::sync::Arc::default(),
+            panic_in: None,
         })
     }
 
@@ -83,6 +88,7 @@ impl MockUpstream {
             lie_raw_hash: None,
             receipts: Vec::new(),
             block_number_calls: std::sync::Arc::default(),
+            panic_in: None,
         }
     }
 }
@@ -117,6 +123,10 @@ impl RpcUpstream for MockUpstream {
     }
 
     fn headers_range(&self, from: u64, to: u64) -> Result<Vec<RpcBlockHeader>> {
+        assert!(
+            self.panic_in != Some("headers_range"),
+            "injected panic under the chain lock"
+        );
         let mut out: Vec<RpcBlockHeader> = self
             .headers
             .iter()
@@ -2497,4 +2507,46 @@ fn the_background_poller_always_reaches_the_upstream() {
         3,
         "poll_sync must not coalesce"
     );
+}
+
+/// A panic while handling a request used to end the worker thread outright: `serve_one`
+/// runs inside `while let Ok(req) = server.recv()`, so the loop simply exited. Four of
+/// those and the listener accepted connections nobody answered — with the process still
+/// up and `/metrics`, which reads only atomics, still reporting a healthy client.
+///
+/// The panic is injected in `headers_range`, i.e. *under* the chain and snapshot locks,
+/// so the follow-up requests also exercise the poisoned-mutex path.
+#[test]
+fn a_panicking_request_is_answered_not_fatal() {
+    let chain = distinct_sealer_chain(15);
+    let mut up = MockUpstream::for_chain(&chain, json!({}));
+    up.panic_in = Some("headers_range");
+    // A tip far above the chain forces `resync_locked` into `headers_range`.
+    up.tip = chain.last().unwrap().number + 5_000;
+    let node = Node::from_parts(Box::new(up), 130, chain);
+
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let body = br#"{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber"}"#;
+    for attempt in 1..=3 {
+        assert!(
+            node.dispatch_caught(body).is_err(),
+            "attempt {attempt} should report a caught panic, not unwind"
+        );
+    }
+    std::panic::set_hook(prev);
+
+    assert!(
+        node.metrics_text()
+            .contains("helios_bsc_request_panics_total 3"),
+        "every caught panic must be countable: {}",
+        node.metrics_text()
+    );
+}
+
+/// The caught panic is reported as JSON-RPC "Internal error", not as a bad request: the
+/// request was well-formed and the failure is ours.
+#[test]
+fn a_caught_panic_is_internal_error_not_invalid_request() {
+    assert_eq!(helios_bsc_rpc::ERR_INTERNAL, -32603);
 }
