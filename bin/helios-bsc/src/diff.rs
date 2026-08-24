@@ -11,6 +11,13 @@ use helios_bsc_types::{decode_hex_fixed, SafeHead};
 use std::collections::HashSet;
 
 /// Demo Slice soak set (≥10). Same list as `scripts/soak_vs_oracle.py`.
+///
+/// Every entry is a **BSC mainnet** address. The token names are symbols, not chains:
+/// `PegETH` and `BTCB` are Binance-Peg contracts deployed on BSC (`name()` returns
+/// "Ethereum Token" / "BTCB Token"), and `USDT` / `USDC` / `DAI` are likewise the
+/// Binance-Peg issues. The rest is BSC-native either way: PancakeSwap, Venus, and the
+/// Parlia system contracts at `0x…1000` ValidatorSet, `0x…1001` Slash, `0x…1002`
+/// SystemReward and `0x…1004` TokenHub.
 pub const SOAK_ADDRESSES: &[(&str, &str)] = &[
     ("WBNB", "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"),
     ("USDT", "0x55d398326f99059fF775485246999027B3197955"),
@@ -36,7 +43,9 @@ pub const SOAK_ADDRESSES: &[(&str, &str)] = &[
     ),
     ("BinanceHot", "0xe2fc31F816A9b94326492132018C3aEcC4a93aE1"),
     ("TokenHub", "0x0000000000000000000000000000000000001004"),
-    ("ETH", "0x2170Ed0880ac9A755fd29B2688956BD959F933F8"),
+    // Binance-Peg "Ethereum Token" on BSC — a BEP-20 with the symbol ETH, not the
+    // Ethereum chain. Labelled `PegETH` so a soak log cannot be read as cross-chain.
+    ("PegETH", "0x2170Ed0880ac9A755fd29B2688956BD959F933F8"),
     ("DAI", "0x1AF3F329e8BE154074D8769D1FFa4eE058B1DBc3"),
     ("XVS", "0xcF6BB5389c92Bdda8a3747Ddb454cB7a64626C63"),
     ("BTCB", "0x7130d2A12B9BCbFAe4f2634d864A1Ee1Ce3Ead9c"),
@@ -136,7 +145,8 @@ pub enum DiffOutcome {
     SkipOracle(String),
 }
 
-/// `totalSupply()` — `keccak256("totalSupply()")[..4]`.
+/// `totalSupply()` — `keccak256("totalSupply()")[..4]`, the same selector under BEP-20
+/// as under ERC-20.
 ///
 /// The one cross-check worth running blind: it is a zero-argument view whose answer is a
 /// pure function of verified state, so local and oracle must agree byte for byte at the
@@ -144,13 +154,16 @@ pub enum DiffOutcome {
 /// block context would compare two different instants.
 pub const TOTAL_SUPPLY_SELECTOR: [u8; 4] = [0x18, 0x16, 0x0d, 0xdd];
 
-/// Addresses that answer `totalSupply()` — the ERC-20s in [`SOAK_ADDRESSES`].
+/// Addresses that answer `totalSupply()` — the BEP-20s in [`SOAK_ADDRESSES`].
+///
+/// BEP-20 is ERC-20 plus optional extras, and BSC runs an EVM, so the selector above is
+/// byte-identical on both. The local name is the right one to use here.
 ///
 /// Deliberately a short allow-list rather than "try it everywhere": a router or an EOA
 /// reverts, and a soak that logged expected reverts would train its reader to ignore the
 /// column that is supposed to mean something.
 pub fn call_probe(addr: &str) -> Option<[u8; 4]> {
-    const ERC20: &[&str] = &[
+    const BEP20: &[&str] = &[
         "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", // WBNB
         "0x55d398326f99059ff775485246999027b3197955", // USDT
         "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d", // USDC
@@ -159,9 +172,9 @@ pub fn call_probe(addr: &str) -> Option<[u8; 4]> {
         "0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3", // DAI
         "0xcf6bb5389c92bdda8a3747ddb454cb7a64626c63", // XVS
         "0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c", // BTCB
-        "0x2170ed0880ac9a755fd29b2688956bd959f933f8", // ETH
+        "0x2170ed0880ac9a755fd29b2688956bd959f933f8", // Binance-Peg ETH
     ];
-    ERC20
+    BEP20
         .contains(&addr_key(addr).as_str())
         .then_some(TOTAL_SUPPLY_SELECTOR)
 }
