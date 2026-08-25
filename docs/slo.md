@@ -1,4 +1,4 @@
-# Operator SLOs (MVP-1)
+# Operator SLOs
 
 These are **operator freshness bounds**, not protocol constants. Confirmation-depth Safe is still **15 distinct subsequent sealers**; a lag above the in-turn upper bound does not make a 15-sealer head un-Safe.
 
@@ -8,12 +8,16 @@ These are **operator freshness bounds**, not protocol constants. Confirmation-de
 | Checkpoint warn | **6h** | stderr + `doctor` `slo=warn` |
 | Safe lag (in-turn upper) | **120** blocks / **~54s** (`15 × turnLength=8 × 450ms`) | `syncStatus.expectedSafeLagBlocks` / `safeLagWithinBound` |
 | Live Safe lag | **~108–112** blocks / **~48–50s** | measured, not a gate |
-| Proof window | **112** blocks (Ankr free) | fail-closed if Safe lag > window |
+| Proof window | **112** blocks on confirmation depth; **~3** on the default fast-finality head | fail-closed if lag > window |
 | Sync catch-up | checkpoint ≤ `--max-sync` (16000, ~2 h) behind tip | fail-closed; refresh the file. `--lookback` 130 is the no-checkpoint Safe window only. |
 
 `helios-bsc doctor` labels `checkpoint.json` `slo=ok|warn|fail` from age only (never prints keys or the sealing-set list). `helios_bsc_syncStatus.safeLagWithinBound` is `true` when `lag ≤ 120`. Serving continues if lag is higher but 15 sealers exist — that is a valid out-of-turn stretch, not a protocol failure.
 
-Wallet mode still maps `latest` → Safe. Do not alert “head is stale” merely because Safe is ~1 minute behind tip.
+**Which head these bounds describe.** Since 2026-08-25 `latest` resolves to the
+BLS-finalized head (~2 blocks, ~1 s) by default. The Safe bounds in the table above
+describe the **confirmation-depth** head — what `--finality confirmation-depth` pins, and
+what the client falls back to when it has no BLS vote keys. On that path, do not alert
+“head is stale” merely because Safe is ~1 minute behind tip: that is the rule working.
 
 ## Prometheus metrics (opt-in)
 
@@ -52,9 +56,10 @@ checkpoint carries no BLS vote keys (see [checkpointing.md](./checkpointing.md))
 
 `helios_bsc_finalized_lag_blocks` is 2 in steady state. That is the observed norm over
 120 consecutive mainnet blocks, not a proven bound — alert on a sustained rise, not on a
-single sample. Note the confirmation-depth `safe*` gauges keep their own meaning and no
-block tag resolves to the finalized head yet, so this gauge is currently observability
-rather than something a wallet read depends on. See
+single sample. The confirmation-depth `safe*` gauges keep their own
+separate meaning. Since 2026-08-25 block tags **do** resolve to the finalized head by
+default, so this gauge is no longer only observability — a sustained rise moves what every
+wallet read is served from, until the client falls back to confirmation depth. See
 [fast-finality.md](./fast-finality.md).
 
 **Measure the lag against `finalityHead`, not against `tip`.** `helios_bsc_syncStatus`

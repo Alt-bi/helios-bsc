@@ -8,25 +8,34 @@ The sealing set is **operator-supplied**. The client never builds it from miners
 
 ## Commands
 
+Every command below needs an upstream. `--upstream` is shown explicitly; it also reads
+`HELIOS_BSC_UPSTREAM`, and `--checkpoint-oracle` reads `HELIOS_BSC_CHECKPOINT_ORACLE`.
+
 ```bash
-# Create from a trusted header + explicit 21 addresses (never from recent miners)
-helios-bsc write-checkpoint --block 0x… --sealing-set 0xabc,0xdef,… --out checkpoint.json
+# The normal case: derive the sealing set, and have a second host confirm the header.
+# --sealing-set-from-epoch is optional — it is derived from --block when omitted.
+helios-bsc write-checkpoint   --upstream https://bsc-rpc.publicnode.com   --checkpoint-oracle https://bsc-dataseed.bnbchain.org   --block latest   --out checkpoint.json
 
-# Or take the set from an *activated* epoch extraData (the *next* set at that epoch).
-# Epoch E activates at E+87 (N=21,T=8). Checkpoint height must be ≥ that.
-helios-bsc write-checkpoint --block 0x… --sealing-set-from-epoch 0x… --out checkpoint.json
+# Operator-supplied set instead: explicit addresses, never inferred from recent miners.
+# This form carries no BLS vote keys, so the client starts at confirmation depth.
+helios-bsc write-checkpoint   --upstream https://bsc-rpc.publicnode.com   --block 0x… --sealing-set 0xabc,0xdef,…   --out checkpoint.json
 
-# Check file vs upstream (no 130-header walk)
-helios-bsc verify-checkpoint --checkpoint checkpoint.json
+# Pin the epoch by hand. Epoch E activates at E+87 (N=21, T=8); --block must be >= that.
+helios-bsc write-checkpoint   --upstream https://bsc-rpc.publicnode.com   --block 0x… --sealing-set-from-epoch 0x…   --out checkpoint.json
 
-# Second source must agree (different RPC host)
-helios-bsc verify-checkpoint --checkpoint checkpoint.json \
-  --require-multisource-checkpoint \
-  --checkpoint-oracle https://bsc-mainnet.public.blastapi.io
+# Check an existing file against upstream (no 130-header walk).
+helios-bsc verify-checkpoint   --upstream https://bsc-rpc.publicnode.com   --checkpoint checkpoint.json
 
-# Sync with membership + persist last-verified back to the file
-helios-bsc run --checkpoint checkpoint.json
+# Require a second, independent host to agree (must not be the same RPC).
+helios-bsc verify-checkpoint   --upstream https://bsc-rpc.publicnode.com   --checkpoint checkpoint.json   --require-multisource-checkpoint   --checkpoint-oracle https://bsc-dataseed.bnbchain.org
+
+# Sync with membership enforced; the last verified header is persisted back to the file.
+helios-bsc run   --upstream https://bsc-rpc.publicnode.com   --checkpoint checkpoint.json
 ```
+
+Confirming the checkpoint at the moment it is written is better than confirming it
+afterwards: every later check is relative to it, so a checkpoint two independent hosts
+disagree on is never written at all. Without an oracle the command warns and continues.
 
 `run` / `probe-safe` / `soak --checkpoint` walk `checkpoint.number+1 ..= tip` with ECDSA seal, parent-link, sealing-set membership, in-turn difficulty, and Bohr `SignRecently`. Tip more than `--max-sync` (default 16000, ~2 h) behind the file → fail-closed (refresh the checkpoint). `--lookback` (130) is only the no-checkpoint Safe window, not the restart budget. Recents start empty at the checkpoint (pre-checkpoint history is not inferred).
 
