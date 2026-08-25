@@ -38,8 +38,12 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             name: macos-arm64
+          # Cross-compiled from the arm64 runner rather than built on `macos-13`: that
+          # image has been retired, so the job queued indefinitely with no runner ever
+          # assigned — and because `release` needs every build, one stuck matrix entry
+          # meant no release at all. Apple's toolchain targets both arches from either.
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             name: macos-x86_64
           - target: x86_64-pc-windows-msvc
             os: windows-latest
@@ -88,7 +92,10 @@ jobs:
       - name: Smoke-test the artifact
         # A binary that cannot start is not a release. `info` touches the fork table and
         # the build metadata without needing an RPC endpoint, so it runs anywhere.
-        if: matrix.target != 'aarch64-apple-darwin'
+        #
+        # Skipped only where the runner cannot execute what it just built: the arm64
+        # macOS runner produces the x86_64 artifact by cross-compilation.
+        if: matrix.target != 'x86_64-apple-darwin'
         shell: bash
         run: |
           bin="target/${{ matrix.target }}/release/helios-bsc"
