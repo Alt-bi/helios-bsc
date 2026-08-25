@@ -25,7 +25,7 @@ pub use proof::{
     verify_eth_get_proof, verify_storage_slot, EthAccountProof, ProofError, StorageProofEntry,
     VerifiedAccount, MAX_CODE_SIZE, MAX_PROOF_NODES, MAX_PROOF_NODE_BYTES,
 };
-pub use raw_tx::{validate_bsc_raw_tx, RawTxError, MAX_RAW_TX};
+pub use raw_tx::{tx_to_address, validate_bsc_raw_tx, RawTxError, MAX_RAW_TX};
 pub use receipt_list::{verify_receipt_list, ReceiptListError};
 pub use receipt_rlp::{
     encode_consensus_receipt, ConsensusLog, ConsensusReceipt, ReceiptRlpError, MAX_LOG_TOPICS,

@@ -42,6 +42,9 @@ struct MockUpstream {
     /// When set, `send_raw_transaction` returns this hash instead of keccak(raw).
     lie_raw_hash: Option<String>,
     receipts: Vec<Value>,
+    /// Raw tx envelopes for `block_raw_transactions`. Empty is the trait default
+    /// (`TxBind::Omitted`), so a test must set this to exercise `transactionsRoot`.
+    raw_txs: Vec<Vec<u8>>,
     /// Upstream `eth_blockNumber` calls, shared with the test that wants to count them.
     block_number_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Name of a method that should panic instead of answering. `headers_range` panics
@@ -69,6 +72,7 @@ impl MockUpstream {
             code: Vec::new(),
             lie_raw_hash: None,
             receipts: Vec::new(),
+            raw_txs: Vec::new(),
             block_number_calls: std::sync::Arc::default(),
             panic_in: None,
         })
@@ -87,6 +91,7 @@ impl MockUpstream {
             code: Vec::new(),
             lie_raw_hash: None,
             receipts: Vec::new(),
+            raw_txs: Vec::new(),
             block_number_calls: std::sync::Arc::default(),
             panic_in: None,
         }
@@ -179,6 +184,10 @@ impl RpcUpstream for MockUpstream {
 
     fn block_receipts_json(&self, _block_hash: &str) -> Result<Vec<Value>> {
         Ok(self.receipts.clone())
+    }
+
+    fn block_raw_transactions(&self, _block_hash: &str) -> Result<Vec<Vec<u8>>> {
+        Ok(self.raw_txs.clone())
     }
 }
 
@@ -2470,6 +2479,147 @@ fn get_transaction_receipt_verified_without_flag() {
     assert_eq!(v["result"]["transactionHash"], json!(txh), "{v}");
     let blk = node.handle(&req("eth_getBlockReceipts", json!(["latest"])));
     assert_eq!(blk["result"].as_array().map(|a| a.len()), Some(1), "{blk}");
+}
+
+/// A receipt must belong to the transaction it names.
+///
+/// `receiptsRoot` proves what a receipt *says* and nothing about *which* transaction it
+/// belongs to. Serving receipt 1's consensus fields under transaction 0's hash produces a
+/// receipt that verifies perfectly and describes the wrong transaction — a wallet reading
+/// `status` would be told the wrong one succeeded. The position in the receipt list is the
+/// transaction index, so the hashes bound to `transactionsRoot` must agree by index.
+#[test]
+fn receipt_labelled_with_the_wrong_transaction_is_refused() {
+    let mut chain = distinct_sealer_chain(15);
+    let raw_txs: Vec<Vec<u8>> = vec![vec![0x02, 0xaa, 0xbb], vec![0x02, 0xcc, 0xdd]];
+    let tx_hashes: Vec<[u8; 32]> = raw_txs.iter().map(|r| keccak256(r)).collect();
+    let recs = [21_000u64, 42_000];
+    let raws: Vec<Vec<u8>> = recs
+        .iter()
+        .map(|c| {
+            encode_consensus_receipt(&ConsensusReceipt {
+                status: 1,
+                cumulative_gas_used: *c,
+                logs_bloom: [0u8; 256],
+                logs: Vec::new(),
+                tx_type: 2,
+            })
+            .unwrap()
+        })
+        .collect();
+    let mut hdr = header_from_verified(&chain[0], [0u8; 32]);
+    hdr.receipts_root = format!("0x{}", hex::encode(ordered_trie_root(&raws)));
+    hdr.transactions_root = format!("0x{}", hex::encode(ordered_trie_root(&raw_txs)));
+    let hash = header_hash(&hdr).unwrap();
+    hdr.hash = format!("0x{}", hex::encode(hash));
+    chain[0].hash = hash;
+    chain[0].header = Some(hdr.clone());
+
+    let receipt_json = |cum: u64, txh: &[u8; 32]| {
+        json!({
+            "status": "0x1",
+            "cumulativeGasUsed": format!("0x{cum:x}"),
+            "logsBloom": format!("0x{}", hex::encode([0u8; 256])),
+            "logs": [],
+            "type": "0x2",
+            "transactionHash": format!("0x{}", hex::encode(txh)),
+        })
+    };
+
+    // Honest pairing first: the same data must be served, so the refusal below is about
+    // the swap and not about the binding rejecting everything.
+    let mut ok_up = MockUpstream::for_chain(&chain, json!({}));
+    ok_up.raw_txs = raw_txs.clone();
+    ok_up.receipts = vec![
+        receipt_json(recs[0], &tx_hashes[0]),
+        receipt_json(recs[1], &tx_hashes[1]),
+    ];
+    let node = Node::from_parts(Box::new(ok_up), 130, chain.clone());
+    let ok = node.handle(&req("eth_getBlockReceipts", json!(["latest"])));
+    assert_eq!(ok["result"].as_array().map(Vec::len), Some(2), "{ok}");
+
+    // Now swap the labels. Every receipt still hashes into `receiptsRoot`.
+    let mut bad_up = MockUpstream::for_chain(&chain, json!({}));
+    bad_up.raw_txs = raw_txs;
+    bad_up.receipts = vec![
+        receipt_json(recs[0], &tx_hashes[1]),
+        receipt_json(recs[1], &tx_hashes[0]),
+    ];
+    let node = Node::from_parts(Box::new(bad_up), 130, chain);
+    let bad = node.handle(&req("eth_getBlockReceipts", json!(["latest"])));
+    assert_eq!(err_code(&bad), ERR_PROOF_FAILED, "{bad}");
+    assert!(
+        bad["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("transactionsRoot"),
+        "{bad}"
+    );
+}
+
+/// `gasUsed` is derived from the verified cumulative totals, never taken from upstream.
+///
+/// `receiptsRoot` binds `cumulativeGasUsed` but not `gasUsed`, so an upstream could hand a
+/// wallet any number it liked through a method labelled Verified. Here it lies about all
+/// three; the served values are the differences of the cumulative chain regardless.
+#[test]
+fn receipt_gas_used_is_derived_not_echoed() {
+    let mut chain = distinct_sealer_chain(15);
+    // 21000, then 29000, then 21000.
+    let cumulative = [21_000u64, 50_000, 71_000];
+    let expect = ["0x5208", "0x7148", "0x5208"];
+    let recs: Vec<ConsensusReceipt> = cumulative
+        .iter()
+        .map(|c| ConsensusReceipt {
+            status: 1,
+            cumulative_gas_used: *c,
+            logs_bloom: [0u8; 256],
+            logs: Vec::new(),
+            tx_type: 2,
+        })
+        .collect();
+    let raws: Vec<Vec<u8>> = recs
+        .iter()
+        .map(|r| encode_consensus_receipt(r).unwrap())
+        .collect();
+    let root = ordered_trie_root(&raws);
+    let mut hdr = header_from_verified(&chain[0], [0u8; 32]);
+    hdr.receipts_root = format!("0x{}", hex::encode(root));
+    let hash = header_hash(&hdr).unwrap();
+    hdr.hash = format!("0x{}", hex::encode(hash));
+    chain[0].hash = hash;
+    chain[0].header = Some(hdr.clone());
+
+    let mut up = MockUpstream::for_chain(&chain, json!({}));
+    up.receipts = cumulative
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            json!({
+                "status": "0x1",
+                "cumulativeGasUsed": format!("0x{c:x}"),
+                "logsBloom": format!("0x{}", hex::encode([0u8; 256])),
+                "logs": [],
+                "type": "0x2",
+                "transactionHash": format!("0x{}", format!("{:02x}", i + 1).repeat(32)),
+                // The lie: a plausible hex quantity that is not the real gas.
+                "gasUsed": "0xdeadbeef",
+            })
+        })
+        .collect();
+    let node = Node::from_parts(Box::new(up), 130, chain);
+    let blk = node.handle(&req("eth_getBlockReceipts", json!(["latest"])));
+    let arr = blk["result"].as_array().expect("receipts array");
+    assert_eq!(arr.len(), 3, "{blk}");
+    for (i, want) in expect.iter().enumerate() {
+        assert_eq!(
+            arr[i]["gasUsed"],
+            json!(want),
+            "receipt {i} must serve the derived gas, not the upstream's: {blk}"
+        );
+    }
+    // And the first receipt's gas is measured from zero, not from the previous block.
+    assert_eq!(arr[0]["gasUsed"], json!("0x5208"), "{blk}");
 }
 
 /// A 64-element batch is inside `MAX_RPC_BATCH`, and each element used to call

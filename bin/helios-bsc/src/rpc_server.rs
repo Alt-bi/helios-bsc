@@ -19,7 +19,7 @@ use helios_bsc_consensus::{
 };
 use helios_bsc_execution::{
     encode_consensus_receipt, encode_data32, encode_qty, eth_call_verified,
-    eth_estimate_gas_verified, pad32, retain_requested_storage, validate_bsc_raw_tx,
+    eth_estimate_gas_verified, pad32, retain_requested_storage, tx_to_address, validate_bsc_raw_tx,
     verify_account_code, verify_eth_get_proof, verify_receipt_list, verify_storage_slot,
     verify_tx_list, CallBlock, CallError, CallTx, ConsensusLog, ConsensusReceipt, EthAccountProof,
     ProofError, ProveAtSafe, VerifiedAccount, CALL_GAS_CAP, EMPTY_CODE_HASH, EMPTY_TRIE_ROOT,
@@ -1633,9 +1633,40 @@ impl Node {
         if raws.is_empty() {
             return Ok(TxBind::Omitted);
         }
+        let hashes = verify_tx_list(&raws, &root)
+            .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))?;
+        Ok(TxBind::List(hashes))
+    }
+
+    /// Verified tx hashes **and** the envelopes they were derived from.
+    ///
+    /// `bind_tx_hashes` drops the raw bytes once the root matches, which is all
+    /// `eth_getBlock*` needs. A receipt's `to` is a field of the envelope, so the receipt
+    /// path keeps them: once the list is bound to `transactionsRoot`, reading a field out
+    /// of it is reading verified data.
+    fn bind_tx_envelopes(
+        &self,
+        hdr: &RpcBlockHeader,
+    ) -> Result<Option<Vec<Vec<u8>>>, (i64, String)> {
+        let root = decode_hex_fixed::<32>(&hdr.transactions_root).map_err(|e| {
+            (
+                ERR_PROOF_FAILED,
+                format!("proof_verification_failed: transactionsRoot: {e}"),
+            )
+        })?;
+        if root == EMPTY_TRIE_ROOT {
+            return Ok(None);
+        }
+        let raws = self
+            .up
+            .block_raw_transactions(&hdr.hash)
+            .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))?;
+        if raws.is_empty() {
+            return Ok(None);
+        }
         verify_tx_list(&raws, &root)
-            .map(TxBind::List)
-            .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))
+            .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))?;
+        Ok(Some(raws))
     }
 
     fn bound_block_txs(&self, local: &VerifiedBlock) -> Result<BoundTxs, (i64, String)> {
@@ -1674,6 +1705,9 @@ impl Node {
         // Block-wide log index, the same counter `eth_getLogs` uses, so the two methods
         // cannot disagree about `logIndex` for the same block.
         let mut log_index: u64 = 0;
+        // Running total the derived `gasUsed` is taken against. Both counters are folded
+        // over the same ordered list the trie is built from, so neither can drift from it.
+        let mut prev_cumulative: u64 = 0;
         for (i, v) in jsons.iter().enumerate() {
             let parsed = parse_consensus_receipt_json(v).map_err(|e| {
                 (
@@ -1688,6 +1722,14 @@ impl Node {
                 )
             })?;
             raws.push(raw);
+            // Saturating because verification of the whole list happens below: a
+            // non-monotonic cumulative sequence cannot survive `verify_receipt_list`, so
+            // the clamped value can never reach a caller.
+            let gas_used = parsed
+                .consensus
+                .cumulative_gas_used
+                .saturating_sub(prev_cumulative);
+            prev_cumulative = parsed.consensus.cumulative_gas_used;
             let json = decorate_receipt_json(
                 v.clone(),
                 hdr,
@@ -1695,6 +1737,7 @@ impl Node {
                 parsed.tx_hash,
                 &parsed.consensus.logs,
                 log_index,
+                gas_used,
             );
             log_index = log_index.saturating_add(parsed.consensus.logs.len() as u64);
             items.push(BoundReceipt {
@@ -1705,6 +1748,52 @@ impl Node {
         }
         verify_receipt_list(&raws, &root)
             .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))?;
+        // `receiptsRoot` proves *what* each receipt says, never *which transaction it
+        // belongs to*. An upstream could serve receipt 5's consensus fields — which verify
+        // — while labelling them with transaction 2's hash, and a wallet would read a
+        // correctly-verified receipt for the wrong transaction. The position in this list
+        // is the transaction index, so binding the block's hashes to `transactionsRoot`
+        // and comparing by index closes that.
+        //
+        // `TxBind::Omitted` means the upstream declined the envelopes: the pairing is
+        // unprovable rather than wrong. Leave the label alone there instead of failing an
+        // otherwise verified read — `docs/rpc-matrix.md` records that this is conditional.
+        if let Some(envelopes) = self.bind_tx_envelopes(hdr)? {
+            for (i, item) in items.iter_mut().enumerate() {
+                let Some(envelope) = envelopes.get(i) else {
+                    return Err((
+                        ERR_PROOF_FAILED,
+                        "proof_verification_failed: more receipts than bound transactions".into(),
+                    ));
+                };
+                if let Some(claimed) = item.tx_hash {
+                    if keccak256(envelope) != claimed {
+                        return Err((
+                            ERR_PROOF_FAILED,
+                            format!(
+                                "proof_verification_failed: receipt {i}: transactionHash does not match transactionsRoot"
+                            ),
+                        ));
+                    }
+                }
+                // `to` is a field of an envelope now bound to the sealed root, so it can
+                // be read rather than believed. A decode failure cannot come from a lying
+                // upstream here — the list already hashed into `transactionsRoot` — so it
+                // would be a bug in this client: leave the echoed value rather than
+                // inventing a recipient.
+                if let Ok(to) = tx_to_address(envelope) {
+                    if let Value::Object(map) = &mut item.json {
+                        map.insert(
+                            "to".into(),
+                            match to {
+                                Some(a) => json!(format!("0x{}", hex::encode(a))),
+                                None => Value::Null,
+                            },
+                        );
+                    }
+                }
+            }
+        }
         Ok(ReceiptBind::List(items))
     }
 
@@ -3124,6 +3213,12 @@ struct ParsedReceipt {
 /// some other block or tx, and `eth_getBlockReceipts` (a *verified* method, no flag)
 /// echoed them straight to the wallet. Rebuild each log from the parsed consensus
 /// values plus the local header instead — the same shape `eth_getLogs` emits.
+///
+/// `gasUsed` is **derived**, not echoed. `receiptsRoot` binds `cumulativeGasUsed`, and a
+/// receipt's own gas is the difference between its cumulative total and the previous
+/// receipt's, so the value can be computed from consensus-verified data rather than taken
+/// on an upstream's word. It was previously only checked for being a hex quantity — which
+/// let a verified method hand a wallet any number at all.
 fn decorate_receipt_json(
     mut v: Value,
     hdr: &RpcBlockHeader,
@@ -3131,11 +3226,13 @@ fn decorate_receipt_json(
     tx_hash: Option<[u8; 32]>,
     logs: &[ConsensusLog],
     first_log_index: u64,
+    gas_used: u64,
 ) -> Value {
     if let Value::Object(map) = &mut v {
         map.insert("blockHash".into(), json!(hdr.hash.clone()));
         map.insert("blockNumber".into(), json!(hdr.number.clone()));
         map.insert("transactionIndex".into(), json!(format!("0x{index:x}")));
+        map.insert("gasUsed".into(), json!(format!("0x{gas_used:x}")));
         if let Some(h) = tx_hash {
             map.insert(
                 "transactionHash".into(),
@@ -3220,10 +3317,12 @@ fn parse_consensus_receipt_json(v: &Value) -> Result<ParsedReceipt, String> {
         Some(_) => return Err("transactionHash not a string".into()),
     };
     // `receiptsRoot` binds status / cumulativeGasUsed / logsBloom / type / logs and
-    // nothing else, so these five are echoed unverified. `docs/rpc-matrix.md` promises
-    // they are at least *structurally* validated; they were not, so an upstream could
-    // hand a wallet `"to": 12345` or a 4-byte `from` through a verified method.
-    // Same checks the passthrough path (`bind_mined_object`) already applies.
+    // nothing else. `gasUsed` is no longer among the echoed fields — it is recomputed from
+    // the verified cumulative totals in `decorate_receipt_json`; the check below only keeps
+    // a malformed value from reaching that point. The rest are still echoed, so they are at
+    // least *structurally* validated as `docs/rpc-matrix.md` promises: without this an
+    // upstream could hand a wallet `"to": 12345` or a 4-byte `from` through a verified
+    // method. Same checks the passthrough path (`bind_mined_object`) already applies.
     bind_optional_address(map.get("from"), "from", false)?;
     bind_optional_address(map.get("to"), "to", true)?;
     bind_optional_address(map.get("contractAddress"), "contractAddress", true)?;
