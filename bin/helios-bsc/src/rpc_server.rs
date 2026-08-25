@@ -362,6 +362,18 @@ impl Node {
         crate::sync::fast_finality_head(chain, snapshot, conf_safe)
     }
 
+    /// True when the snapshot carries the BLS vote keys `FinalityMode::Fast` needs.
+    ///
+    /// `read_head` falls back to confirmation depth without them, which is the safe
+    /// direction but a silent one — the caller uses this to say so at startup instead.
+    pub fn fast_finality_armed(&self) -> bool {
+        self.snapshot
+            .lock()
+            .expect("snapshot lock")
+            .as_ref()
+            .is_some_and(Snapshot::fast_finality_available)
+    }
+
     pub fn metrics_enabled(&self) -> bool {
         self.metrics_enabled
     }

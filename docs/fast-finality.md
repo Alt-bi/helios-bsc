@@ -155,7 +155,7 @@ python scripts/verify_attestations.py --rpc https://bsc-dataseed.bnbchain.org --
 | Justified / finalized tracking | `snapshot.rs` `justified()` / `finalized()` | **Done** |
 | Vote keys carried in the checkpoint | `helios-bsc-types`, `write-checkpoint --sealing-set-from-epoch` | **Done** |
 | Exposed on `helios_bsc_syncStatus` + `/metrics` | `bin/helios-bsc/src/rpc_server.rs` | **Done** |
-| `latest` / `safe` / `finalized` served from BLS finality | `run --finality fast` | **Done, opt-in.** Default is still confirmation depth. The ≥24h soak was the gate for flipping it and **passed 2026-08-24** (24.06 h, exit 0); flipping the default is the next step, not a done one. |
+| `latest` / `safe` / `finalized` served from BLS finality | `run` (default since 2026-08-25) | **Done, default.** The ≥24h soak that gated it passed 2026-08-24 (24.06 h, exit 0) and a 4 h soak on the shipped build followed (2871 comparisons, 0 mismatch, 99 `parlia_*` cross-checks). `--finality confirmation-depth` pins the old rule. |
 | Maxwell BEP-524 `recents` prune to the finalized head | `snapshot.rs` `prune_recents_to_finalized` | **Done** |
 | Justified / finalized cross-checked against geth | `soak --finality fast`, `diff_finality_one` | **Done** — compares this client's pair with `parlia_getJustifiedNumber` / `parlia_getFinalizedNumber` at the snapshot's own block. Everything above verifies the attestation path against itself; this is the only check that asks an independent geth whether the answer is right. The soak fails closed if it never produced a verdict, so the oracle must serve the `parlia_` namespace — most public BSC endpoints answer `-32601`. |
 

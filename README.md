@@ -116,9 +116,9 @@ python scripts/soak_vs_oracle.py --once
 1. **Phase 0** — **done** (hardfork pin, epoch fixtures, proof provider matrix)
 2. **Demo Slice** — **closed** (checkpoint → seals → Safe → verified `eth_getBalance`; 1h re-diff soak GATE PASS 2026-08-19: unique=19, compared=214, match=214, mismatch=0, skip=38)
 3. **MVP-1** — verified nonce/code/storageAt + unverified `eth_sendRawTransaction` **in tree**; the **≥24h soak GATE PASSED 2026-08-24** (24.06 h continuous, exit 0 — see STATUS.md for what that run did and did not cover). Header verification is now complete against the pinned v1.7.8 rules: out-of-turn backoff, Maxwell FF recents prune and `baseFeePerGas` all closed (BSC has no parent `baseFee` formula — `CalcBaseFee` returns a constant `0` on any Parlia chain).
-4. **MVP-2** — constrained `eth_call` + best-effort `eth_estimateGas` (proof-backed revm; never proxied). **Fast Finality (BLS) implemented** — vote attestations decoded and their aggregate BLS signature verified against the epoch vote keys; live mainnet finalized lag **2 blocks** vs 106–112 for confirmation depth ([docs/fast-finality.md](docs/fast-finality.md)). The `finalized` tag still resolves to the confirmation-depth Safe head; the ≥24h soak that gates moving it passed 2026-08-24, so that flip is the next implementation step.
+4. **MVP-2** — constrained `eth_call` + best-effort `eth_estimateGas` (proof-backed revm; never proxied). **Fast Finality (BLS) implemented** — vote attestations decoded and their aggregate BLS signature verified against the epoch vote keys; live mainnet finalized lag **2 blocks** vs 106–112 for confirmation depth ([docs/fast-finality.md](docs/fast-finality.md)). Since 2026-08-25 `latest` / `safe` / `finalized` resolve to the BLS-finalized head **by default** (`--finality confirmation-depth` pins the old rule), gated on the ≥24h soak that passed 2026-08-24.
 
-Honest calendar: **months** of part-time work, not a weekend. See design doc. Pasteur (2026-08-25) is scheduled, not live.
+Honest calendar: **months** of part-time work, not a weekend. See design doc. Pasteur went **live 2026-08-25**; the pin already covered it and it changed no Parlia rule.
 
 ## Deploy note
 

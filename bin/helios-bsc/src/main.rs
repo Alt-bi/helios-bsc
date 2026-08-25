@@ -140,11 +140,12 @@ enum Commands {
         metrics: bool,
         /// Which finality rule `latest` / `safe` / `finalized` resolve to.
         ///
-        /// `confirmation-depth` (default) is ~106–113 blocks behind the tip. `fast` uses
-        /// the BEP-126 BLS-finalized head, ~2 blocks behind, and falls back to
-        /// confirmation depth whenever no finalized head is known — for instance from a
-        /// checkpoint without BLS vote keys. Opt-in until the ≥24h soak covers it.
-        #[arg(long, value_enum, default_value_t = FinalityArg::ConfirmationDepth)]
+        /// `fast` (default since the ≥24h soak passed 2026-08-24) uses the BEP-126
+        /// BLS-finalized head, ~2 blocks behind the tip. It falls back to
+        /// `confirmation-depth` — ~106–113 blocks — whenever no finalized head is known,
+        /// for instance from a checkpoint carrying no BLS vote keys; the startup line
+        /// says which rule is actually in force. `confirmation-depth` pins the older one.
+        #[arg(long, value_enum, default_value_t = FinalityArg::Fast)]
         finality: FinalityArg,
     },
     /// Write a checkpoint JSON from a trusted header + operator sealing set.
@@ -340,13 +341,18 @@ async fn main() -> Result<()> {
                 node.set_metrics_enabled(true);
                 eprintln!("metrics on http://{listen}/metrics");
             }
-            if finality == FinalityArg::Fast {
-                node.set_finality_mode(FinalityMode::Fast);
-                eprintln!(
-                    "finality: fast (BEP-126 BLS); falls back to confirmation depth \
-                     when no finalized head is known"
-                );
-            }
+            node.set_finality_mode(match finality {
+                FinalityArg::Fast => FinalityMode::Fast,
+                FinalityArg::ConfirmationDepth => FinalityMode::ConfirmationDepth,
+            });
+            // Say which rule is in force, not which one was asked for. Fast falls back to
+            // confirmation depth without BLS vote keys — the safe direction, and until now
+            // a silent one: the operator saw `--finality fast` accepted and a ~110-block
+            // lag, with nothing on screen connecting the two.
+            eprintln!(
+                "{}",
+                finality_startup_line(finality, node.fast_finality_armed())
+            );
             rpc_server::serve(Arc::new(node), &listen)
         }
         Commands::WriteCheckpoint {
@@ -617,6 +623,29 @@ fn parse_sealing_set(s: &str) -> Result<Vec<String>> {
         decode_hex_fixed::<20>(a).with_context(|| format!("sealing-set address {a}"))?;
     }
     Ok(set)
+}
+
+/// What `run` prints about finality at startup.
+///
+/// Three outcomes, not two: asking for fast and getting it is a different fact from
+/// asking for fast and reading at confirmation depth anyway because the checkpoint
+/// carries no BLS vote keys. The fallback stays — a deeper head is never the unsafe
+/// answer — but it is named rather than inferred from a lag gauge.
+fn finality_startup_line(arg: FinalityArg, armed: bool) -> String {
+    match (arg, armed) {
+        (FinalityArg::Fast, true) => {
+            "finality: fast (BEP-126 BLS finalized head, ~2 blocks behind the tip)".into()
+        }
+        (FinalityArg::Fast, false) => concat!(
+            "finality: confirmation-depth (~106-113 blocks) — fast is selected but this ",
+            "checkpoint carries no BLS vote keys, so there is no finalized head to read at. ",
+            "Write one with `write-checkpoint --sealing-set-from-epoch` to arm it."
+        )
+        .into(),
+        (FinalityArg::ConfirmationDepth, _) => {
+            "finality: confirmation-depth (~106-113 blocks behind the tip)".into()
+        }
+    }
 }
 
 fn fetch_header(up: &Upstream, block: &str) -> Result<RpcBlockHeader> {
@@ -1612,4 +1641,82 @@ fn verify_checkpoint(
     }
     println!("GATE:         PASS");
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// The operator-facing default, flipped once the >=24h soak covered it. Pinned here
+    /// because it is the one setting that changes what every wallet read resolves to, and
+    /// a silent revert would look exactly like a slow provider.
+    #[test]
+    fn run_defaults_to_fast_finality() {
+        let cli = Cli::try_parse_from(["helios-bsc", "run", "--upstream", "https://a.example"])
+            .expect("run parses without --finality");
+        match cli.cmd {
+            Commands::Run { finality, .. } => assert_eq!(finality, FinalityArg::Fast),
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    /// The soak keeps the older default on purpose: its fast mode additionally requires an
+    /// oracle serving the `parlia_` namespace and fails closed without one, and most
+    /// public BSC endpoints answer -32601. Defaulting a test harness to a hard failure
+    /// helps nobody.
+    #[test]
+    fn soak_still_defaults_to_confirmation_depth() {
+        let cli = Cli::try_parse_from([
+            "helios-bsc",
+            "soak",
+            "--upstream",
+            "https://a.example",
+            "--oracle",
+            "https://b.example",
+        ])
+        .expect("soak parses");
+        match cli.cmd {
+            Commands::Soak { finality, .. } => {
+                assert_eq!(finality, FinalityArg::ConfirmationDepth)
+            }
+            other => panic!("expected Soak, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    /// Asking for fast and getting it, versus asking for fast and reading at confirmation
+    /// depth anyway, must not print the same line.
+    #[test]
+    fn the_startup_line_names_the_rule_in_force_not_the_one_requested() {
+        let armed = finality_startup_line(FinalityArg::Fast, true);
+        assert!(armed.contains("fast"), "{armed}");
+        assert!(armed.contains("~2 blocks"), "{armed}");
+
+        let unarmed = finality_startup_line(FinalityArg::Fast, false);
+        assert!(
+            unarmed.starts_with("finality: confirmation-depth"),
+            "an unarmed fast run reads at confirmation depth and must say so: {unarmed}"
+        );
+        assert!(
+            unarmed.contains("no BLS vote keys"),
+            "and must say why: {unarmed}"
+        );
+        assert!(
+            unarmed.contains("--sealing-set-from-epoch"),
+            "and how to fix it: {unarmed}"
+        );
+        assert_ne!(armed, unarmed);
+
+        let conf = finality_startup_line(FinalityArg::ConfirmationDepth, true);
+        assert!(conf.starts_with("finality: confirmation-depth"), "{conf}");
+        assert!(
+            !conf.contains("BLS vote keys"),
+            "a deliberate choice is not a fallback: {conf}"
+        );
+    }
 }
