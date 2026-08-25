@@ -23,4 +23,4 @@ CI runs the same (`cargo fmt --all -- --check`). Toolchain is stable (`rust-tool
 - Do not weaken Safe = **15** distinct subsequent sealers (`floor(2N/3)+1`). A shallow `eth_getProof` window is a provider issue — swap the RPC, do not change consensus.
 - `eth_call` / `eth_estimateGas` must stay **proof-backed revm** (Safe-only iterative `eth_getProof`; unproven SLOAD/account → `-32001`). Never proxy upstream `eth_call` or `eth_estimateGas`. `eth_estimateGas` is labeled **best-effort** (gas is not consensus) but MethodPolicy is **Verified**.
 
-See [`docs/design.md`](docs/design.md), [`docs/rpc-matrix.md`](docs/rpc-matrix.md), [`docs/threat-model.md`](docs/threat-model.md).
+Documentation index: [`docs/README.md`](docs/README.md). Start with [`docs/design.md`](docs/design.md), [`docs/rpc-matrix.md`](docs/rpc-matrix.md) and [`docs/threat-model.md`](docs/threat-model.md).

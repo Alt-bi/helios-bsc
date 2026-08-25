@@ -496,8 +496,7 @@ fn print_info() -> Result<()> {
         "unverified:   run --allow-unverified-passthrough  (receipts header-bound to Safe; gasPrice unbound)"
     );
     println!("doctor:       helios-bsc doctor  (env hosts, no keys)");
-    println!("design:       docs/design.md");
-    println!("phase0:       docs/phase0-checklist.md");
+    println!("docs:         docs/README.md  (start here: docs/quickstart.md)");
     Ok(())
 }
 
