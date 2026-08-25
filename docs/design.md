@@ -119,13 +119,13 @@ Honest conclusion: **execution-proof reuse is high; consensus path is a new Parl
 ### MVP-1 DoD
 
 - [x] All Demo Slice criteria, plus verified nonce/code/storageAt; `eth_sendRawTransaction` labeled unverified; unsupported methods hard-error by default.
-- [ ] Mainnet differential soak **≥24h** with zero proof false-accepts; oracle **independent** of the sole upstream used for proofs/headers (second RPC, explorer API, or second Alt F). 1h re-diff 2026-08-19 GATE PASS (Ankr vs BlastAPI: unique=19, compared=214, match=214, mismatch=0, skip=38 — Ankr window, not false-accept). **24h remains the GA live gate.**
+- [x] Mainnet differential soak **≥24h** with zero proof false-accepts; oracle **independent** of the sole upstream used for proofs/headers. **PASSED 2026-08-24**: 24.06 h continuous, exit 0 (blastapi proofs, publicnode oracle). That run's closing counters were not retained and it predated the `parlia_*` cross-check — see STATUS.md — so a 4 h soak on the shipped build followed it: `compared=2871 match=2871 mismatch=0 skip=4`, sub-checks `balance/nonce/slot0=1881 eth_call=891 parlia_finality=99`. Earlier 1h re-diff 2026-08-19 GATE PASS (Ankr vs BlastAPI: 19 unique / 214 compared / 0 mismatch).
 - [x] Checkpoint age / sync lag SLOs documented (`docs/slo.md`) and wired on `doctor` / `syncStatus` under default freshness policy (24h checkpoint age; Safe lag bound 120). 24h soak is a separate gate.
 - [x] Docs: threat model (`docs/threat-model.md`), RPC matrix (`docs/rpc-matrix.md`), checkpointing (`docs/checkpointing.md`), incident stub for proof-fail storms (`docs/runbooks/proof-fail-storm.md`).
 
 ### MVP-2 DoD (optional track)
 
-- [x] FF verification gated on **data, not a build flag**: it engages only once BLS vote keys are known (checkpoint `--sealing-set-from-epoch`, or an ingested epoch header); without them the client stays on confirmation depth and never guesses a key. Verifies the real signatures on five mainnet fixture headers, and ran live 2026-08-21 (`finality=fast-finality`, `finalizedLagBlocks=2`). Block tags still resolve to the confirmation-depth Safe head **by default**; `run --finality fast` opts into serving them from the BLS-finalized head and stays opt-in until the ≥24h soak covers it. See [fast-finality.md](./fast-finality.md).
+- [x] FF verification gated on **data, not a build flag**: it engages only once BLS vote keys are known (checkpoint `--sealing-set-from-epoch`, or an ingested epoch header); without them the client stays on confirmation depth and never guesses a key. Verifies the real signatures on five mainnet fixture headers, and ran live 2026-08-21 (`finality=fast-finality`, `finalizedLagBlocks=2`). Block tags resolved to the confirmation-depth Safe head by default until the ≥24h soak covered it; since **2026-08-25** they resolve to the BLS-finalized head, with `--finality confirmation-depth` pinning the old rule and an unarmed client falling back to it and saying so. See [fast-finality.md](./fast-finality.md).
 - [x] Constrained `eth_call` with gas/proof budgets; estimateGas explicitly best-effort.
 
 ---
@@ -727,7 +727,7 @@ Prefer a dedicated spare volume or small VPS for any Alt F full/fast node. Avoid
 3. **Execution trust via `eth_getProof` + verified `stateRoot`** — Same Helios execution thesis; provider matrix is a **GA/Phase 0 gate**.
 4. **Weak subjectivity checkpoints with multisource UX** — Unavoidable without Portal.
 5. **Default fail-closed RPC** — MetaMask-compatible via hard errors; TrustClass via meta APIs only.
-6. **Finality (amended):** **MVP-1 default = confirmation-depth over sealing set** with `min_distinct_sealers = floor(2×N_seal/3)+1` (=**15** for N_seal=**21**). **Live pins (`STATUS.md`):** turnLength=**8**, proof window **112**, Safe lag **~106–112** (~50s @ 0.45s). Historical example: ~1–2 min @ turnLength≈16. Fast Finality (`ceil(2×N_vote/3)` = **14 of 21** / BEP-126) is **implemented and verified** — the vote data question is closed, since the attestation rides in the sealed header on ordinary public RPC. Verification engages whenever vote keys are known, and is **additive**: it is reported on `helios_bsc_syncStatus` / `/metrics` (measured finalized lag **2 blocks**, an observed norm, not a bound), while the `safe` / `finalized` / `latest` tags still resolve to the confirmation-depth Safe head **by default**. `run --finality fast` opts the tags into BLS finality; off by default until the ≥24h soak covers it. **Default wallet mode:** proof-backed `latest` maps to Safe. `--allow-unsafe-head-reads` is **not implemented**.
+6. **Finality (amended again 2026-08-25):** the served default is now the **BEP-126 BLS-finalized head** (~2 blocks); **confirmation-depth over sealing set** remains the fallback and the `--finality confirmation-depth` option, with `min_distinct_sealers = floor(2×N_seal/3)+1` (=**15** for N_seal=**21**). **Live pins (`STATUS.md`):** turnLength=**8**, proof window **112**, Safe lag **~106–112** (~50s @ 0.45s). Historical example: ~1–2 min @ turnLength≈16. Fast Finality (`ceil(2×N_vote/3)` = **14 of 21** / BEP-126) is **implemented and verified** — the vote data question is closed, since the attestation rides in the sealed header on ordinary public RPC. Verification engages whenever vote keys are known, and is **additive**: it is reported on `helios_bsc_syncStatus` / `/metrics` (measured finalized lag **2 blocks**, an observed norm, not a bound), while the `safe` / `finalized` / `latest` tags still resolve to the confirmation-depth Safe head **by default**. `run --finality fast` opts the tags into BLS finality; off by default until the ≥24h soak covers it. **Default wallet mode:** proof-backed `latest` maps to Safe. `--allow-unsafe-head-reads` is **not implemented**.
 7. **~0 durable storage** — Checkpoint + `last_safe` + ephemeral cache; compatible with BTC IBD host sharing.
 8. **Apache-2.0 OR MIT dual license** — Community/wallet adoption.
 9. **SOL / opBNB / Portal deferred** — Keep MVP coherent.
@@ -788,12 +788,12 @@ Incremental, independently reviewable PRs. Rough **engineer-days** assume one pr
 
 ### Phase 0 exit checklist (must pass before PR 4+)
 
-- [ ] Hardfork parameter table merged (PR 3b) pinned to `bnb-chain/bsc` commit.
-- [ ] Modern mainnet fixtures across **epochLength=1000** boundary (PR 3).
-- [ ] `docs/proof-provider-matrix.md` has ≥1 reproducible **hash/number or Alt F** proof path (+ mutated fail case). Tag-only alone = **gate fail**.
-- [ ] If public hash/number unavailable: Alt F node provisioned as untrusted data plane (still not soak-oracle-only).
+- [x] Hardfork parameter table merged (PR 3b) pinned to `bnb-chain/bsc` commit — `docs/hardfork-table.md`, tag **v1.7.8** / `cdb7548b5baa…`.
+- [x] Modern mainnet fixtures across **epochLength=1000** boundary (PR 3) — epoch 116664000 ±2 plus the two epoch boundaries below it (116663000, 116662000) that bootstrap reads. All verified against the live chain by `scripts/verify_fixtures.py`.
+- [x] `docs/proof-provider-matrix.md` has ≥1 reproducible **hash/number** proof path (+ mutated fail case). Tag-only providers are recorded as failing at any lag.
+- [x] ~~If public hash/number unavailable: Alt F node provisioned~~ — **not required.** Public hash/number proofs are available: at the BLS-finalized head the window is ~2 blocks rather than ~112, which the free keyless `bsc-mainnet.public.blastapi.io` clears. Recorded as the condition it was: it never triggered.
 - [x] FF RPC availability recorded — **pass**: the attestation is inside sealed `extraData`, so public RPC suffices. PR 7 scheduled and landed ([fast-finality.md](./fast-finality.md)).
-- [ ] `docs/consensus-appendix.md` stub with `parlia.go` function pointers.
+- [x] `docs/consensus-appendix.md` with `parlia.go` / `snapshot.go` function pointers.
 
 ### PR 1 — Repository scaffold & license (~2 d)
 
