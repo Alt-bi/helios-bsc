@@ -42,3 +42,28 @@ Refresh:
 ```bash
 python scripts/capture_headers.py --rpc URL --from-block 116663998 --count 5 --out fixtures/mainnet/
 ```
+
+## `txs_sender.json` — signed envelopes, one per EIP-2718 type
+
+Five real mainnet transactions captured **2026-08-25**, covering types `0x0`, `0x01`,
+`0x02`, `0x03` and `0x04`, each with the `from` the chain's own RPC reports for it.
+
+They back `sender_recovery_matches_the_chain_for_every_tx_type`. That test is the one
+that decides whether a receipt's `from` can be derived at all: a signing hash that is
+subtly wrong does not fail loudly, it recovers a **different, well-formed address**. Only
+real envelopes signed by real wallets can catch that, so a synthetic fixture would not
+do — and the sender has to come from the chain, not from this client.
+
+A companion test flips one byte in the middle of an envelope and requires the recovered
+address to move, so a recovery that quietly ignored part of the preimage cannot pass
+either.
+
+Refresh (any block with the five types present):
+
+```bash
+python - <<'EOF'
+# eth_getBlockByNumber(n, true) for `from` and `type`, then
+# eth_getRawTransactionByHash(hash) for the envelope. Send a User-Agent.
+EOF
+```
+

@@ -28,7 +28,7 @@ Organised by what you came here to do.
 | [consensus-appendix.md](consensus-appendix.md) | Normative pins into geth's `parlia.go` / `snapshot.go`, with pseudo-code |
 | [hardfork-table.md](hardfork-table.md) | Fork schedule and Parlia constants, pinned to a `bnb-chain/bsc` commit |
 | [proof-provider-matrix.md](proof-provider-matrix.md) | Which RPC providers can actually serve `eth_getProof`, measured |
-| [../fixtures/mainnet/README.md](../fixtures/mainnet/README.md) | The pinned mainnet headers the test suite runs against, and how to capture more |
+| [../fixtures/mainnet/README.md](../fixtures/mainnet/README.md) | The pinned mainnet headers and signed envelopes the test suite runs against, and how to capture more |
 
 | [engineering-log.md](engineering-log.md) | How each non-obvious item was found, closed and checked — the maintainer's record |
 
