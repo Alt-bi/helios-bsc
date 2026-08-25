@@ -351,7 +351,7 @@ For each new header `H` extending the verified chain:
      estimate's cap run + binary search).
    - Unproven SLOAD/account → `-32001` (fail-closed, **not** zero).
    - Never proxy upstream `eth_call` or `eth_estimateGas`.
-   - `eth_estimateGas` is **best-effort** (gas is not consensus): geth/reth binary search over `TX_GAS..=min(user, 50M, block.gasLimit)`, not a single `gas_used`. MethodPolicy **Verified**.
+   - `eth_estimateGas` is **best-effort** (gas is not consensus): geth/reth binary search over `TX_GAS..=` the same cap as `eth_call` (from Osaka, EIP-7825's 16,777,216), not a single `gas_used`. MethodPolicy **Verified**.
 4. **Provider capability (Phase 0 exit criterion — blocking for PR 9):**
 
 #### Phase 0 exit: `eth_getProof` provider matrix
