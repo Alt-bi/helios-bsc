@@ -1,0 +1,159 @@
+name: release
+
+# Build binaries on a `v*` tag and attach them to a GitHub Release.
+#
+# Until this existed, using helios-bsc meant cloning the repository, installing a Rust
+# toolchain and building it. That is a wall in front of everyone who is not already a
+# Rust developer, which is almost everyone the project is for.
+#
+# Only first-party actions plus the `gh` CLI. This client's whole argument is about not
+# trusting things you have not checked, so its release path does not pull third-party
+# actions that could rewrite what ships. `dtolnay/rust-toolchain` is the one exception,
+# pinned to the same action `ci.yml` already uses.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Static, so it runs on distributions older than the runner's glibc. This is
+          # the one most people want and the reason `musl-tools` is installed below —
+          # `blst` and `secp256k1` compile C, so the target needs a C toolchain too.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            name: linux-x86_64
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: linux-x86_64-gnu
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: macos-arm64
+          - target: x86_64-apple-darwin
+            os: macos-13
+            name: macos-x86_64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install musl toolchain
+        if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        # `--locked` so the artifact is built from the committed lockfile and not from
+        # whatever resolved that morning.
+        run: cargo build --release --locked -p helios-bsc --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          out="helios-bsc-${{ matrix.name }}"
+          mkdir -p "dist/$out"
+          cp "target/${{ matrix.target }}/release/helios-bsc" "dist/$out/"
+          cp README.md LICENSE-APACHE LICENSE-MIT "dist/$out/"
+          tar -C dist -czf "$out.tar.gz" "$out"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $out = "helios-bsc-${{ matrix.name }}"
+          New-Item -ItemType Directory -Force "dist/$out" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/helios-bsc.exe" "dist/$out/"
+          Copy-Item README.md, LICENSE-APACHE, LICENSE-MIT "dist/$out/"
+          Compress-Archive -Path "dist/$out" -DestinationPath "$out.zip"
+
+      - name: Smoke-test the artifact
+        # A binary that cannot start is not a release. `info` touches the fork table and
+        # the build metadata without needing an RPC endpoint, so it runs anywhere.
+        if: matrix.target != 'aarch64-apple-darwin'
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/helios-bsc"
+          [ "${{ runner.os }}" = "Windows" ] && bin="$bin.exe"
+          "$bin" info
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: helios-bsc-${{ matrix.name }}
+          path: |
+            *.tar.gz
+            *.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      # The only job that needs write, and only to attach files to its own tag.
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd artifacts
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          notes=$(mktemp)
+          {
+            echo "## What this is"
+            echo
+            echo "A trust-minimized local JSON-RPC for BNB Smart Chain. It answers wallet"
+            echo "reads from proofs it verified itself against Parlia consensus, so a lying"
+            echo "upstream RPC produces an error rather than a wrong balance."
+            echo
+            echo "**It is not a node.** It has no chain storage and no p2p; it sits in front"
+            echo "of an ordinary RPC endpoint and checks what that endpoint says. It serves"
+            echo "the wallet read surface — see \`docs/rpc-matrix.md\` for exactly what is"
+            echo "verified, what is passthrough, and what is refused."
+            echo
+            echo "Start here: [docs/quickstart.md](https://github.com/${GITHUB_REPOSITORY}/blob/${tag}/docs/quickstart.md)"
+            echo
+            echo "## Verify your download"
+            echo
+            echo '```bash'
+            echo "sha256sum -c SHA256SUMS --ignore-missing"
+            echo '```'
+          } > "$notes"
+          gh release create "$tag" \
+            --title "$tag" \
+            --notes-file "$notes" \
+            --verify-tag \
+            artifacts/*

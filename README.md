@@ -4,12 +4,20 @@
 
 Inspired by [a16z/helios](https://github.com/a16z/helios) for Ethereum. BSC has **no sync committees**; consensus is **Parlia** (ECDSA seals, epoch validator sets). This is a **greenfield** project (not a Helios fork).
 
+**New here? → [docs/quickstart.md](docs/quickstart.md)** — binary to a wallet reading verified balances, in three commands.
+
+```bash
+helios-bsc write-checkpoint --upstream https://bsc-rpc.publicnode.com --checkpoint-oracle https://bsc-dataseed.bnbchain.org --block latest --out checkpoint.json
+helios-bsc run --upstream https://bsc-rpc.publicnode.com --checkpoint checkpoint.json
+# then point MetaMask at http://127.0.0.1:8545 (chainId 56)
+```
+
 | | |
 |--|--|
-| **Status** | **Demo Slice closed.** 1h re-diff soak GATE PASS (2026-08-19). **24h soak** is still the MVP-1 GA live gate; the longest clean run so far is **13.9h** (compared=4129, mismatch=0), ended by the host, not by the client. |
+| **Status** | **MVP-1 gate passed.** The ≥24h differential soak passed 2026-08-24 (24.06 h, exit 0), followed by 4 h on the shipped build (2871 compared, 0 mismatch, 99 `parlia_*` cross-checks). Block tags serve the BLS-finalized head by default since 2026-08-25 — ~2 blocks behind the tip. A nightly soak now runs in CI. Not audited; see [threat model](docs/threat-model.md). |
 | **Repo** | https://github.com/Alt-bi/helios-bsc |
 | **License** | MIT OR Apache-2.0 |
-| **Design** | [docs/design.md](docs/design.md) · [RPC matrix](docs/rpc-matrix.md) · [wallet guide](docs/wallet-guide.md) · [checkpoints](docs/checkpointing.md) · [fast finality](docs/fast-finality.md) · [SLOs](docs/slo.md) · [threat model](docs/threat-model.md) |
+| **Design** | [quickstart](docs/quickstart.md) · [docs/design.md](docs/design.md) · [RPC matrix](docs/rpc-matrix.md) · [wallet guide](docs/wallet-guide.md) · [checkpoints](docs/checkpointing.md) · [fast finality](docs/fast-finality.md) · [SLOs](docs/slo.md) · [threat model](docs/threat-model.md) |
 | **Chain** | BSC mainnet (`chainId` 56) |
 
 ## Why
