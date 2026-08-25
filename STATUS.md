@@ -1,6 +1,8 @@
 # helios-bsc status
 
-**Updated:** 2026-08-24
+**Updated:** 2026-08-25 · **Released:** [v0.1.0](https://github.com/Alt-bi/helios-bsc/releases/tag/v0.1.0) (5 platforms, `SHA256SUMS`)
+
+This file is the engineering record — what closed, when, and how it was checked. For what the client does today start at [docs/quickstart.md](docs/quickstart.md); for what it verifies, [docs/rpc-matrix.md](docs/rpc-matrix.md).
 
 | Milestone | State |
 |-----------|--------|
@@ -29,7 +31,7 @@
 | Data-plane backup | **Done** — `--backup` / `HELIOS_BSC_BACKUP`: transport failover if the primary RPC errors. Both untrusted; seals/MPT still apply. Soak backup must not be the oracle host. |
 | Header.Hash() | **Done** — keccak256(RLP(header)) vs RPC `hash` on every sealed header (v1.7.8 `Header.Hash()` / `gen_header_rlp.go`). Re-fetch / persist / checkpoint match the computed hash, not the JSON field. |
 | Sync counters | **Done** — `syncStatus.proofOk` / `proofFail` / `headersVerified` (process lifetime). |
-| Demo Slice | **Vertical closed:** Safe=15, wallet `latest`→Safe, WBNB MPT, `verify-checkpoint` GATE PASS, soak **19 unique / 214 compared / 0 mismatch** vs BlastAPI over **≥1h** re-diff. Wallet guide: `docs/wallet-guide.md`. |
+| Demo Slice | **Vertical closed:** Safe=15, wallet `latest`→Safe, WBNB MPT, `verify-checkpoint` GATE PASS, soak **19 unique / 214 compared / 0 mismatch** vs BlastAPI over **≥1h** re-diff. Wallet guide: `docs/quickstart.md`. |
 | Operator doctor | **Done** — `helios-bsc doctor` prints RPC **hosts** only (no keys); Pasteur countdown; checkpoint age without the sealing-set list. |
 | `syncStatus` lag fields | **Done** — `safeLagBlocks` / `safeLagSeconds` + `finality=confirmation-depth` (Demo Slice DoD). |
 | Pasteur profile | **LIVE 2026-08-25** — activated at unix `1787625000` (02:30 UTC). The pin already contained it and `IsPasteur` appears in no `consensus/parlia/*.go` file, so no client change was needed and none was made. Confirmed on the live chain the same morning: `doctor` reports `live_fork: pasteur`, a checkpoint at 117956350 writes `forkId=pasteur` with vote keys, and a soak run entirely on post-Pasteur blocks matched an independent oracle **116/116, 0 mismatch, 4 parlia cross-checks, lag 2**. |

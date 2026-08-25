@@ -4,8 +4,8 @@
 |-------|-------|
 | **Document** | BSC Verified Local JSON-RPC (Parlia Light Client) |
 | **Author** | helios-bsc maintainers |
-| **Date** | 2026-08-21 |
-| **Status** | **Active** — Demo Slice closed; MVP-1 methods+docs in tree; 24h soak remains the GA live gate; MVP-2 constrained `eth_call` + best-effort `eth_estimateGas` in tree; **Fast Finality BLS verified** (`docs/fast-finality.md`) — block tags still serve the confirmation-depth Safe head by default (`run --finality fast` is opt-in, unsoaked) |
+| **Date** | 2026-08-25 |
+| **Status** | **Active** — MVP-1 and MVP-2 in tree; the ≥24 h soak passed 2026-08-24 and block tags serve the **BLS-finalized** head by default since 2026-08-25 (`run --finality confirmation-depth` pins the older rule). Current state: [STATUS.md](../STATUS.md) |
 | **Working name** | **helios-bsc** (crate/binary: `helios-bsc`) |
 | **License** | Dual Apache-2.0 OR MIT |
 | **Repo** | https://github.com/Alt-bi/helios-bsc |
@@ -345,7 +345,10 @@ For each new header `H` extending the verified chain:
 3. For `eth_call` / `eth_estimateGas` (**MVP-2**):
    - Safe only (`latest`→Safe); `to` + optional `data`; **no create**; **no state overrides**.
    - Helios-style iterative `eth_getProof` at Safe hash/number; execute in **revm** with proven state.
-   - Gas cap **50_000_000**; max **8** proof rounds (shared across an estimate's cap run + binary search).
+   - Gas cap `min(user, 50_000_000, block gasLimit)`, and from Osaka also EIP-7825's
+     `MAX_TX_GAS` = **16,777,216** — the chain's own per-transaction ceiling, which is
+     the one that binds on a live block. Max **8** proof rounds (shared across an
+     estimate's cap run + binary search).
    - Unproven SLOAD/account → `-32001` (fail-closed, **not** zero).
    - Never proxy upstream `eth_call` or `eth_estimateGas`.
    - `eth_estimateGas` is **best-effort** (gas is not consensus): geth/reth binary search over `TX_GAS..=min(user, 50M, block.gasLimit)`, not a single `gas_used`. MethodPolicy **Verified**.
@@ -932,3 +935,5 @@ _Rev 10 (2026-08-21): Local verified `BLOCKHASH` (in-window unknown fail-closed;
 _Rev 11 (2026-08-21): Fast Finality landed — BEP-126 vote attestations decoded from sealed `extraData` and their aggregate BLS signature verified (`blst`, min_pk, POP DST) against the epoch vote keys; quorum `ceil(2N/3)` = **14 of 21** (not the confirmation-depth 15); justified = the newest attestation's target, finalized = its source. The Phase 0 "is public RPC vote data verifiable?" gate is **closed — pass**: the attestation is inside the sealed header, so no full node / Alt F capture was required. Measured live: finalized lag **2 blocks** vs 106–112 for confirmation depth (constant over 120 consecutive headers in a healthy period — an observed norm, not a proven bound). Present-but-invalid attestation rejects the header; absent never does; no vote keys ⇒ confirmation depth and no guessing. Block tags **still resolve to the confirmation-depth Safe head by default**; `run --finality fast` is an opt-in switch that serves them from the BLS-finalized head when it is newer and locally verified, and falls back to confirmation depth otherwise — off by default until the ≥24h soak covers it. Maxwell FF `recents` prune also now implemented. 24h soak still the GA live gate. Pasteur 2026-08-25 is not live._
 
 _Rev 12 (2026-08-25): Review pass and the finality flip. Bootstrap now reads `turnLength` and any pending set switch back from the two epoch headers around the checkpoint — both were filled from the fork table, and both are wrong in ways that wedge the client on honest headers (`turnLength` is snapshot state geth reads from epoch `extraData`; a checkpoint whose offset in the epoch is below `minerHistoryCheckLen` misses a switch geth performs a few blocks later — 87 blocks in 1000). A checkpoint inside an activation window is **refused**, not seeded: adopting the announced set would import a future sealing set from an unverified header. The soak's `parlia_*` cross-check no longer marks a round done before knowing whether it ran, and `--finality fast` fails closed if it never produced a verdict. One shared `ureq::Agent` (59 connections for 59 requests → 3 for 55); `refresh()` coalesced to one upstream poll per block interval (a 64-element batch cost 64 upstream calls) with `eth_blockNumber` lifted out of the chain lock. A panicking request answers `-32603` instead of ending its worker thread. **Block tags now resolve to the BLS-finalized head by default**, gated on the ≥24h soak that passed 2026-08-24; without vote keys the fallback to confirmation depth stays, but the startup line names the rule in force and why. **Pasteur activated 2026-08-25 02:30 UTC** with no client change — verified the same morning on post-Pasteur blocks (116/116 vs an independent oracle, lag 2)._
+
+_Rev 13 (2026-08-25): Documentation pass. `wallet-guide.md` and `phase0-checklist.md` removed — the first duplicated `quickstart.md` and `rpc-matrix.md` and had drifted out of agreement with both; the second was a completed Phase 0 checklist whose durable content (the provider policy) lives in `proof-provider-matrix.md`. `docs/README.md` added as an index. Three claims were stale rather than merely repeated and are corrected wherever they appeared: the EVM no longer runs at a fixed `SpecId::CANCUN` (it follows the executing block's timestamp, so BLS12-381 at `0x0b..=0x11` is reachable and only `0x64..=0x69` / `0x0100` stay refused); the effective gas ceiling on a live block is EIP-7825's 16,777,216, not this client's 50,000,000; and BLS fast finality is the **default** head since 2026-08-25, not an unsoaked opt-in._
