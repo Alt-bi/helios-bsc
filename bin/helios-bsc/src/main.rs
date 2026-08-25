@@ -23,8 +23,9 @@ use helios_bsc_config::{
     PROVIDER_PROOF_LOOKBACK,
 };
 use helios_bsc_consensus::{
-    assert_checkpoint_age, checkpoint_at_snapshot, proof_lag, sealing_set_from_activated_epoch,
-    vote_keys_from_activated_epoch, within_proof_window, CHECKPOINT_WARN_AGE_SECS,
+    assert_checkpoint_age, checkpoint_at_snapshot, epoch_seed_at, proof_lag,
+    sealing_set_from_activated_epoch, vote_keys_from_activated_epoch, within_proof_window,
+    EpochSeed, CHECKPOINT_WARN_AGE_SECS,
 };
 use helios_bsc_execution::{verify_eth_get_proof, EthAccountProof};
 use helios_bsc_types::{decode_hex_fixed, decode_u64, Checkpoint, RpcBlockHeader};
@@ -139,11 +140,12 @@ enum Commands {
         metrics: bool,
         /// Which finality rule `latest` / `safe` / `finalized` resolve to.
         ///
-        /// `confirmation-depth` (default) is ~106–113 blocks behind the tip. `fast` uses
-        /// the BEP-126 BLS-finalized head, ~2 blocks behind, and falls back to
-        /// confirmation depth whenever no finalized head is known — for instance from a
-        /// checkpoint without BLS vote keys. Opt-in until the ≥24h soak covers it.
-        #[arg(long, value_enum, default_value_t = FinalityArg::ConfirmationDepth)]
+        /// `fast` (default since the ≥24h soak passed 2026-08-24) uses the BEP-126
+        /// BLS-finalized head, ~2 blocks behind the tip. It falls back to
+        /// `confirmation-depth` — ~106–113 blocks — whenever no finalized head is known,
+        /// for instance from a checkpoint carrying no BLS vote keys; the startup line
+        /// says which rule is actually in force. `confirmation-depth` pins the older one.
+        #[arg(long, value_enum, default_value_t = FinalityArg::Fast)]
         finality: FinalityArg,
     },
     /// Write a checkpoint JSON from a trusted header + operator sealing set.
@@ -339,13 +341,18 @@ async fn main() -> Result<()> {
                 node.set_metrics_enabled(true);
                 eprintln!("metrics on http://{listen}/metrics");
             }
-            if finality == FinalityArg::Fast {
-                node.set_finality_mode(FinalityMode::Fast);
-                eprintln!(
-                    "finality: fast (BEP-126 BLS); falls back to confirmation depth \
-                     when no finalized head is known"
-                );
-            }
+            node.set_finality_mode(match finality {
+                FinalityArg::Fast => FinalityMode::Fast,
+                FinalityArg::ConfirmationDepth => FinalityMode::ConfirmationDepth,
+            });
+            // Say which rule is in force, not which one was asked for. Fast falls back to
+            // confirmation depth without BLS vote keys — the safe direction, and until now
+            // a silent one: the operator saw `--finality fast` accepted and a ~110-block
+            // lag, with nothing on screen connecting the two.
+            eprintln!(
+                "{}",
+                finality_startup_line(finality, node.fast_finality_armed())
+            );
             rpc_server::serve(Arc::new(node), &listen)
         }
         Commands::WriteCheckpoint {
@@ -618,6 +625,29 @@ fn parse_sealing_set(s: &str) -> Result<Vec<String>> {
     Ok(set)
 }
 
+/// What `run` prints about finality at startup.
+///
+/// Three outcomes, not two: asking for fast and getting it is a different fact from
+/// asking for fast and reading at confirmation depth anyway because the checkpoint
+/// carries no BLS vote keys. The fallback stays — a deeper head is never the unsafe
+/// answer — but it is named rather than inferred from a lag gauge.
+fn finality_startup_line(arg: FinalityArg, armed: bool) -> String {
+    match (arg, armed) {
+        (FinalityArg::Fast, true) => {
+            "finality: fast (BEP-126 BLS finalized head, ~2 blocks behind the tip)".into()
+        }
+        (FinalityArg::Fast, false) => concat!(
+            "finality: confirmation-depth (~106-113 blocks) — fast is selected but this ",
+            "checkpoint carries no BLS vote keys, so there is no finalized head to read at. ",
+            "Write one with `write-checkpoint --sealing-set-from-epoch` to arm it."
+        )
+        .into(),
+        (FinalityArg::ConfirmationDepth, _) => {
+            "finality: confirmation-depth (~106-113 blocks behind the tip)".into()
+        }
+    }
+}
+
 fn fetch_header(up: &Upstream, block: &str) -> Result<RpcBlockHeader> {
     if block.eq_ignore_ascii_case("latest") {
         let n = up.block_number()?;
@@ -626,6 +656,37 @@ fn fetch_header(up: &Upstream, block: &str) -> Result<RpcBlockHeader> {
     let n = u64::from_str_radix(block.trim_start_matches("0x").trim_start_matches("0X"), 16)
         .context("block number")?;
     up.header_by_number(n)
+}
+
+/// Fail a checkpoint whose block sits between an epoch boundary and the height at which
+/// that epoch's sealing set takes effect.
+///
+/// `walk_from_checkpoint` refuses such a checkpoint because adopting the announced set
+/// would mean trusting an unverified header; catching it at write time turns a restart
+/// failure into an immediate one, with a block number the operator can use instead.
+fn assert_outside_activation_window(up: &Upstream, number: u64, epoch_length: u64) -> Result<()> {
+    if epoch_length == 0 {
+        return Ok(());
+    }
+    let epoch_block = (number / epoch_length) * epoch_length;
+    let Some(prev_block) = epoch_block.checked_sub(epoch_length) else {
+        return Ok(());
+    };
+    let epoch_header = fetch_header(up, &format!("0x{epoch_block:x}"))?;
+    let prev_header = fetch_header(up, &format!("0x{prev_block:x}"))?;
+    match epoch_seed_at(number, epoch_length, &epoch_header, &prev_header)? {
+        EpochSeed::Active { turn_length, .. } => {
+            println!("epoch     {epoch_block} active, turnLength={turn_length}");
+            Ok(())
+        }
+        EpochSeed::PendingActivation {
+            epoch_block,
+            activate_at,
+        } => bail!(
+            "block {number} is inside epoch {epoch_block}'s activation window (the set announced there takes effect at {activate_at}) — write the checkpoint at block {} instead",
+            epoch_block.saturating_sub(1)
+        ),
+    }
 }
 
 fn write_checkpoint(
@@ -669,6 +730,10 @@ fn write_checkpoint(
         None => cp,
     };
     cp.validate_basic()?;
+    // Refuse here what `walk_from_checkpoint` would refuse at run time, so the operator
+    // finds out while writing the file rather than at the next restart. Roughly one block
+    // in twelve falls in this window.
+    assert_outside_activation_window(&up, number, fork.epoch_length)?;
     write_checkpoint_file(out, &cp)?;
     println!(
         "wrote checkpoint {} hash={} n_seal={} fork={} fastFinality={}",
@@ -819,7 +884,8 @@ fn probe_safe(args: ProbeSafeArgs<'_>) -> Result<()> {
             safe.number
         );
         let mut done = HashSet::new();
-        let report = soak_until(
+        let mut report = SoakReport::default();
+        soak_until(
             up.as_ref(),
             &oracle,
             &addrs,
@@ -837,7 +903,13 @@ fn probe_safe(args: ProbeSafeArgs<'_>) -> Result<()> {
                 // same head so the two numbers cannot disagree.
                 fast_finality: false,
             },
-            &mut done,
+            SoakSink {
+                done: &mut done,
+                report: &mut report,
+                // probe-safe keeps no state file, so there is nothing to persist between
+                // bursts — the run is a one-shot diagnostic, not a duration gate.
+                persist: &mut |_, _| Ok(()),
+            },
         )?;
         println!(
             "diff:         compared={} match={} mismatch={} skip={} unique={}",
@@ -909,6 +981,54 @@ struct SoakReport {
     checked_finality: u32,
 }
 
+/// Everything a round writes to.
+///
+/// `persist` is called after every burst. A round runs for minutes; saving only when
+/// [`soak_until`] returns meant a crashed host lost the whole round, and a round that
+/// bailed saved nothing at all — `?` propagated straight past the caller's save. For a
+/// module whose entire purpose is surviving a dead host, one round was the wrong
+/// granularity.
+struct SoakSink<'a> {
+    done: &'a mut HashSet<String>,
+    report: &'a mut SoakReport,
+    persist: &'a mut dyn FnMut(&SoakReport, &HashSet<String>) -> Result<()>,
+}
+
+/// Write `base + round` to the soak state file, closing the open session at now.
+///
+/// Split out so the same accounting runs after every burst and again when the round
+/// ends, however it ends. A partial round is real soak time and real comparisons; losing
+/// them because the round did not finish is the overstatement's mirror image.
+fn persist_soak(
+    state: Option<&mut SoakState>,
+    path: Option<&std::path::Path>,
+    base: &DiffReport,
+    base_fast: u32,
+    round: &SoakReport,
+    done: &HashSet<String>,
+) -> Result<()> {
+    let (Some(st), Some(path)) = (state, path) else {
+        return Ok(());
+    };
+    st.compared = base.compared + round.compared;
+    st.matched = base.matched + round.matched;
+    st.mismatched = base.mismatched + round.mismatched;
+    st.skipped = base.skipped + round.skipped;
+    st.compared_at_fast = base_fast + round.compared_at_fast;
+    st.checked_balance = base.checked_balance + round.checked_balance;
+    st.checked_nonce = base.checked_nonce + round.checked_nonce;
+    st.checked_slot0 = base.checked_slot0 + round.checked_slot0;
+    st.checked_call = base.checked_call + round.checked_call;
+    st.checked_finality = base.checked_finality + round.checked_finality;
+    st.unique = {
+        let mut v: Vec<String> = done.iter().cloned().collect();
+        v.sort();
+        v
+    };
+    st.touch_session(now_unix());
+    st.save(path)
+}
+
 fn soak_until(
     up: &dyn RpcUpstream,
     oracle: &Upstream,
@@ -916,8 +1036,13 @@ fn soak_until(
     chain: &mut Vec<helios_bsc_consensus::VerifiedBlock>,
     mut snapshot: Option<&mut helios_bsc_consensus::Snapshot>,
     opts: SoakUntilOpts,
-    done: &mut HashSet<String>,
-) -> Result<SoakReport> {
+    sink: SoakSink<'_>,
+) -> Result<()> {
+    let SoakSink {
+        done,
+        report,
+        persist,
+    } = sink;
     let burst = opts.burst.max(1);
     let mut give_up: HashSet<String> = HashSet::new();
     let mut pending = if opts.visit_all {
@@ -930,11 +1055,14 @@ fn soak_until(
     } else {
         opts.min_unique as usize
     };
-    let mut report = SoakReport::default();
     let mut empty = 0u32;
     // Once per round, not per address: `parlia_*` is served by few providers and the
     // ones that do serve it throttle hard.
     let mut finality_checked = false;
+    // Bounded so an oracle that simply does not serve `parlia_*` costs a few lines per
+    // round rather than one per burst. The zero it leaves in `# CHECKED` is the signal.
+    let mut finality_attempts = 0u32;
+    const FINALITY_ATTEMPTS_PER_ROUND: u32 = 3;
     while !pending.is_empty() && done.len() < unique_cap {
         let (tip, safe) = match wait_until_in_window_with(
             up,
@@ -967,32 +1095,40 @@ fn soak_until(
             opts.fast_finality && safe_of(chain).is_ok_and(|conf| conf.number != safe.number);
         // Compare this client's BEP-126 heads with geth's own answer at the block our
         // snapshot is actually at -- the only direct coverage the attestation path gets.
-        if !finality_checked {
-            finality_checked = true;
-            if let Some(outcome) = snapshot.as_deref().and_then(|snap| {
+        //
+        // Once per round is the sampling rate, but "once" must mean one *verdict*, not
+        // one attempt. The snapshot has adopted no attestation yet for the first bursts
+        // after a bootstrap, and an oracle blip returns a skip; marking the round done on
+        // either of those buys a silent `parlia_finality=0` in the summary, which is the
+        // same fail-open shape the `# CHECKED` tally exists to expose.
+        if !finality_checked && finality_attempts < FINALITY_ATTEMPTS_PER_ROUND {
+            // `None` means the snapshot carries no attestation to compare, which costs no
+            // oracle call and so must not spend an attempt.
+            match snapshot.as_deref().and_then(|snap| {
                 snap.justified()
                     .zip(snap.finalized())
                     .and_then(|((j, _), (f, _))| {
                         diff_finality_one(oracle, snap.number, snap.hash, (j, f))
                     })
             }) {
-                match outcome {
-                    DiffOutcome::Match { local, remote, .. } => {
-                        report.compared += 1;
-                        report.matched += 1;
-                        report.checked_finality += 1;
-                        eprintln!(
-                            "  finality  local={local}  oracle={remote}  OK [parlia_finality]"
-                        );
-                    }
-                    DiffOutcome::Mismatch { local, remote } => {
-                        eprintln!("  finality  local={local}  oracle={remote}  MISMATCH");
-                        bail!("parlia finality mismatch (fail-closed)");
-                    }
-                    DiffOutcome::SkipProof(e) | DiffOutcome::SkipOracle(e) => {
-                        eprintln!("  finality  SKIP: {e}");
-                    }
+                Some(DiffOutcome::Match { local, remote, .. }) => {
+                    finality_checked = true;
+                    finality_attempts += 1;
+                    report.compared += 1;
+                    report.matched += 1;
+                    report.checked_finality += 1;
+                    eprintln!("  finality  local={local}  oracle={remote}  OK [parlia_finality]");
                 }
+                Some(DiffOutcome::Mismatch { local, remote }) => {
+                    eprintln!("  finality  local={local}  oracle={remote}  MISMATCH");
+                    bail!("parlia finality mismatch (fail-closed)");
+                }
+                Some(DiffOutcome::SkipProof(e) | DiffOutcome::SkipOracle(e)) => {
+                    finality_attempts += 1;
+                    let left = FINALITY_ATTEMPTS_PER_ROUND - finality_attempts;
+                    eprintln!("  finality  SKIP ({left} attempt(s) left this round): {e}");
+                }
+                None => {}
             }
         }
         let n = burst.min(pending.len());
@@ -1073,6 +1209,7 @@ fn soak_until(
                 }
             }
         }
+        persist(report, done)?;
         if opts.visit_all {
             pending = pending.split_off(n.min(pending.len()));
         } else {
@@ -1096,7 +1233,7 @@ fn soak_until(
         }
     }
     report.unique = done.len() as u32;
-    Ok(report)
+    Ok(())
 }
 
 fn soak(args: SoakArgs<'_>) -> Result<()> {
@@ -1302,24 +1439,37 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
         } else {
             args.min_unique
         };
-        let report = soak_until(
-            up.as_ref(),
-            &oracle,
-            &addrs,
-            &mut chain,
-            snap_hold.as_mut(),
-            SoakUntilOpts {
-                burst: args.burst,
-                pause: args.pause,
-                min_unique: round_target,
-                max_empty: 8,
-                lookback: args.lookback,
-                max_sync: args.max_sync,
-                visit_all,
-                fast_finality: args.fast_finality,
-            },
-            &mut done,
-        )?;
+        let mut report = SoakReport::default();
+        let base = tot.clone();
+        let base_fast = fast_compared;
+        let outcome = {
+            let mut st = state.as_mut();
+            let mut persist = |r: &SoakReport, d: &HashSet<String>| {
+                persist_soak(st.as_deref_mut(), args.state, &base, base_fast, r, d)
+            };
+            soak_until(
+                up.as_ref(),
+                &oracle,
+                &addrs,
+                &mut chain,
+                snap_hold.as_mut(),
+                SoakUntilOpts {
+                    burst: args.burst,
+                    pause: args.pause,
+                    min_unique: round_target,
+                    max_empty: 8,
+                    lookback: args.lookback,
+                    max_sync: args.max_sync,
+                    visit_all,
+                    fast_finality: args.fast_finality,
+                },
+                SoakSink {
+                    done: &mut done,
+                    report: &mut report,
+                    persist: &mut persist,
+                },
+            )
+        };
         tot.compared += report.compared;
         tot.matched += report.matched;
         tot.mismatched += report.mismatched;
@@ -1338,27 +1488,18 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
             report.mismatched,
             report.skipped
         );
-        // Persist before the bails below: a run that stops for any reason should leave
-        // the hours it did complete on disk.
-        if let (Some(st), Some(path)) = (state.as_mut(), args.state) {
-            st.compared = tot.compared;
-            st.matched = tot.matched;
-            st.mismatched = tot.mismatched;
-            st.skipped = tot.skipped;
-            st.compared_at_fast = fast_compared;
-            st.checked_balance = tot.checked_balance;
-            st.checked_nonce = tot.checked_nonce;
-            st.checked_slot0 = tot.checked_slot0;
-            st.checked_call = tot.checked_call;
-            st.checked_finality = tot.checked_finality;
-            st.unique = {
-                let mut v: Vec<String> = done.iter().cloned().collect();
-                v.sort();
-                v
-            };
-            st.touch_session(now_unix());
-            st.save(path)?;
-        }
+        // Persist before the bails below — including `outcome` itself. A run that stops
+        // for any reason should leave the hours it did complete on disk, and the round
+        // that failed still soaked for as long as it ran.
+        persist_soak(
+            state.as_mut(),
+            args.state,
+            &tot,
+            fast_compared,
+            &SoakReport::default(),
+            &done,
+        )?;
+        outcome?;
         if tot.mismatched > 0 {
             bail!("oracle mismatch (fail-closed)");
         }
@@ -1436,6 +1577,16 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
             tot.compared
         );
     }
+    // Same rule one level down. `--finality fast` gates the BEP-126 path, and the only
+    // check that actually exercises attestation bookkeeping against geth is the
+    // `parlia_*` cross-check. A run where it never produced a verdict — an oracle that
+    // does not serve the namespace, or a snapshot that never adopted an attestation —
+    // has not tested the thing it is about to certify.
+    if args.fast_finality && tot.checked_finality == 0 {
+        bail!(
+            "--finality fast was requested but the parlia_* finality cross-check never ran (see the SKIP lines above). The soak oracle must serve parlia_getJustifiedNumber / parlia_getFinalizedNumber."
+        );
+    }
     // A resumable soak can be stopped early and restarted; without this the last
     // session would print PASS on a tally that never reached the target.
     if args.duration_secs > 0 {
@@ -1451,7 +1602,10 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
             }
         }
     }
-    println!("GATE:         PASS  unique={unique_best}  at_fast_head={fast_compared}");
+    println!(
+        "GATE:         PASS  unique={unique_best}  at_fast_head={fast_compared}  parlia_finality={}",
+        tot.checked_finality
+    );
     Ok(())
 }
 
@@ -1487,4 +1641,82 @@ fn verify_checkpoint(
     }
     println!("GATE:         PASS");
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// The operator-facing default, flipped once the >=24h soak covered it. Pinned here
+    /// because it is the one setting that changes what every wallet read resolves to, and
+    /// a silent revert would look exactly like a slow provider.
+    #[test]
+    fn run_defaults_to_fast_finality() {
+        let cli = Cli::try_parse_from(["helios-bsc", "run", "--upstream", "https://a.example"])
+            .expect("run parses without --finality");
+        match cli.cmd {
+            Commands::Run { finality, .. } => assert_eq!(finality, FinalityArg::Fast),
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    /// The soak keeps the older default on purpose: its fast mode additionally requires an
+    /// oracle serving the `parlia_` namespace and fails closed without one, and most
+    /// public BSC endpoints answer -32601. Defaulting a test harness to a hard failure
+    /// helps nobody.
+    #[test]
+    fn soak_still_defaults_to_confirmation_depth() {
+        let cli = Cli::try_parse_from([
+            "helios-bsc",
+            "soak",
+            "--upstream",
+            "https://a.example",
+            "--oracle",
+            "https://b.example",
+        ])
+        .expect("soak parses");
+        match cli.cmd {
+            Commands::Soak { finality, .. } => {
+                assert_eq!(finality, FinalityArg::ConfirmationDepth)
+            }
+            other => panic!("expected Soak, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    /// Asking for fast and getting it, versus asking for fast and reading at confirmation
+    /// depth anyway, must not print the same line.
+    #[test]
+    fn the_startup_line_names_the_rule_in_force_not_the_one_requested() {
+        let armed = finality_startup_line(FinalityArg::Fast, true);
+        assert!(armed.contains("fast"), "{armed}");
+        assert!(armed.contains("~2 blocks"), "{armed}");
+
+        let unarmed = finality_startup_line(FinalityArg::Fast, false);
+        assert!(
+            unarmed.starts_with("finality: confirmation-depth"),
+            "an unarmed fast run reads at confirmation depth and must say so: {unarmed}"
+        );
+        assert!(
+            unarmed.contains("no BLS vote keys"),
+            "and must say why: {unarmed}"
+        );
+        assert!(
+            unarmed.contains("--sealing-set-from-epoch"),
+            "and how to fix it: {unarmed}"
+        );
+        assert_ne!(armed, unarmed);
+
+        let conf = finality_startup_line(FinalityArg::ConfirmationDepth, true);
+        assert!(conf.starts_with("finality: confirmation-depth"), "{conf}");
+        assert!(
+            !conf.contains("BLS vote keys"),
+            "a deliberate choice is not a fallback: {conf}"
+        );
+    }
 }

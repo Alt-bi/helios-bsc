@@ -4,6 +4,7 @@ Captured 2026-08-18 from `https://bsc-mainnet.public.blastapi.io`.
 
 | File | What |
 |------|------|
+| `header_116662000.json` | Epoch **below** the one that governs the fixtures. Bootstrap needs two boundaries: the activation height of an epoch is set by the *previous* epoch's validator count and turn length, so `header_116663000` alone cannot say whether it is already active. |
 | `header_116663000.json` | Epoch that **governs** the blocks below (activates at +87 = 116663087). Supplies the *real* 21-address sealing set, so tests can keep `enforce_inturn` on instead of padding a fake set. |
 | `header_116663998.json` … `header_116664002.json` | Headers across epoch **116664000** (`number % 1000 == 0`) |
 | `proof_wbnb_tip.json` | `eth_getProof(WBNB)` **at tip** — MPT unit-test vector only. **Not** a Safe-lag Demo Slice proof. |
@@ -29,7 +30,7 @@ chain (headers field-by-field, proof `stateRoot`/`blockHash`, WBNB bytecode):
 python scripts/verify_fixtures.py --rpc https://bsc-dataseed.bnbchain.org
 ```
 
-Last verified **2026-08-21**: all 6 headers, 3 proofs and `wbnb_code.hex` match live
+Last verified **2026-08-21**: all 6 headers then present (`header_116662000.json` added 2026-08-24 via `capture_headers.py`; `n=21`, `turnLength=8`, activation `116662087`), 3 proofs and `wbnb_code.hex` match live
 BSC mainnet (via `bsc-dataseed.bnbchain.org`; header data only, no `eth_getProof`).
 
 Send a **`User-Agent`** if you probe by hand: BlastAPI / publicnode / meowrpc answer

@@ -14,12 +14,12 @@ Custom RPC URL: `http://127.0.0.1:8545` · chainId **56**.
 | What the client asks | What helios-bsc serves |
 |----------------------|------------------------|
 | `latest` / `eth_blockNumber` | **Safe** — newest block with ≥15 distinct subsequent sealers |
-| `safe` / `finalized` | Same Safe head by default. Fast Finality **is** verified (BLS, `docs/fast-finality.md`), but the tags move to the BLS-finalized head only under opt-in `run --finality fast`; otherwise read `helios_bsc_syncStatus` for it |
+| `safe` / `finalized` | Same head as `latest`. Since 2026-08-25 that is the **BLS-finalized** head (~2 blocks) when the client has BLS vote keys, else the confirmation-depth Safe head; `run --finality confirmation-depth` pins the latter. `helios_bsc_syncStatus.safeSource` says which |
 | Exact number/hash | Local verified header with `n ≤ Safe` (same as `eth_getBlockByNumber`; `latest` still maps to Safe) |
 
 Safe lag on mainnet is ~106–112 blocks (~50s), not “the last mined block”.
 
-**Fast Finality (BEP-126).** The client verifies the BLS vote attestation in each sealed header and tracks a justified and a finalized head, measured **2 blocks** behind the tip on live mainnet — the observed norm over 120 consecutive headers in a healthy period, not a guaranteed bound. By default it is **reported, not served**: `latest` / `safe` / `finalized` stay on the confirmation-depth Safe head, and `run --finality fast` is the opt-in switch that points them at the BLS-finalized head instead (falling back to confirmation depth whenever no finalized head is known). A wallet on the default reads `helios_bsc_syncStatus` → `finality` (`fast-finality` vs `confirmation-depth`), `finalizedBlock` / `finalizedHash`, `finalizedLagBlocks`, `justifiedBlock` / `justifiedLagBlocks`, and `finalityHead` (the verified head the lags are measured against). The fields are `null` and `finality` stays `confirmation-depth` until the client has BLS vote keys — write the checkpoint with `write-checkpoint --sealing-set-from-epoch` to carry them; it never guesses a key. Details: `docs/fast-finality.md`.
+**Fast Finality (BEP-126).** The client verifies the BLS vote attestation in each sealed header and tracks a justified and a finalized head, measured **2 blocks** behind the tip on live mainnet — the observed norm over 120 consecutive headers in a healthy period, not a guaranteed bound. Since 2026-08-25 it is **served by default**: `latest` / `safe` / `finalized` resolve to the BLS-finalized head, falling back to the confirmation-depth Safe head whenever no finalized head is known, and `run --finality confirmation-depth` pins the older rule. The startup line names the rule actually in force, so an unarmed client reading at ~110 blocks says why. A wallet on the default reads `helios_bsc_syncStatus` → `finality` (`fast-finality` vs `confirmation-depth`), `finalizedBlock` / `finalizedHash`, `finalizedLagBlocks`, `justifiedBlock` / `justifiedLagBlocks`, and `finalityHead` (the verified head the lags are measured against). The fields are `null` and `finality` stays `confirmation-depth` until the client has BLS vote keys — write the checkpoint with `write-checkpoint --sealing-set-from-epoch` to carry them; it never guesses a key. Details: `docs/fast-finality.md`.
 
 ## Methods
 
@@ -31,7 +31,7 @@ Safe lag on mainnet is ~106–112 blocks (~50s), not “the last mined block”.
 
 **`eth_getLogs` is supported for a single block only** — `fromBlock == toBlock`, or `blockHash`; a range is `-32602`. Logs come from receipts bound to the sealed `receiptsRoot`, never from an upstream `eth_getLogs`.
 
-**Unsupported (no index / no keys / later):** log **ranges**, filters, `eth_subscribe`, `eth_sendTransaction`, `eth_sign*`, `personal_*`, `debug_*`, `txpool_*`. Fast Finality **is** implemented and verified, but exposes **no new RPC method** — it adds fields to `helios_bsc_syncStatus` and, under opt-in `run --finality fast`, changes which head the existing tags resolve to (see Tags above).
+**Unsupported (no index / no keys / later):** log **ranges**, filters, `eth_subscribe`, `eth_sendTransaction`, `eth_sign*`, `personal_*`, `debug_*`, `txpool_*`. Fast Finality **is** implemented and verified, but exposes **no new RPC method** — it adds fields to `helios_bsc_syncStatus` and changes which head the existing tags resolve to (see Tags above).
 
 There is **no silent passthrough**. Unsupported or unverified-without-flag methods hard-error.
 

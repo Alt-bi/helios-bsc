@@ -9,6 +9,9 @@ pub const ERR_STATE_ROOT: i64 = -32002;
 pub const ERR_NOT_SYNCED: i64 = -32003;
 pub const ERR_METHOD: i64 = -32601;
 pub const ERR_PARAMS: i64 = -32602;
+/// JSON-RPC 2.0 "Internal error". Reserved here for a caught panic: the request was
+/// well-formed and the failure is ours, so it must not be reported as a bad request.
+pub const ERR_INTERNAL: i64 = -32603;
 /// geth `eth_call` / `eth_estimateGas` execution revert or halt (not proof failure).
 pub const ERR_EXECUTION: i64 = 3;
 

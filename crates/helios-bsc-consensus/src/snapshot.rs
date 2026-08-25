@@ -6,8 +6,9 @@ use crate::seal::{
 use crate::vote::{decode_vote_attestation, verify_attestation_signature, VoteData, VoteError};
 use helios_bsc_config::{
     attestation_target_window, miner_history_check_len, params_at, parse_extra, ExtraDataVersion,
-    ExtraError, SealingValidator, DIFF_IN_TURN, DIFF_NO_TURN, K_ANCESTOR_GENERATION_DEPTH,
-    MAXWELL_EPOCH_LENGTH, MAXWELL_TIME,
+    ExtraError, SealingValidator, DEFAULT_EPOCH_LENGTH, DIFF_IN_TURN, DIFF_NO_TURN,
+    K_ANCESTOR_GENERATION_DEPTH, LORENTZ_EPOCH_LENGTH, LORENTZ_TIME, MAXWELL_EPOCH_LENGTH,
+    MAXWELL_TIME,
 };
 use helios_bsc_types::{
     decode_hex, decode_hex_fixed, decode_u64, format_address, Checkpoint, RpcBlockHeader,
@@ -53,6 +54,18 @@ pub enum SnapshotError {
     AttestationSource { want: u64, got: u64 },
     #[error("attestation source hash does not match the justified block")]
     AttestationSourceHash,
+    #[error("header {number} is not an epoch boundary (epochLength={epoch_length})")]
+    NotEpochBoundary { number: u64, epoch_length: u64 },
+    #[error("epoch headers {newer} and {older} are not one epoch ({epoch_length}) apart")]
+    EpochHeadersNotAdjacent {
+        newer: u64,
+        older: u64,
+        epoch_length: u64,
+    },
+    #[error("checkpoint {checkpoint} is not inside epoch {epoch}")]
+    SeedEpochMismatch { checkpoint: u64, epoch: u64 },
+    #[error("epoch state can only be seeded before the first header is walked (at {number})")]
+    SeedAfterWalk { number: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +77,116 @@ pub struct PendingEpoch {
     /// layout carries none (pre-Luban), which leaves fast finality unavailable.
     pub vote_keys: Vec<[u8; 48]>,
     pub turn_length: u64,
+}
+
+/// Epoch state that a checkpoint cannot carry, read back from the chain at bootstrap.
+///
+/// A checkpoint names a block, a sealing set and (optionally) BLS vote keys. It says
+/// nothing about `turnLength`, which is not a constant: geth keeps it on the snapshot and
+/// reads it from epoch `extraData`, and the pinned v1.7.8 tree anticipates mainnet moving
+/// to 16 (`consensus/parlia/parlia.go`, the epoch-length/turn-length table). Nor can a
+/// checkpoint say whether a validator-set switch is still pending, because the epoch
+/// header that announces one sits below the checkpoint and was never walked.
+///
+/// Assuming the compile-time default for both is wrong in two different ways, and every
+/// fixture in this repo carries `turnLength = 8`, so nothing here would notice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EpochSeed {
+    /// Epoch `epoch_block` is already activated at the checkpoint, so its `turnLength` is
+    /// the one geth's snapshot holds there.
+    Active { epoch_block: u64, turn_length: u64 },
+    /// The switch announced by `epoch_block` is still ahead of the checkpoint. Adopting
+    /// it would mean taking a future sealing set from an unverified header — see
+    /// [`epoch_seed_at`].
+    PendingActivation { epoch_block: u64, activate_at: u64 },
+}
+
+/// Sorted validators and the `turnLength` an epoch header installs.
+fn epoch_records(header: &RpcBlockHeader) -> Result<(Vec<SealingValidator>, u64), SnapshotError> {
+    let number = decode_u64(&header.number)?;
+    let timestamp = decode_u64(&header.timestamp)?;
+    let fork = params_at(number, timestamp);
+    if fork.epoch_length == 0 || number % fork.epoch_length != 0 {
+        return Err(SnapshotError::NotEpochBoundary {
+            number,
+            epoch_length: fork.epoch_length,
+        });
+    }
+    let extra = decode_hex(&header.extra_data)?;
+    let parsed = parse_extra(&extra, fork.extra_data_version, true)?;
+    if parsed.validators.is_empty() {
+        return Err(SnapshotError::MissingEpochExtra(number));
+    }
+    let mut vals = parsed.validators;
+    vals.sort_by_key(|v| v.address);
+    // Pre-Bohr layouts carry no turnLength byte; geth then leaves the snapshot on its
+    // default, which is what the fork table records.
+    let turn = parsed
+        .turn_length
+        .map(u64::from)
+        .unwrap_or(fork.turn_length);
+    Ok((vals, turn))
+}
+
+/// Which epoch state geth's snapshot would already hold at `checkpoint_number`.
+///
+/// `epoch_header` is the newest boundary at or below the checkpoint, `prev_epoch_header`
+/// the one an `epoch_length` below it. **Both** are needed. geth switches the set when
+/// `number % epochLength == snap.minerHistoryCheckLen()`, evaluated against the snapshot
+/// *as it stands before the switch* — so the height at which `epoch_header` activates is
+/// fixed by the previous epoch's validator count and turn length, never by its own.
+///
+/// Neither header is authenticated here, and that is deliberate rather than overlooked:
+///
+/// * The `Active` answer only yields a `turnLength`, and a wrong one cannot survive the
+///   walk. `expected_difficulty` divides by it, so a forged value puts the in-turn sealer
+///   at a different offset and the very next header fails `DifficultyMismatch`. There is
+///   no forged-but-accepted state, only a fail-closed stop.
+/// * The `PendingActivation` answer *would* import a future sealing set from an unverified
+///   header, which is a different thing entirely. Callers must refuse it rather than adopt
+///   it — see `walk_from_checkpoint`.
+///
+/// A tampered `prev_epoch_header` can only move the boundary between the two answers, and
+/// both sides of that boundary are fail-closed: too early gives the wrong `turnLength` and
+/// wedges on the next header, too late refuses a checkpoint that was in fact usable.
+pub fn epoch_seed_at(
+    checkpoint_number: u64,
+    epoch_length: u64,
+    epoch_header: &RpcBlockHeader,
+    prev_epoch_header: &RpcBlockHeader,
+) -> Result<EpochSeed, SnapshotError> {
+    let epoch_block = decode_u64(&epoch_header.number)?;
+    let prev_block = decode_u64(&prev_epoch_header.number)?;
+    if epoch_length == 0 || epoch_block.checked_sub(prev_block) != Some(epoch_length) {
+        return Err(SnapshotError::EpochHeadersNotAdjacent {
+            newer: epoch_block,
+            older: prev_block,
+            epoch_length,
+        });
+    }
+    if checkpoint_number < epoch_block || checkpoint_number - epoch_block >= epoch_length {
+        return Err(SnapshotError::SeedEpochMismatch {
+            checkpoint: checkpoint_number,
+            epoch: epoch_block,
+        });
+    }
+
+    let (_, turn_length) = epoch_records(epoch_header)?;
+    let (prev_vals, prev_turn) = epoch_records(prev_epoch_header)?;
+    let activate_at =
+        epoch_block.saturating_add(miner_history_check_len(prev_vals.len() as u32, prev_turn));
+
+    if checkpoint_number >= activate_at {
+        Ok(EpochSeed::Active {
+            epoch_block,
+            turn_length,
+        })
+    } else {
+        Ok(EpochSeed::PendingActivation {
+            epoch_block,
+            activate_at,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +284,28 @@ impl Snapshot {
             // attestation that names one rather than guessing at its hash.
             ancestors: vec![(cp.number, decode_hex_fixed::<32>(&cp.hash)?)],
         })
+    }
+
+    /// Install the `turnLength` read from the chain at bootstrap.
+    ///
+    /// [`Snapshot::from_checkpoint`] can only seed the fork table's value, which is a
+    /// guess: `turnLength` lives in epoch `extraData` and validators can change it. Get it
+    /// wrong and `inturn_validator` divides by the wrong number, so `expected_difficulty`
+    /// disagrees with the chain on roughly every header — the client refuses honest blocks
+    /// and never recovers, because a header the snapshot rejects is rejected again forever.
+    ///
+    /// Refuses once the walk has begun: past that point `turn_length` is whatever the
+    /// epoch headers actually installed, and overwriting it would undo real state.
+    pub fn seed_turn_length(&mut self, turn_length: u64) -> Result<(), SnapshotError> {
+        if self.number >= self.walk_start {
+            return Err(SnapshotError::SeedAfterWalk {
+                number: self.number,
+            });
+        }
+        if turn_length > 0 {
+            self.turn_length = turn_length;
+        }
+        Ok(())
     }
 
     /// Vote keys in `validators` order, hex-encoded — `None` when they are not known.
@@ -437,6 +582,48 @@ impl Snapshot {
         self.validators.iter().map(format_address).collect()
     }
 
+    /// v1.7.8 `Snapshot.apply`:
+    ///
+    /// ```text
+    /// epochLength := snap.EpochLength
+    /// nextBlockNumber := header.Number.Uint64() + 1
+    /// if snap.EpochLength == defaultEpochLength && chainConfig.IsLorentz(...) &&
+    ///     nextBlockNumber%lorentzEpochLength == 0 {
+    ///     snap.EpochLength = lorentzEpochLength
+    /// }
+    /// if snap.EpochLength == lorentzEpochLength && chainConfig.IsMaxwell(...) &&
+    ///     nextBlockNumber%maxwellEpochLength == 0 {
+    ///     snap.EpochLength = maxwellEpochLength
+    /// }
+    /// ```
+    ///
+    /// The epoch length is snapshot state that climbs a ladder, not a constant read from
+    /// the fork table. `from_checkpoint` seeds it from `params_at`, which is right for a
+    /// checkpoint taken today and wrong for a snapshot that walks across the step — and
+    /// getting it wrong means `number % epoch_length == 0` picks different blocks than
+    /// geth, so epoch `extraData` is parsed at the wrong heights and missed at the right
+    /// ones.
+    ///
+    /// Dormant on mainnet: Maxwell is long past and Fermi and Pasteur both keep 1000. It
+    /// is here so the next fork that moves it does not do so silently.
+    fn advance_epoch_length(&mut self, number: u64, time: u64) {
+        // Keyed on the *next* block, so the length only ever changes at a height where
+        // the old and new boundaries coincide.
+        let next = number.saturating_add(1);
+        if self.epoch_length == DEFAULT_EPOCH_LENGTH
+            && time >= LORENTZ_TIME
+            && next % LORENTZ_EPOCH_LENGTH == 0
+        {
+            self.epoch_length = LORENTZ_EPOCH_LENGTH;
+        }
+        if self.epoch_length == LORENTZ_EPOCH_LENGTH
+            && time >= MAXWELL_TIME
+            && next % MAXWELL_EPOCH_LENGTH == 0
+        {
+            self.epoch_length = MAXWELL_EPOCH_LENGTH;
+        }
+    }
+
     /// Apply a fully verified header (signer already recovered).
     pub fn apply_verified(
         &mut self,
@@ -534,6 +721,11 @@ impl Snapshot {
         if time >= MAXWELL_TIME {
             self.prune_recents_to_finalized();
         }
+
+        // After the prune and before the set switch, as in geth. The switch below still
+        // uses the length this block was read with: `pending.activate_at` was computed at
+        // the epoch block, from the length in force there.
+        self.advance_epoch_length(number, time);
 
         if let Some(pending) = self.pending.clone() {
             if number == pending.activate_at {
@@ -1130,5 +1322,153 @@ mod tests {
             parent = hash;
         }
         assert!(!snap.sign_recently(&addr(1)));
+    }
+    // ---- epoch seeding (turnLength / pending activation) ----------------------------
+
+    /// Build an epoch header whose extraData announces `n` validators and `turn`.
+    fn epoch_header(number: u64, n: usize, turn: u8) -> RpcBlockHeader {
+        let mut extra = vec![0u8; 32];
+        extra.push(n as u8);
+        for i in 0..n {
+            extra.extend_from_slice(&addr(i as u8 + 1));
+            extra.extend_from_slice(&[0u8; 48]);
+        }
+        extra.push(turn);
+        extra.extend_from_slice(&[0u8; 65]);
+        let mut h = dummy_header(number, [0u8; 32], [1u8; 32]);
+        h.extra_data = format!("0x{}", hex::encode(&extra));
+        // Post-Maxwell, so `params_at` yields epochLength 1000 and the Bohr layout.
+        h.timestamp = format!("0x{:x}", MAXWELL_TIME + 1_000_000);
+        h
+    }
+
+    /// The bug this exists to prevent: the fork table says 8, the chain says 16, and a
+    /// snapshot that keeps 8 puts `inturn_validator` at the wrong offset for almost every
+    /// header. No fixture in this repo carries anything but 8.
+    #[test]
+    fn turn_length_comes_from_the_chain_not_the_fork_table() {
+        let e = epoch_header(117_000_000, 21, 16);
+        let prev = epoch_header(116_999_000, 21, 16);
+        // mhcl(21, 16) = 11*16-1 = 175, so 117_000_200 is past the activation.
+        let seed = epoch_seed_at(117_000_200, 1000, &e, &prev).unwrap();
+        assert_eq!(
+            seed,
+            EpochSeed::Active {
+                epoch_block: 117_000_000,
+                turn_length: 16
+            }
+        );
+    }
+
+    /// geth measures the activation height with the set and turn length in force *before*
+    /// the switch. Reading them off the new epoch header instead moves the boundary by 88
+    /// blocks when turnLength changes — the one case that matters.
+    #[test]
+    fn activation_height_uses_the_previous_epochs_turn_length() {
+        let e = epoch_header(117_000_000, 21, 16);
+        let prev = epoch_header(116_999_000, 21, 8);
+        // mhcl(21, 8) = 87. A checkpoint at +100 is therefore already past it...
+        assert!(matches!(
+            epoch_seed_at(117_000_100, 1000, &e, &prev).unwrap(),
+            EpochSeed::Active {
+                turn_length: 16,
+                ..
+            }
+        ));
+        // ...while +80 is not, and must not be seeded from `e`.
+        assert_eq!(
+            epoch_seed_at(117_000_080, 1000, &e, &prev).unwrap(),
+            EpochSeed::PendingActivation {
+                epoch_block: 117_000_000,
+                activate_at: 117_000_087,
+            }
+        );
+    }
+
+    /// 87 of every 1000 blocks land in the window. A checkpoint there would miss the
+    /// switch geth performs a few blocks later, so it is named rather than guessed at.
+    #[test]
+    fn a_checkpoint_inside_the_activation_window_is_reported_pending() {
+        let e = epoch_header(117_000_000, 21, 8);
+        let prev = epoch_header(116_999_000, 21, 8);
+        for offset in [0u64, 1, 43, 86] {
+            assert!(
+                matches!(
+                    epoch_seed_at(117_000_000 + offset, 1000, &e, &prev).unwrap(),
+                    EpochSeed::PendingActivation { .. }
+                ),
+                "offset {offset} must be pending"
+            );
+        }
+        assert!(matches!(
+            epoch_seed_at(117_000_087, 1000, &e, &prev).unwrap(),
+            EpochSeed::Active { .. }
+        ));
+    }
+
+    #[test]
+    fn seed_rejects_headers_that_are_not_one_epoch_apart() {
+        let e = epoch_header(117_000_000, 21, 8);
+        let far = epoch_header(116_000_000, 21, 8);
+        assert!(matches!(
+            epoch_seed_at(117_000_200, 1000, &e, &far),
+            Err(SnapshotError::EpochHeadersNotAdjacent { .. })
+        ));
+        let prev = epoch_header(116_999_000, 21, 8);
+        // Checkpoint below the epoch it is supposed to sit in.
+        assert!(matches!(
+            epoch_seed_at(116_999_500, 1000, &e, &prev),
+            Err(SnapshotError::SeedEpochMismatch { .. })
+        ));
+    }
+
+    /// Seeding is a bootstrap-only operation: after the walk starts, `turn_length` is
+    /// whatever the epoch headers actually installed.
+    #[test]
+    fn seeding_after_the_walk_is_refused() {
+        let mut snap = Snapshot::from_checkpoint(&cp()).unwrap();
+        assert!(snap.seed_turn_length(16).is_ok());
+        assert_eq!(snap.turn_length, 16);
+        snap.number += 1;
+        assert!(matches!(
+            snap.seed_turn_length(8),
+            Err(SnapshotError::SeedAfterWalk { .. })
+        ));
+        assert_eq!(snap.turn_length, 16, "a refused seed changes nothing");
+    }
+    /// The epoch length is snapshot state in geth, not a fork-table constant. A snapshot
+    /// walking across the step must climb the same ladder or it parses epoch `extraData`
+    /// at different heights than the chain does.
+    #[test]
+    fn epoch_length_climbs_the_ladder_geth_climbs() {
+        let mut snap = Snapshot::from_checkpoint(&cp()).unwrap();
+
+        // Pre-Lorentz: nothing moves, whatever the height.
+        snap.epoch_length = DEFAULT_EPOCH_LENGTH;
+        snap.advance_epoch_length(LORENTZ_EPOCH_LENGTH - 1, LORENTZ_TIME - 1);
+        assert_eq!(snap.epoch_length, DEFAULT_EPOCH_LENGTH);
+
+        // Lorentz is live, but only the block whose successor lands on the new boundary
+        // steps it up.
+        snap.advance_epoch_length(LORENTZ_EPOCH_LENGTH - 2, LORENTZ_TIME);
+        assert_eq!(snap.epoch_length, DEFAULT_EPOCH_LENGTH, "not this block");
+        snap.advance_epoch_length(LORENTZ_EPOCH_LENGTH - 1, LORENTZ_TIME);
+        assert_eq!(snap.epoch_length, LORENTZ_EPOCH_LENGTH);
+
+        // And it cannot skip a rung: Maxwell only applies from the Lorentz length.
+        snap.advance_epoch_length(MAXWELL_EPOCH_LENGTH - 1, MAXWELL_TIME);
+        assert_eq!(snap.epoch_length, MAXWELL_EPOCH_LENGTH);
+
+        // Terminal — Fermi and Pasteur both keep 1000, so nothing moves again.
+        snap.advance_epoch_length(2 * MAXWELL_EPOCH_LENGTH - 1, MAXWELL_TIME + 10_000_000);
+        assert_eq!(snap.epoch_length, MAXWELL_EPOCH_LENGTH);
+    }
+
+    /// A checkpoint written today starts at the top of the ladder, so the mainnet path is
+    /// unaffected by the rungs above.
+    #[test]
+    fn a_current_checkpoint_starts_at_the_maxwell_length() {
+        let snap = Snapshot::from_checkpoint(&cp()).unwrap();
+        assert_eq!(snap.epoch_length, MAXWELL_EPOCH_LENGTH);
     }
 }

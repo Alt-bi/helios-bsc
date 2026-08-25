@@ -14,7 +14,7 @@ Config source: `params/config.go` `BSCChainConfig`
 | Commit SHA | `cdb7548b5baacfdae92f9f63437d6456411665f3` |
 | Date verified | 2026-08-18 |
 | Verified by | helios-bsc Phase 0 (source read of `params/config.go` + `consensus/parlia/{parlia,snapshot}.go`) |
-| Note | `master` at this date is `v1.8.0-alpha` — **do not pin master**. Pasteur (`PasteurTime = 1787625000` = 2026-08-25 02:30 UTC) is **scheduled, not yet live**. |
+| Note | `master` at this date is `v1.8.0-alpha` — **do not pin master**. Pasteur (`PasteurTime = 1787625000` = 2026-08-25 02:30 UTC) went **live 2026-08-25**; the pin already contained it and it changes no Parlia rule, so no client change was needed. Walked live the same day: checkpoint at 117956350 reports `forkId=pasteur`, and a soak on the post-Pasteur chain matched an independent oracle on 116 comparisons with 0 mismatches. |
 
 Re-pin after Pasteur (2026-08-25) if extraData / epoch / turnLength change (they are not expected to).
 

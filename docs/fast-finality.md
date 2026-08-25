@@ -150,13 +150,14 @@ python scripts/verify_attestations.py --rpc https://bsc-dataseed.bnbchain.org --
 | `VoteData.Hash()` = `keccak256(RLP(...))` | same | **Done** |
 | Aggregate BLS verify (`blst`, min_pk, POP DST) | same | **Done** — verifies the real signatures on all five mainnet fixture headers |
 | Bitset → sorted validator mapping, `ceil(2N/3)` quorum | same | **Done** |
-| Target-is-parent / source-is-justified linkage | `snapshot.rs` `check_attestation` | **Done** |
+| Target-is-parent / source-is-justified linkage | `snapshot.rs` `check_attestation` | **Done** — from Fermi the target may be any of 3 ancestors |
 | Set selection at `TargetNumber - 1` | `snapshot.rs` `attestation_set` | **Done** — one generation of history kept |
 | Justified / finalized tracking | `snapshot.rs` `justified()` / `finalized()` | **Done** |
 | Vote keys carried in the checkpoint | `helios-bsc-types`, `write-checkpoint --sealing-set-from-epoch` | **Done** |
 | Exposed on `helios_bsc_syncStatus` + `/metrics` | `bin/helios-bsc/src/rpc_server.rs` | **Done** |
-| `latest` / `safe` / `finalized` served from BLS finality | `run --finality fast` | **Done, opt-in.** Default is unchanged confirmation depth; the ≥24h soak is the gate for flipping it. |
+| `latest` / `safe` / `finalized` served from BLS finality | `run` (default since 2026-08-25) | **Done, default.** The ≥24h soak that gated it passed 2026-08-24 (24.06 h, exit 0) and a 4 h soak on the shipped build followed (2871 comparisons, 0 mismatch, 99 `parlia_*` cross-checks). `--finality confirmation-depth` pins the old rule. |
 | Maxwell BEP-524 `recents` prune to the finalized head | `snapshot.rs` `prune_recents_to_finalized` | **Done** |
+| Justified / finalized cross-checked against geth | `soak --finality fast`, `diff_finality_one` | **Done** — compares this client's pair with `parlia_getJustifiedNumber` / `parlia_getFinalizedNumber` at the snapshot's own block. Everything above verifies the attestation path against itself; this is the only check that asks an independent geth whether the answer is right. The soak fails closed if it never produced a verdict, so the oracle must serve the `parlia_` namespace — most public BSC endpoints answer `-32601`. |
 
 ## Serving reads from the finalized head
 

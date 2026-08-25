@@ -29,6 +29,9 @@ use serde_json::{json, Value};
 struct MockUpstream {
     tip: u64,
     headers: Vec<RpcBlockHeader>,
+    /// Epoch boundaries below `headers`. Served by number only: they must not appear in a
+    /// `headers_range` walk, which is why they are a separate list rather than prepended.
+    epoch_headers: Vec<RpcBlockHeader>,
     proof: Value,
     /// When set, `header_by_hash` lies about `stateRoot` (hash/number still match).
     lie_state_root: bool,
@@ -39,6 +42,12 @@ struct MockUpstream {
     /// When set, `send_raw_transaction` returns this hash instead of keccak(raw).
     lie_raw_hash: Option<String>,
     receipts: Vec<Value>,
+    /// Upstream `eth_blockNumber` calls, shared with the test that wants to count them.
+    block_number_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Name of a method that should panic instead of answering. `headers_range` panics
+    /// from inside `resync_locked`, i.e. while the chain and snapshot locks are held,
+    /// which is the case that used to take the whole RPC surface down with it.
+    panic_in: Option<&'static str>,
 }
 
 impl MockUpstream {
@@ -46,6 +55,7 @@ impl MockUpstream {
         Ok(Self {
             tip: rpc.tip_number()?,
             headers: rpc.headers().to_vec(),
+            epoch_headers: helios_bsc_mock::epoch_headers()?,
             proof: rpc.proof_json(),
             lie_state_root: false,
             balance: rpc
@@ -59,6 +69,8 @@ impl MockUpstream {
             code: Vec::new(),
             lie_raw_hash: None,
             receipts: Vec::new(),
+            block_number_calls: std::sync::Arc::default(),
+            panic_in: None,
         })
     }
 
@@ -66,6 +78,7 @@ impl MockUpstream {
         Self {
             tip: chain.last().map(|b| b.number).unwrap_or(0),
             headers: headers_from_chain(chain),
+            epoch_headers: Vec::new(),
             proof,
             lie_state_root: false,
             balance: "0x0".into(),
@@ -74,18 +87,23 @@ impl MockUpstream {
             code: Vec::new(),
             lie_raw_hash: None,
             receipts: Vec::new(),
+            block_number_calls: std::sync::Arc::default(),
+            panic_in: None,
         }
     }
 }
 
 impl RpcUpstream for MockUpstream {
     fn block_number(&self) -> Result<u64> {
+        self.block_number_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(self.tip)
     }
 
     fn header_by_number(&self, n: u64) -> Result<RpcBlockHeader> {
         self.headers
             .iter()
+            .chain(self.epoch_headers.iter())
             .find(|h| decode_u64(&h.number).ok() == Some(n))
             .cloned()
             .ok_or_else(|| anyhow!("header {n} missing"))
@@ -105,6 +123,10 @@ impl RpcUpstream for MockUpstream {
     }
 
     fn headers_range(&self, from: u64, to: u64) -> Result<Vec<RpcBlockHeader>> {
+        assert!(
+            self.panic_in != Some("headers_range"),
+            "injected panic under the chain lock"
+        );
         let mut out: Vec<RpcBlockHeader> = self
             .headers
             .iter()
@@ -188,6 +210,16 @@ fn safe_chain_with_fixture_root() -> (Vec<VerifiedBlock>, MockRpc) {
 fn node_from_chain(chain: Vec<VerifiedBlock>, proof: Value) -> Node {
     let up = MockUpstream::for_chain(&chain, proof);
     Node::from_parts(Box::new(up), 130, chain)
+}
+
+/// Like [`node_from_chain`], but hands back the upstream's `eth_blockNumber` counter.
+fn node_counting_block_number(
+    chain: Vec<VerifiedBlock>,
+    proof: Value,
+) -> (Node, std::sync::Arc<std::sync::atomic::AtomicU64>) {
+    let up = MockUpstream::for_chain(&chain, proof);
+    let calls = std::sync::Arc::clone(&up.block_number_calls);
+    (Node::from_parts(Box::new(up), 130, chain), calls)
 }
 
 fn load_wbnb_code() -> Vec<u8> {
@@ -2438,4 +2470,166 @@ fn get_transaction_receipt_verified_without_flag() {
     assert_eq!(v["result"]["transactionHash"], json!(txh), "{v}");
     let blk = node.handle(&req("eth_getBlockReceipts", json!(["latest"])));
     assert_eq!(blk["result"].as_array().map(|a| a.len()), Some(1), "{blk}");
+}
+
+/// A 64-element batch is inside `MAX_RPC_BATCH`, and each element used to call
+/// `refresh` — so one request in the size limit fired 64 upstream `eth_blockNumber`
+/// calls and spent the operator's quota on itself. Inside one block interval the chain
+/// cannot have moved, so the published sync answers them all.
+#[test]
+fn a_full_batch_costs_one_upstream_poll() {
+    let chain = distinct_sealer_chain(15);
+    let (node, calls) = node_counting_block_number(chain, json!({}));
+    let batch: Vec<Value> = (0..MAX_RPC_BATCH)
+        .map(|i| json!({"jsonrpc": "2.0", "id": i + 1, "method": "eth_blockNumber"}))
+        .collect();
+    let out = node.dispatch(&Value::Array(batch));
+    assert_eq!(
+        out.as_array().map(Vec::len),
+        Some(MAX_RPC_BATCH),
+        "every element must still be answered"
+    );
+    let n = calls.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(n, 1, "{MAX_RPC_BATCH} requests took {n} upstream polls");
+}
+
+/// The coalescing window must not swallow the background poller: it is what keeps the
+/// window fed, so a poller that answered from its own cache would freeze the chain.
+#[test]
+fn the_background_poller_always_reaches_the_upstream() {
+    let chain = distinct_sealer_chain(15);
+    let (node, calls) = node_counting_block_number(chain, json!({}));
+    for _ in 0..3 {
+        let _ = node.poll_sync();
+    }
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "poll_sync must not coalesce"
+    );
+}
+
+/// A panic while handling a request used to end the worker thread outright: `serve_one`
+/// runs inside `while let Ok(req) = server.recv()`, so the loop simply exited. Four of
+/// those and the listener accepted connections nobody answered — with the process still
+/// up and `/metrics`, which reads only atomics, still reporting a healthy client.
+///
+/// The panic is injected in `headers_range`, i.e. *under* the chain and snapshot locks,
+/// so the follow-up requests also exercise the poisoned-mutex path.
+#[test]
+fn a_panicking_request_is_answered_not_fatal() {
+    let chain = distinct_sealer_chain(15);
+    let mut up = MockUpstream::for_chain(&chain, json!({}));
+    up.panic_in = Some("headers_range");
+    // A tip far above the chain forces `resync_locked` into `headers_range`.
+    up.tip = chain.last().unwrap().number + 5_000;
+    let node = Node::from_parts(Box::new(up), 130, chain);
+
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let body = br#"{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber"}"#;
+    for attempt in 1..=3 {
+        assert!(
+            node.dispatch_caught(body).is_err(),
+            "attempt {attempt} should report a caught panic, not unwind"
+        );
+    }
+    std::panic::set_hook(prev);
+
+    assert!(
+        node.metrics_text()
+            .contains("helios_bsc_request_panics_total 3"),
+        "every caught panic must be countable: {}",
+        node.metrics_text()
+    );
+}
+
+/// The caught panic is reported as JSON-RPC "Internal error", not as a bad request: the
+/// request was well-formed and the failure is ours.
+#[test]
+fn a_caught_panic_is_internal_error_not_invalid_request() {
+    assert_eq!(helios_bsc_rpc::ERR_INTERNAL, -32603);
+}
+
+/// The dispatch table's fallback arm used to test `unverified_passthrough_ok`, which
+/// could never be true there: every method on that list already has its own arm. Deleting
+/// the dead branch is only safe while that stays true, so assert it — a passthrough
+/// method that lost its arm would silently answer `method_unsupported` with the flag on.
+#[test]
+fn every_passthrough_method_has_its_own_arm() {
+    let chain = distinct_sealer_chain(15);
+    let node = node_from_chain(chain, json!({}));
+    let hash = format!("0x{}", "11".repeat(32));
+    // Gated at the top of their handler, so with the flag off they say so.
+    for (method, params) in [
+        ("eth_getTransactionByHash", json!([hash])),
+        ("eth_getRawTransactionByHash", json!([hash])),
+        ("eth_gasPrice", json!([])),
+        ("eth_maxPriorityFeePerGas", json!([])),
+        ("eth_feeHistory", json!([])),
+        ("eth_blobBaseFee", json!([])),
+    ] {
+        assert!(
+            helios_bsc_rpc::unverified_passthrough_ok(method),
+            "{method} left the allow-list"
+        );
+        let v = node.handle(&req(method, params));
+        assert_eq!(
+            v["error"]["message"].as_str().unwrap_or_default(),
+            "unverified_passthrough_disabled",
+            "{method} fell through to the default arm: {v}"
+        );
+    }
+    // `eth_getTransactionReceipt` is on the allow-list but is not pure passthrough: when
+    // the receipt's block is in the local chain it is rebuilt from the verified receipts
+    // trie, and only the pending / receipts-omitted fallback needs the flag. So the
+    // invariant to pin for it is the weaker one that still makes the dead arm dead.
+    let v = node.handle(&req("eth_getTransactionReceipt", json!([hash])));
+    assert_ne!(
+        v["error"]["message"].as_str().unwrap_or_default(),
+        "method_unsupported",
+        "eth_getTransactionReceipt fell through to the default arm: {v}"
+    );
+}
+
+/// `method_policy` is the specification of what this client serves, but the dispatcher no
+/// longer consults it — the fallback arm answered the same for every policy, so keeping
+/// the call was decoration. The table can now only drift silently, so pin the agreement:
+/// anything the table calls `Unsupported` must be refused, and anything it does not must
+/// not be refused *as unsupported*.
+#[test]
+fn the_dispatcher_agrees_with_the_method_policy_table() {
+    use helios_bsc_rpc::{method_policy, MethodPolicy};
+    let chain = distinct_sealer_chain(15);
+    let node = node_from_chain(chain, json!({}));
+    for m in [
+        "eth_chainId",
+        "eth_blockNumber",
+        "eth_getBalance",
+        "eth_call",
+        "eth_getLogs",
+        "eth_sendRawTransaction",
+        "eth_gasPrice",
+        "helios_bsc_syncStatus",
+        "eth_newFilter",
+        "eth_subscribe",
+        "debug_traceTransaction",
+        "parlia_getJustifiedNumber",
+        "bsc_health",
+        "personal_sign",
+        "engine_forkchoiceUpdatedV1",
+        "eth_thisDoesNotExist",
+    ] {
+        let v = node.handle(&req(m, json!([])));
+        let unsupported = v["error"]["message"].as_str() == Some("method_unsupported");
+        match method_policy(m) {
+            MethodPolicy::Unsupported => {
+                assert!(unsupported, "{m} is Unsupported but was not refused: {v}")
+            }
+            MethodPolicy::Verified | MethodPolicy::Unverified => assert!(
+                !unsupported,
+                "{m} is in the table but the dispatcher has no arm: {v}"
+            ),
+        }
+    }
 }

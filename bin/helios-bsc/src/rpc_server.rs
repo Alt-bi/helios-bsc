@@ -27,11 +27,10 @@ use helios_bsc_execution::{
     MAX_RAW_TX, MAX_RECEIPT_LOGS,
 };
 use helios_bsc_rpc::{
-    jsonrpc_id_ok, jsonrpc_is_v2, jsonrpc_params_len, jsonrpc_params_ok, method_policy, rpc_err,
-    rpc_err_data, rpc_ok, unverified_passthrough_ok, wallet_block_number_allowed,
-    wallet_block_tag_str, BlockId, MethodPolicy, ERR_EXECUTION, ERR_INVALID, ERR_METHOD,
-    ERR_NOT_SYNCED, ERR_PARAMS, ERR_PARSE, ERR_PROOF_FAILED, ERR_STATE_ROOT,
-    MAX_PROOF_STORAGE_KEYS, MAX_RPC_BATCH, MAX_RPC_METHOD, MAX_RPC_PARAMS,
+    jsonrpc_id_ok, jsonrpc_is_v2, jsonrpc_params_len, jsonrpc_params_ok, rpc_err, rpc_err_data,
+    rpc_ok, wallet_block_number_allowed, wallet_block_tag_str, BlockId, ERR_EXECUTION,
+    ERR_INTERNAL, ERR_INVALID, ERR_METHOD, ERR_NOT_SYNCED, ERR_PARAMS, ERR_PARSE, ERR_PROOF_FAILED,
+    ERR_STATE_ROOT, MAX_PROOF_STORAGE_KEYS, MAX_RPC_BATCH, MAX_RPC_METHOD, MAX_RPC_PARAMS,
 };
 use helios_bsc_types::{
     decode_hex, decode_hex_fixed, decode_u64, keccak256, Checkpoint, RpcBlockHeader, SafeHead,
@@ -42,6 +41,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tiny_http::{Header, Method, Response, Server};
 
 /// JSON-RPC is POST-only. Caps memory if a client streams a huge body.
@@ -64,6 +64,9 @@ pub struct Node {
     header_verify_fail: AtomicU64,
     /// Upstream `eth_blockNumber` failures (transport, not verification).
     upstream_errors: AtomicU64,
+    /// Requests whose handling panicked and was caught. Never expected to move; if it
+    /// does, the answers around it are `-32603` and the client needs a restart.
+    panics: AtomicU64,
     /// Last observed tip / Safe, published after each sync so `/metrics` never has to
     /// take the chain lock. [`NO_BLOCK`] means "not known yet".
     last_tip: AtomicU64,
@@ -129,7 +132,19 @@ struct FinalityView {
     /// `safe` printed beside it.
     read_head: Option<SafeHead>,
     read_head_is_fast: bool,
+    /// When the sync that produced this view finished. `None` until the first one does.
+    ///
+    /// Lives here rather than in its own field so a reader cannot pair a freshness stamp
+    /// with a different sample than the one it describes.
+    synced_at: Option<Instant>,
 }
+
+/// A request whose handling panicked and was caught.
+///
+/// Deliberately empty: the panic payload is already on stderr through the default hook,
+/// and none of it belongs in a reply to a caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestPanicked;
 
 /// Request threads serving the local JSON-RPC listener.
 ///
@@ -163,6 +178,7 @@ impl Node {
             headers_verified: AtomicU64::new(n),
             header_verify_fail: AtomicU64::new(0),
             upstream_errors: AtomicU64::new(0),
+            panics: AtomicU64::new(0),
             last_tip: AtomicU64::new(tip),
             last_safe: AtomicU64::new(safe.number),
             // Lookback bootstrap carries no snapshot, so no attestation is known yet.
@@ -213,6 +229,7 @@ impl Node {
             headers_verified: AtomicU64::new(n),
             header_verify_fail: AtomicU64::new(0),
             upstream_errors: AtomicU64::new(0),
+            panics: AtomicU64::new(0),
             last_tip: AtomicU64::new(tip),
             last_safe: AtomicU64::new(safe.number),
             last_justified: AtomicU64::new(justified.unwrap_or(NO_BLOCK)),
@@ -244,6 +261,7 @@ impl Node {
             headers_verified: AtomicU64::new(0),
             header_verify_fail: AtomicU64::new(0),
             upstream_errors: AtomicU64::new(0),
+            panics: AtomicU64::new(0),
             last_tip: AtomicU64::new(NO_BLOCK),
             last_safe: AtomicU64::new(NO_BLOCK),
             last_justified: AtomicU64::new(NO_BLOCK),
@@ -280,6 +298,7 @@ impl Node {
             headers_verified: AtomicU64::new(0),
             header_verify_fail: AtomicU64::new(0),
             upstream_errors: AtomicU64::new(0),
+            panics: AtomicU64::new(0),
             last_tip: AtomicU64::new(NO_BLOCK),
             last_safe: AtomicU64::new(NO_BLOCK),
             last_justified: AtomicU64::new(NO_BLOCK),
@@ -341,6 +360,18 @@ impl Node {
         // `distinct_sealers` / `required_sealers` stay the confirmation-depth counts;
         // `safeSource` on `helios_bsc_syncStatus` says which rule actually chose.
         crate::sync::fast_finality_head(chain, snapshot, conf_safe)
+    }
+
+    /// True when the snapshot carries the BLS vote keys `FinalityMode::Fast` needs.
+    ///
+    /// `read_head` falls back to confirmation depth without them, which is the safe
+    /// direction but a silent one — the caller uses this to say so at startup instead.
+    pub fn fast_finality_armed(&self) -> bool {
+        self.snapshot
+            .lock()
+            .expect("snapshot lock")
+            .as_ref()
+            .is_some_and(Snapshot::fast_finality_available)
     }
 
     pub fn metrics_enabled(&self) -> bool {
@@ -465,6 +496,11 @@ impl Node {
             "helios_bsc_upstream_errors_total",
             "Upstream transport failures fetching the tip (not a verification failure).",
             self.upstream_errors.load(Ordering::Relaxed),
+        );
+        counter(
+            "helios_bsc_request_panics_total",
+            "Requests whose handling panicked and was answered -32603. Alert on any increase.",
+            self.panics.load(Ordering::Relaxed),
         );
 
         let mut gauge = |name: &str, help: &str, v: String| {
@@ -626,14 +662,48 @@ impl Node {
         }
     }
 
-    /// Catch up to the live tip. Used on every wallet read and by the background poller.
+    /// Catch up to the live tip. The background poller. Always goes to the upstream: it is what keeps the coalescing
+    /// window below fed, so a coalesced answer is never older than one poll interval.
     pub fn poll_sync(&self) -> Result<(u64, SafeHead)> {
-        self.refresh()
+        self.refresh_now()
     }
 
+    /// Reuse the last published sync if the chain cannot have moved since.
+    ///
+    /// Every served method calls this first, and it used to mean one upstream
+    /// `eth_blockNumber` per request — so a single 64-element JSON-RPC batch, well inside
+    /// `MAX_RPC_BATCH`, fired 64 upstream calls and burned the operator's quota from one
+    /// request. Each of those also serialised behind the chain lock, so four worker
+    /// threads answered like one.
+    ///
+    /// The window is the fork's block interval, because that is the fastest the chain can
+    /// produce anything new: inside it a fresh poll cannot return a different head, so
+    /// skipping it costs no accuracy at all. It is not a cache with a staleness budget.
     fn refresh(&self) -> Result<(u64, SafeHead)> {
-        let mut chain = self.chain.lock().expect("chain lock");
-        let mut snapshot = self.snapshot.lock().expect("snapshot lock");
+        if let Some(fresh) = self.published_if_fresh() {
+            return Ok(fresh);
+        }
+        self.refresh_now()
+    }
+
+    /// `(head, read head)` from the last sync, or `None` if it is older than one block.
+    fn published_if_fresh(&self) -> Option<(u64, SafeHead)> {
+        let view = self.finality.lock().expect("finality lock");
+        let window = Duration::from_millis(mainnet_current_fork().block_interval_ms);
+        if view.synced_at?.elapsed() >= window {
+            return None;
+        }
+        Some((view.head, view.read_head.clone()?))
+    }
+
+    fn refresh_now(&self) -> Result<(u64, SafeHead)> {
+        // Outside the locks on purpose. This is a network call with a 30 s cap and three
+        // backoff retries behind it; holding `chain` and `snapshot` across it let one slow
+        // upstream stall every worker for minutes. A tip that goes stale while we wait for
+        // the locks is harmless — `resync_locked` treats an already-passed height as a
+        // no-op, and the head published below is read back off the chain, never from this
+        // number, so no consumer can see a head the client has not verified.
+        //
         // Transport failure here is not a verification failure — count it apart so a
         // flaky provider never looks like a lying one on the metrics dashboard.
         let tip = match self.up.block_number() {
@@ -643,6 +713,8 @@ impl Node {
                 return Err(e);
             }
         };
+        let mut chain = self.chain.lock().expect("chain lock");
+        let mut snapshot = self.snapshot.lock().expect("snapshot lock");
         let (safe, conf_safe, verified_this, grew) =
             match self.resync_locked(&mut chain, &mut snapshot, tip) {
                 Ok(v) => v,
@@ -651,24 +723,31 @@ impl Node {
                     return Err(e);
                 }
             };
+        // The head is the highest header this client actually verified, read back off the
+        // chain rather than taken from the `tip` sampled before the locks. A concurrent
+        // sync can have advanced past that number while this thread waited, and pairing an
+        // older tip with a newer chain is how a head, its lag and its source end up
+        // describing different instants.
+        let head = chain.last().map(|b| b.number).unwrap_or(tip);
         // Read the fast-finality heads while the snapshot is still locked, and keep them
         // together with the head they are measured against. Everything published below
         // comes from this one sample, so no consumer can mix two instants.
         let mut view = match snapshot.as_ref() {
             Some(s) => FinalityView {
-                head: tip,
+                head,
                 available: s.fast_finality_available(),
                 justified: s.justified(),
                 finalized: s.finalized(),
                 ..FinalityView::default()
             },
             None => FinalityView {
-                head: tip,
+                head,
                 ..FinalityView::default()
             },
         };
         view.read_head_is_fast = safe.number != conf_safe.number;
         view.read_head = Some(safe.clone());
+        view.synced_at = Some(Instant::now());
         // Publish **while the chain lock is still held**. `docs/slo.md` promises that
         // `helios_bsc_tip_block` and the finality gauges are "published together", and
         // publishing after the drop broke that with four worker threads: the whole sync
@@ -678,7 +757,7 @@ impl Node {
         // staying there until the next sync. These are plain atomic stores plus one
         // uncontended mutex, no I/O, so the critical section does not grow measurably.
         // `/metrics` still reads only atomics and never takes this lock.
-        self.last_tip.store(tip, Ordering::Relaxed);
+        self.last_tip.store(head, Ordering::Relaxed);
         // `last_safe` is the confirmation-depth head, whatever tags resolve to — the SLO
         // bound and its alerts are defined against that rule, so the gauge must not start
         // meaning something else when the flag is on.
@@ -701,7 +780,7 @@ impl Node {
         if grew {
             self.persist_verified_tip();
         }
-        Ok((tip, safe))
+        Ok((head, safe))
     }
 
     /// Advance the locked chain to `tip`. Returns `(safe, newly_verified, grew)`.
@@ -821,6 +900,21 @@ impl Node {
         }
     }
 
+    /// [`Node::dispatch_bytes`], with a panic turned into `Err(())` instead of unwinding
+    /// into the worker loop. See the call site in `serve_one` for why that matters.
+    ///
+    /// `AssertUnwindSafe` is the honest annotation rather than a workaround: everything
+    /// this touches is behind a mutex, and a panic that leaves one poisoned makes every
+    /// later access panic too — caught here, reported, never silently used.
+    pub fn dispatch_caught(&self, buf: &[u8]) -> std::result::Result<Value, RequestPanicked> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.dispatch_bytes(buf))).map_err(
+            |_| {
+                self.panics.fetch_add(1, Ordering::Relaxed);
+                RequestPanicked
+            },
+        )
+    }
+
     pub fn dispatch_bytes(&self, buf: &[u8]) -> Value {
         match serde_json::from_slice::<Value>(buf) {
             Ok(body) => self.dispatch(&body),
@@ -902,14 +996,14 @@ impl Node {
                 self.unverified_qty(id, req, method)
             }
             "helios_bsc_getVerificationStatus" => self.verification_status(id),
-            _ => match method_policy(method) {
-                MethodPolicy::Unsupported => rpc_err(id, ERR_METHOD, "method_unsupported"),
-                MethodPolicy::Unverified if unverified_passthrough_ok(method) => {
-                    rpc_err(id, ERR_METHOD, "unverified_passthrough_disabled")
-                }
-                MethodPolicy::Unverified => rpc_err(id, ERR_METHOD, "method_unsupported"),
-                MethodPolicy::Verified => rpc_err(id, ERR_METHOD, "method_unsupported"),
-            },
+            // Every method the passthrough allow-list names has an explicit arm above,
+            // which is where `unverified_passthrough_disabled` comes from. This arm is
+            // only reached by a method with no handler at all, and each `MethodPolicy`
+            // used to answer exactly the same thing here — including a guard on
+            // `unverified_passthrough_ok` that could never be true. The table is still
+            // the specification; `every_passthrough_method_has_its_own_arm` and
+            // `the_dispatcher_agrees_with_the_method_policy_table` keep the two aligned.
+            _ => rpc_err(id, ERR_METHOD, "method_unsupported"),
         }
     }
 
@@ -3368,9 +3462,14 @@ pub fn serve(node: Arc<Node>, listen: &str) -> Result<()> {
     let _ = std::thread::Builder::new()
         .name("helios-bsc-sync".into())
         .spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_millis(1800));
-            if let Err(e) = poller.poll_sync() {
-                eprintln!("background sync: {e}");
+            std::thread::sleep(Duration::from_millis(1800));
+            // Caught for the same reason as a request: an uncaught panic here ends the
+            // thread, and nothing restarts it. The chain would then only advance on a
+            // request that misses the coalescing window, with no log line saying why.
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| poller.poll_sync())) {
+                Ok(Err(e)) => eprintln!("background sync: {e}"),
+                Err(_) => eprintln!("background sync panicked; poller continues"),
+                Ok(Ok(_)) => {}
             }
         });
 
@@ -3446,7 +3545,30 @@ fn serve_one(node: &Node, mut req: tiny_http::Request, loopback_only: bool) {
         let _ = req.respond(Response::from_string("payload too large").with_status_code(code));
         return;
     }
-    let out = node.dispatch_bytes(&buf);
+    let out = match node.dispatch_caught(&buf) {
+        Ok(v) => v,
+        Err(RequestPanicked) => {
+            // A panic here used to end the worker: `serve_one` is called from
+            // `while let Ok(req) = server.recv()`, so the thread simply left the loop.
+            // Four of those and the listener accepted connections nobody answered, while
+            // the process stayed up and `/metrics` — which reads only atomics — kept
+            // reporting a healthy client. Silent and total.
+            //
+            // Answering `-32603` keeps the worker in its loop. A panic that poisoned a
+            // state lock will then panic again on the next request and be caught again,
+            // so the failure is a visible per-request error instead of a dead server, and
+            // `helios_bsc_request_panics_total` is there to alert on.
+            let mut resp = Response::from_string(
+                rpc_err(Value::Null, ERR_INTERNAL, "internal_error").to_string(),
+            )
+            .with_status_code(500);
+            if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]) {
+                resp = resp.with_header(h);
+            }
+            let _ = req.respond(resp);
+            return;
+        }
+    };
     if out.is_null() {
         let _ = req.respond(Response::from_string("").with_status_code(204));
         return;

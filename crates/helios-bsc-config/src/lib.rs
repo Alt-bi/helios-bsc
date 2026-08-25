@@ -31,7 +31,8 @@ pub const LORENTZ_TIME: u64 = 1_745_903_100;
 pub const MAXWELL_TIME: u64 = 1_751_250_600;
 pub const FERMI_TIME: u64 = 1_768_357_800;
 pub const OSAKA_MENDEL_TIME: u64 = 1_777_343_400;
-/// Scheduled 2026-08-25 02:30 UTC — not live as of the Phase 0 pin date.
+/// Live since 2026-08-25 02:30 UTC. Already in the pinned v1.7.8 tree, and it changes
+/// no Parlia rule — see [`fermi_family`] — so activation needed no client change.
 pub const PASTEUR_TIME: u64 = 1_787_625_000;
 
 pub const DEFAULT_EPOCH_LENGTH: u64 = 200;

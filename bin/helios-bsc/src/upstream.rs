@@ -225,21 +225,50 @@ fn headers_from_batch(arr: &[Value], from: u64, to: u64) -> Result<Vec<RpcBlockH
 /// HTTP JSON-RPC client (ureq).
 pub struct Upstream {
     url: String,
+    /// One agent for the whole client, not one per request.
+    ///
+    /// `ureq::post(url)` runs on what ureq's own docs call a "use-once Agent": it builds a
+    /// connection pool, makes the request, and drops the pool. Every JSON-RPC call then
+    /// pays a fresh TCP connect *and* TLS handshake.
+    ///
+    /// Counted through a local forwarder, one catch-up walk: **59 requests over 59
+    /// connections** before, **55 requests over 3** after. Both BSC endpoints tested
+    /// answer `Connection: keep-alive`, and reuse is worth ~275 ms per call on
+    /// `bsc-rpc.publicnode.com` (440 → 165 ms) and ~500 ms on `bsc-dataseed.bnbchain.org`
+    /// (665 → 162 ms).
+    ///
+    /// Wall time of a *walk* barely moves — that path is paced by its own retry sleeps and
+    /// the provider's proof window, not by handshakes. What this buys is the per-request
+    /// latency on the serving path, where one upstream round trip sits inside every
+    /// answered RPC, and a long-running process that no longer opens a socket per call.
+    ///
+    /// `Agent` is `Send + Sync`, so the parallel header batches in
+    /// `headers_range_parallel` share this one and pool across threads.
+    agent: ureq::Agent,
 }
+
+/// Global cap per HTTP attempt. Retries below multiply it, so this is not the wall
+/// clock a caller waits.
+const UPSTREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl Upstream {
     pub fn new(url: impl Into<String>) -> Self {
-        Self { url: url.into() }
+        Self {
+            url: url.into(),
+            agent: ureq::Agent::config_builder()
+                .timeout_global(Some(UPSTREAM_TIMEOUT))
+                .build()
+                .into(),
+        }
     }
 
     fn post_json(&self, body: &Value) -> Result<Value> {
         const ATTEMPTS: u64 = 4;
         let mut last = anyhow!("no attempt");
         for attempt in 0..ATTEMPTS {
-            match ureq::post(&self.url)
-                .config()
-                .timeout_global(Some(std::time::Duration::from_secs(30)))
-                .build()
+            match self
+                .agent
+                .post(&self.url)
                 .header("Content-Type", "application/json")
                 .header("User-Agent", "helios-bsc")
                 .send_json(body)

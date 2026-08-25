@@ -26,6 +26,7 @@ Wallet mode still maps `latest` → Safe. Do not alert “head is stale” merel
 | `helios_bsc_proof_success_total` | counter | MPT proofs verified against a Safe `stateRoot` |
 | `helios_bsc_proof_fail_total` | counter | MPT proofs rejected — the number to alert on |
 | `helios_bsc_upstream_errors_total` | counter | Transport failures fetching the tip |
+| `helios_bsc_request_panics_total` | counter | Caught request panics, answered `-32603`. Expected to stay at 0; any increase means a poisoned state lock is likely and the process should be restarted |
 | `helios_bsc_tip_block` / `helios_bsc_safe_block` | gauge | Local tip / Safe head |
 | `helios_bsc_safe_lag_blocks` / `_seconds` | gauge | Tip − Safe |
 | `helios_bsc_safe_lag_within_bound` | gauge | 1 inside the bound above, else 0 |
