@@ -1,13 +1,24 @@
 # Proof-fail storm
 
-`eth_getProof` at Safe (lag ~108–112) returns `historical state not available`, `-32001`, or a window error. Wallet `eth_getBalance("latest")` must **fail closed**, not fall back to tip.
+`eth_getProof` at the read head returns `historical state not available`, `-32001`, or a
+window error. Wallet `eth_getBalance("latest")` must **fail closed**, not fall back to tip.
+
+**First establish which head you are on.** Since 2026-08-25 the default is the BLS-finalized
+head at lag ~2, where almost any provider can serve proofs — a storm there is usually the
+provider, not the window. The ~108–112 lag this runbook was written for is what
+`--finality confirmation-depth` asks for, and what a client without BLS vote keys falls back
+to. `helios_bsc_syncStatus.safeSource` and the startup line both name the rule in force.
 
 ## Immediate
 
 1. `helios_bsc_syncStatus` — check `lag` / `safeLagBlocks` / `safeLagSeconds` / `safeLagWithinBound`, `inProofWindow`, `distinctSealers` (≥15), `finality`, `sealingSetEnforced`, `proofFail` (process lifetime). See [SLOs](../slo.md).
-2. If `lag > 112`: wait or swap the proof RPC. Do **not** lower the 15-sealer rule.
-3. If `inProofWindow` is true but proofs still fail: provider jitter. Retry by **hash**, then **number**. Still failing → swap key (Ankr free is knife-edge; paid/archive is the next step).
-4. Soak: `helios-bsc soak --oracle <other-host> --once`. Oracle skips (no historical state) are not mismatches. Mismatch = incident.
+2. If `safeSource` is `confirmation-depth` when you expected `fast-finality`, the checkpoint
+   carries no BLS vote keys — rewrite it (`write-checkpoint` does this by default) rather
+   than hunting a deeper provider.
+3. If `lag > 112` on confirmation depth: wait or swap the proof RPC. Do **not** lower the
+   15-sealer rule.
+4. If `inProofWindow` is true but proofs still fail: provider jitter. Retry by **hash**, then **number**. Still failing → swap key (Ankr free is knife-edge; paid/archive is the next step).
+5. Soak: `helios-bsc soak --oracle <other-host> --once`. Oracle skips (no historical state) are not mismatches. Mismatch = incident.
 
 ## Do not
 

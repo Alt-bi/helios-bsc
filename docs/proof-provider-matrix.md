@@ -41,7 +41,11 @@ Probed with `scripts/probe_eth_get_proof.py` plus a lag sweep (0 / 8 / 16 / 32 /
 
 ## Gate verdict
 
-**PASS with `--finality fast` (2026-08-21). PARTIAL PASS on the default build.**
+**PASS on the default build (fast finality). PARTIAL PASS under `--finality confirmation-depth`.**
+
+> Re-framed 2026-08-25. The measurements below were taken on 2026-08-21, when fast
+> finality was opt-in and confirmation depth was the default; that flipped on 2026-08-25.
+> The numbers are unchanged — what changed is which column describes a stock `run`.
 
 The gate had been stuck since 2026-08-19 on one number: confirmation-depth Safe needs a
 proof ~112 blocks back, and no free provider retains state that deep. BLS fast finality
@@ -63,8 +67,9 @@ End-to-end on that free endpoint with `--finality fast`, head at `tip - 2`:
   block: **8 addresses, 8 match, 0 mismatch, 0 skip.**
 
 So Alt F (self-hosted full node) is **no longer mandatory** for a verified read, and no
-paid key is needed either — provided the operator opts into `--finality fast`. The default
-build still needs a ≥112-block window, which is why this is not a clean full PASS.
+paid key is needed either. Since 2026-08-25 that is the stock configuration rather than an
+opt-in. Only `--finality confirmation-depth` still needs a ≥112-block window, which is why
+this is a PASS with a qualifier rather than an unconditional one.
 
 Two caveats that have not changed:
 
@@ -85,15 +90,16 @@ Next:
 
 ## What Fast Finality changes here (2026-08-21)
 
-**Every Pass? column in the table above was measured against the ~112-block requirement
-and is only valid for the default build.** `run --finality fast` needs ~3.
+**Every Pass? column in the table above was measured against the ~112-block requirement,
+which is now what `--finality confirmation-depth` asks for — not what a stock `run` asks
+for.** The default needs ~3.
 
 Re-swept 2026-08-21 with `scripts/sweep_proof_window.py`, which now probes the
 fast-finality lags (0/2/3/5) alongside the deep ones and reports by-hash next to by-number:
 
 | Provider | by-number at lag ≤3 | deepest by-number | Verdict |
 |----------|--------------------|-------------------|---------|
-| `bsc-mainnet.public.blastapi.io` | **OK** (also by hash) | lag 64 OK, 96 fails | **passes `--finality fast`**, fails default |
+| `bsc-mainnet.public.blastapi.io` | **OK** (also by hash) | lag 64 OK, 96 fails | **passes the default (fast finality)**, fails `--finality confirmation-depth` |
 | `bsc-rpc.publicnode.com` | FAIL | none — fails at the tip | **tag-only**; no finality rule helps |
 | `bsc.meowrpc.com` | FAIL (`missing trie node`) | none by number | fails both; by-hash answers were inconsistent across probes, so it is load-balanced across nodes with different pruning |
 | `bsc-dataseed.bnbchain.org` | `limit exceeded` | — | **inconclusive**, rate limit not a window verdict |
