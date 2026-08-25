@@ -594,6 +594,9 @@ fn confirm_loaded_checkpoint(
     }
     if let Some(url) = oracle_url.filter(|u| !u.trim().is_empty()) {
         if !independent_rpc_hosts(upstream, url) {
+            // Not silent, and not fatal either: the operator asked for a second source
+            // and did not get one, which is worth saying even though the run continues.
+            eprintln!("{}", UNCONFIRMED_CHECKPOINT_WARNING);
             eprintln!(
                 "ignoring --checkpoint-oracle: same host as upstream ({})",
                 rpc_host(url)
@@ -602,9 +605,23 @@ fn confirm_loaded_checkpoint(
         }
         confirm_checkpoint_with_oracle(cp, &Upstream::new(url))?;
         eprintln!("checkpoint oracle OK ({})", rpc_host(url));
+        return Ok(());
+    }
+    if checkpoint_path.is_some() {
+        eprintln!("{}", UNCONFIRMED_CHECKPOINT_WARNING);
     }
     Ok(())
 }
+
+/// Said whenever a checkpoint is loaded without an independent source agreeing to it.
+///
+/// Everything this client verifies is verified *relative to the checkpoint*: the sealing
+/// set comes from it, and every later header is checked against that set. A checkpoint
+/// taken from a lying provider is therefore not one bad answer among many — it is a
+/// self-consistent fake chain that passes every check downstream of it. That single fact
+/// used to be the one thing the client never mentioned; `checkpoint_policy` already warns
+/// when there is *no* checkpoint, and this is the symmetric case.
+const UNCONFIRMED_CHECKPOINT_WARNING: &str = "warning: checkpoint not confirmed by a second source — it is the whole root of trust here, and every later check is relative to it. Pass --checkpoint-oracle <other-host> (add --require-multisource-checkpoint to make disagreement fatal).";
 
 fn checkpoint_age_secs(timestamp: u64, now: u64) -> u64 {
     helios_bsc_consensus::checkpoint_age_secs(timestamp, now)
@@ -1682,6 +1699,26 @@ mod cli_tests {
             }
             other => panic!("expected Soak, got {other:?}"),
         }
+    }
+
+    /// The checkpoint is the whole root of trust: the sealing set comes from it and every
+    /// later header is checked against that set, so a checkpoint from a lying provider is
+    /// a self-consistent fake chain rather than one bad answer. Loading one unconfirmed
+    /// used to say nothing at all. Pinned so the warning cannot quietly lose the parts
+    /// that make it actionable.
+    #[test]
+    fn the_unconfirmed_checkpoint_warning_says_what_to_do() {
+        let w = UNCONFIRMED_CHECKPOINT_WARNING;
+        assert!(w.starts_with("warning:"), "{w}");
+        assert!(
+            w.contains("root of trust"),
+            "it must say why it matters: {w}"
+        );
+        assert!(w.contains("--checkpoint-oracle"), "and how to fix it: {w}");
+        assert!(
+            w.contains("--require-multisource-checkpoint"),
+            "and how to make it fatal: {w}"
+        );
     }
 
     #[test]

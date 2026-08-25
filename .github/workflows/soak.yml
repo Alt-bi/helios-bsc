@@ -48,6 +48,10 @@ jobs:
       # finality cross-check is the only check that tests our attestation bookkeeping
       # against geth's own answer. Most public BSC endpoints answer -32601 for it.
       ORACLE: https://bsc-rpc.publicnode.com
+      # Third host, used only to confirm the checkpoint. It has to be a third: the
+      # checkpoint is written from ORACLE, so confirming it there is circular, and
+      # confirming it against UPSTREAM is refused as the same host that serves the proofs.
+      CHECKPOINT_ORACLE: https://bsc-dataseed.bnbchain.org
     steps:
       - uses: actions/checkout@v7
 
@@ -84,16 +88,22 @@ jobs:
 
       - name: Soak vs an independent oracle
         # `--finality fast` is what `run` now serves by default, so it is what needs
-        # watching. --min-unique is deliberately low: a red build that is usually a
-        # throttled provider gets ignored, and an ignored detector is worse than none.
-        # Real failures do not depend on it — a mismatch or a wedged walk fails the run
-        # on its own.
+        # watching. `--require-multisource-checkpoint` makes this exercise the strict
+        # path: three independent hosts, and a checkpoint no two of them agree on is
+        # fatal rather than a warning.
+        #
+        # --min-unique is deliberately low: a red build that is usually a throttled
+        # provider gets ignored, and an ignored detector is worse than none. Real
+        # failures do not depend on it — a mismatch or a wedged walk fails the run on
+        # its own.
         run: |
           set -euo pipefail
           ./target/release/helios-bsc soak \
             --upstream "$UPSTREAM" \
             --oracle "$ORACLE" \
             --checkpoint checkpoint.json \
+            --checkpoint-oracle "$CHECKPOINT_ORACLE" \
+            --require-multisource-checkpoint \
             --finality fast \
             --state soak-state.json \
             --duration-secs "${{ github.event_name == 'schedule' && '2700' || inputs.duration_secs || '600' }}" \
