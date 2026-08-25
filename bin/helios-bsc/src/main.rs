@@ -159,8 +159,15 @@ enum Commands {
         #[arg(long)]
         sealing_set: Option<String>,
         /// Epoch block whose extraData is the *next* set. Only after minerHistoryCheckLen at --block.
+        /// Optional: derived from --block when omitted.
         #[arg(long)]
         sealing_set_from_epoch: Option<String>,
+        /// Second, independent host that must agree on the checkpoint header.
+        ///
+        /// The checkpoint is the whole root of trust — every later check is relative to
+        /// it — so confirming it belongs at the moment it is created, not later.
+        #[arg(long, env = "HELIOS_BSC_CHECKPOINT_ORACLE")]
+        checkpoint_oracle: Option<String>,
         #[arg(long)]
         out: PathBuf,
     },
@@ -360,12 +367,14 @@ async fn main() -> Result<()> {
             block,
             sealing_set,
             sealing_set_from_epoch,
+            checkpoint_oracle,
             out,
         } => write_checkpoint(
             &upstream,
             &block,
             sealing_set.as_deref(),
             sealing_set_from_epoch.as_deref(),
+            checkpoint_oracle.as_deref(),
             &out,
         ),
         Commands::Soak {
@@ -681,6 +690,34 @@ fn fetch_header(up: &Upstream, block: &str) -> Result<RpcBlockHeader> {
 /// `walk_from_checkpoint` refuses such a checkpoint because adopting the announced set
 /// would mean trusting an unverified header; catching it at write time turns a restart
 /// failure into an immediate one, with a block number the operator can use instead.
+/// The epoch whose `extraData` holds the sealing set in force at `number`.
+///
+/// The newest boundary at or below the block, and a refusal when that epoch has not
+/// activated yet — the same window [`assert_outside_activation_window`] refuses, said
+/// here so the operator gets a usable block number instead of a set that is about to be
+/// replaced.
+fn epoch_in_force(up: &Upstream, number: u64, epoch_length: u64) -> Result<u64> {
+    if epoch_length == 0 {
+        bail!("cannot derive an epoch: epoch length is 0 for block {number}");
+    }
+    let epoch_block = (number / epoch_length) * epoch_length;
+    let Some(prev_block) = epoch_block.checked_sub(epoch_length) else {
+        bail!("block {number} is in the first epoch; name a sealing set explicitly");
+    };
+    let epoch_header = fetch_header(up, &format!("0x{epoch_block:x}"))?;
+    let prev_header = fetch_header(up, &format!("0x{prev_block:x}"))?;
+    match epoch_seed_at(number, epoch_length, &epoch_header, &prev_header)? {
+        EpochSeed::Active { epoch_block, .. } => Ok(epoch_block),
+        EpochSeed::PendingActivation {
+            epoch_block,
+            activate_at,
+        } => bail!(
+            "block {number} is inside epoch {epoch_block}'s activation window (the set announced there takes effect at {activate_at}) — write the checkpoint at block {} instead",
+            epoch_block.saturating_sub(1)
+        ),
+    }
+}
+
 fn assert_outside_activation_window(
     up: &Upstream,
     number: u64,
@@ -727,6 +764,7 @@ fn write_checkpoint(
     block: &str,
     sealing_set: Option<&str>,
     sealing_set_from_epoch: Option<&str>,
+    checkpoint_oracle: Option<&str>,
     out: &std::path::Path,
 ) -> Result<()> {
     let up = Upstream::new(url);
@@ -738,6 +776,7 @@ fn write_checkpoint(
     // confirmation-depth until the client sees an epoch header for itself.
     let mut vote_keys: Option<Vec<String>> = None;
     let mut chosen_epoch: Option<u64> = None;
+    let fork = params_at(number, timestamp);
     let set = match (sealing_set, sealing_set_from_epoch) {
         (Some(s), None) => parse_sealing_set(s)?,
         (None, Some(epoch_id)) => {
@@ -749,12 +788,22 @@ fn write_checkpoint(
         (Some(_), Some(_)) => {
             bail!("pass either --sealing-set or --sealing-set-from-epoch, not both")
         }
-        (None, None) => bail!(
-            "need --sealing-set (operator addresses) or --sealing-set-from-epoch (activated epoch extraData, not miners)"
-        ),
+        // Neither flag: derive the epoch in force at `--block` and read the set from it.
+        //
+        // Naming it by hand never added any trust — the operator computed
+        // `floor(block / epochLength) * epochLength` and typed it in, and the header still
+        // came from the same upstream. What it did add was a barrier in front of the very
+        // first command anyone runs, and an easy way to name a superseded epoch. The
+        // trust control is `--checkpoint-oracle`, not this arithmetic.
+        (None, None) => {
+            let epoch_block = epoch_in_force(&up, number, fork.epoch_length)?;
+            let epoch_header = fetch_header(&up, &format!("0x{epoch_block:x}"))?;
+            chosen_epoch = Some(epoch_block);
+            vote_keys = Some(vote_keys_from_activated_epoch(&epoch_header, number)?);
+            sealing_set_from_activated_epoch(&epoch_header, number)?
+        }
     };
-    let fork = params_at(number, timestamp);
-    let attestation = if sealing_set_from_epoch.is_some() {
+    let attestation = if chosen_epoch.is_some() {
         Some("helios-bsc write-checkpoint from activated epoch extraData".into())
     } else {
         Some("helios-bsc write-checkpoint".into())
@@ -765,6 +814,20 @@ fn write_checkpoint(
         None => cp,
     };
     cp.validate_basic()?;
+    // Before the file exists, not after: a checkpoint a second host will not vouch for
+    // should never be written at all.
+    match checkpoint_oracle.map(str::trim).filter(|u| !u.is_empty()) {
+        Some(oracle) if !independent_rpc_hosts(url, oracle) => bail!(
+            "--checkpoint-oracle must be a different host than --upstream (both {})",
+            rpc_host(oracle)
+        ),
+        Some(oracle) => {
+            confirm_checkpoint_with_oracle(&cp, &Upstream::new(oracle))
+                .context("checkpoint oracle disagrees")?;
+            println!("oracle    {} agrees", rpc_host(oracle));
+        }
+        None => eprintln!("{UNCONFIRMED_CHECKPOINT_WARNING}"),
+    }
     // Refuse here what `walk_from_checkpoint` would refuse at run time, so the operator
     // finds out while writing the file rather than at the next restart. Roughly one block
     // in twelve falls in this window.
