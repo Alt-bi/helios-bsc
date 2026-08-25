@@ -61,7 +61,11 @@ Validators present **only** on epoch blocks (`number % epochLength == 0`).
 | vanity 32 | vote attestation RLP (or empty) | seal 65 |
 ```
 
-`n` is typically **21**. Each validator record is **68 bytes**. `turnLength` is typically **16**.
+`n` is **21** on live mainnet. Each validator record is **68 bytes** (20-byte address + 48-byte BLS key).
+`turnLength` is **8** on live mainnet, read from the epoch header — never assume it. The constant
+`defaultTurnLength` in the pinned source is **1**; the **16** that appears in a `snapshot.go`
+comment is geth anticipating a future value, not one this chain has used. Hard-coding either is
+the mistake this appendix exists to prevent.
 
 ## Seal verification (MVP-1, per header)
 
@@ -160,7 +164,9 @@ VoteAttestation {
 - Plato+ (`block ≥ 30_720_096`): invalid attestation **rejects** the header.
 - Fermi+: attestation target may be an ancestor up to `kAncestorGenerationDepth = 3`, not only the parent.
 
-**MVP-1 does not verify BLS.** Record only: fixtures should keep raw `extraData` so PR 7 can parse attestations later.
+**BLS is verified** as of MVP-2: the aggregate signature is checked against the epoch vote keys
+(`blst`, min_pk, POP DST) over `keccak256(RLP(VoteData))`, with the bitset mapped onto the sealing
+set sorted by address. See [fast-finality.md](./fast-finality.md). Fixtures keep raw `extraData`.
 
 ## Light-client rules (MVP-1)
 
@@ -192,8 +198,9 @@ for h in headers_from_checkpoint:
         safe = some_ancestor_meeting_policy(h)   # confirmation-depth head
 ```
 
-## What is still fixture-gated (not blocked on more reading)
+## Fixture coverage (all closed)
 
-- Real epoch-boundary `extraData` bytes at `number % 1000 == 0` and the following non-epoch header.
-- One mutated-seal / mutated-proof fail vector.
-- Live `eth_getProof` by hash/number (provider matrix).
+- Real epoch-boundary `extraData` at `number % 1000 == 0` and the following non-epoch header —
+  `fixtures/mainnet/`, epoch 116664000 ±2, live `n=21`, `turnLength=8`.
+- Mutated-seal and mutated-proof fail vectors — in the adversarial suite.
+- Live `eth_getProof` by hash/number — [proof-provider-matrix.md](./proof-provider-matrix.md).
