@@ -1,0 +1,92 @@
+name: upstream-pin
+
+# Weekly watch on the geth release this client is pinned to.
+#
+# Every consensus rule here is transcribed from one commit of `bnb-chain/bsc`. When BSC
+# ships a fork, nothing in this repository notices: the client simply stops walking the
+# chain one day, and whoever runs it concludes "something broke". That has already
+# happened twice — see the soak workflow.
+#
+# So this does not update anything. It tells you a new release exists and, more usefully,
+# whether it touched the Parlia files this client actually transcribes. A release that
+# leaves them byte-identical is a re-pin at leisure; one that changes them is work.
+#
+# Fails the job rather than opening an issue: a failed scheduled run already mails the
+# repository owner, and keeping `contents: read` means this workflow can never write to
+# the repository it is watching.
+
+on:
+  schedule:
+    - cron: "41 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compare the pin with the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # sed, not `grep -oP`: PCRE is a build option and refuses to run under some
+          # locales. A silently empty tag here would compare unequal to every release and
+          # cry wolf every week, so it is checked rather than assumed.
+          cfg=crates/helios-bsc-config/src/lib.rs
+          pinned_tag=$(sed -n 's/.*BSC_UPSTREAM_TAG: &str = "\([^"]*\)".*/\1/p' "$cfg")
+          pinned_commit=$(sed -n 's/.*BSC_UPSTREAM_COMMIT: &str = "\([^"]*\)".*/\1/p' "$cfg")
+          if [ -z "$pinned_tag" ] || [ -z "$pinned_commit" ]; then
+            echo "::error::Could not read the pin out of $cfg — the constants moved or were renamed."
+            exit 1
+          fi
+          echo "pinned: $pinned_tag ($pinned_commit)"
+
+          # Newest non-prerelease. Alphas carry unshipped forks and are never a pin target.
+          #
+          # Deliberately one page, not `--paginate`: gh applies `--jq` to each page
+          # separately, so `[...][0]` with pagination returns the first match on *every*
+          # page and `latest` comes back multi-line. The API returns newest-first, so one
+          # page of 100 is more than enough.
+          latest=$(gh api 'repos/bnb-chain/bsc/releases?per_page=100' \
+                   --jq '[.[] | select(.prerelease == false and .draft == false)][0].tag_name')
+          echo "latest release: $latest"
+
+          if [ "$latest" = "$pinned_tag" ]; then
+            echo "Pin is current."
+            exit 0
+          fi
+
+          echo "::group::Parlia diff $pinned_tag -> $latest"
+          changed=""
+          for f in consensus/parlia/parlia.go consensus/parlia/snapshot.go \
+                   consensus/parlia/ramanujanfork.go params/config.go; do
+            a=$(mktemp); b=$(mktemp)
+            if ! curl -sSfL -m 60 "https://raw.githubusercontent.com/bnb-chain/bsc/$pinned_commit/$f" -o "$a"; then
+              echo "could not fetch $f at the pin"; continue
+            fi
+            if ! curl -sSfL -m 60 "https://raw.githubusercontent.com/bnb-chain/bsc/$latest/$f" -o "$b"; then
+              echo "could not fetch $f at $latest"; continue
+            fi
+            if cmp -s "$a" "$b"; then
+              echo "unchanged: $f"
+            else
+              changed="$changed $f"
+              echo "CHANGED:   $f"
+              diff -u "$a" "$b" | head -60 || true
+            fi
+          done
+          echo "::endgroup::"
+
+          if [ -n "$changed" ]; then
+            echo "::error::BSC $latest changes files this client transcribes:$changed — re-read them and re-pin before the fork goes live."
+          else
+            echo "::error::BSC $latest is out (pinned: $pinned_tag). The Parlia files this client transcribes are byte-identical, so this is a re-pin at leisure, not a rule change."
+          fi
+          exit 1

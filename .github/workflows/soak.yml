@@ -1,0 +1,132 @@
+name: soak
+
+# Nightly differential soak against live BSC mainnet.
+#
+# This exists because of how this client has actually failed. Twice the cause was
+# fork-parameter drift, not a coding mistake: the pre-Fermi attestation-target rule
+# wedged the client on honest mainnet headers, and `turnLength` was a compile-time
+# constant that would wedge it the day validators vote it up. Neither was caught by the
+# suite — every fixture pins the chain as it was when the fixture was taken. Only a run
+# against the live chain can notice, and only a *scheduled* one notices without somebody
+# remembering to look.
+#
+# Free to run: the repository is public, so Actions minutes are not billed, and both
+# endpoints below are keyless. No secrets, which is also why this is safe to read.
+#
+# Note: GitHub disables `schedule` on repositories with no activity for 60 days. If this
+# job stops appearing, that is why — push anything, or re-enable it in the Actions tab.
+
+on:
+  schedule:
+    # 03:17 UTC. Off the hour on purpose: the top of the hour is when every other cron on
+    # the platform fires, and the public RPC endpoints feel it.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      duration_secs:
+        description: "Soak seconds (manual runs; the nightly schedule always uses 2700)"
+        required: false
+        default: "600"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: soak
+  cancel-in-progress: false
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    # The soak itself is capped at 45 min; the rest is build and checkout headroom.
+    timeout-minutes: 75
+    env:
+      # Proof upstream. At the BLS-finalized head the required window is ~2 blocks rather
+      # than ~112, which this free keyless endpoint clears.
+      UPSTREAM: https://bsc-mainnet.public.blastapi.io
+      # Oracle. Must be a different host, and must serve the `parlia_` namespace: the
+      # finality cross-check is the only check that tests our attestation bookkeeping
+      # against geth's own answer. Most public BSC endpoints answer -32601 for it.
+      ORACLE: https://bsc-rpc.publicnode.com
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release -p helios-bsc --locked
+
+      - name: Write a fresh checkpoint
+        # Written every run rather than committed: a checkpoint goes stale in 24h, and
+        # writing it here means `write-checkpoint` — including the epoch-activation
+        # refusal — is exercised nightly too.
+        run: |
+          set -euo pipefail
+          tip=$(curl -sS --retry 3 --retry-delay 5 -m 30 \
+                 -H 'Content-Type: application/json' -H 'User-Agent: helios-bsc-ci' \
+                 -d '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
+                 "$ORACLE" | python3 -c 'import json,sys; print(int(json.load(sys.stdin)["result"],16))')
+          epoch=$(( tip / 1000 * 1000 ))
+          block=$tip
+          # A checkpoint inside an epoch's activation window is refused by design; step
+          # back to the previous epoch's tail instead of retrying into the same refusal.
+          if [ $(( tip - epoch )) -lt 87 ]; then
+            block=$(( epoch - 1 ))
+            epoch=$(( epoch - 1000 ))
+          fi
+          echo "tip=$tip checkpoint=$block epoch=$epoch"
+          ./target/release/helios-bsc write-checkpoint \
+            --upstream "$ORACLE" \
+            --block "$(printf '0x%x' "$block")" \
+            --sealing-set-from-epoch "$(printf '0x%x' "$epoch")" \
+            --out checkpoint.json
+
+      - name: Soak vs an independent oracle
+        # `--finality fast` is what `run` now serves by default, so it is what needs
+        # watching. --min-unique is deliberately low: a red build that is usually a
+        # throttled provider gets ignored, and an ignored detector is worse than none.
+        # Real failures do not depend on it — a mismatch or a wedged walk fails the run
+        # on its own.
+        run: |
+          set -euo pipefail
+          ./target/release/helios-bsc soak \
+            --upstream "$UPSTREAM" \
+            --oracle "$ORACLE" \
+            --checkpoint checkpoint.json \
+            --finality fast \
+            --state soak-state.json \
+            --duration-secs "${{ github.event_name == 'schedule' && '2700' || inputs.duration_secs || '600' }}" \
+            --min-unique 3 \
+            2>&1 | tee soak.log
+
+      - name: Classify the failure
+        if: failure()
+        # A human reading the failure mail should know in five seconds whether to care.
+        # A mismatch means an oracle and a proof disagreed and is always worth reading; a
+        # wedged walk usually means a fork moved under the pin; everything else is the
+        # providers having a bad night.
+        run: |
+          if grep -q "MISMATCH" soak.log 2>/dev/null; then
+            echo "::error::VERIFICATION MISMATCH — a proof and the oracle disagreed. Read soak.log."
+            grep -B2 -A2 "MISMATCH" soak.log | head -40
+          elif grep -q "compared nothing" soak.log 2>/dev/null; then
+            echo "::error::WALK WEDGED — the client refuses headers the chain accepts. Suspect a fork parameter; check the upstream-pin job."
+            grep -E "snapshot [0-9]+|cascading|wait window" soak.log | tail -20
+          elif grep -qE "parlia_\* finality cross-check never ran" soak.log 2>/dev/null; then
+            echo "::warning::The oracle stopped serving parlia_*. Not a client fault; pick another oracle."
+          else
+            echo "::warning::No mismatch and no wedge — most likely provider throttling. Check the SKIP lines."
+            grep -E "SKIP" soak.log | tail -20
+          fi
+
+      - name: Upload log and state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-${{ github.run_id }}
+          path: |
+            soak.log
+            soak-state.json
+            checkpoint.json
+          retention-days: 30
