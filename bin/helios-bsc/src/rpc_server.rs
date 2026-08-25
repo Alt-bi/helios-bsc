@@ -14,17 +14,17 @@ use helios_bsc_config::{
 #[cfg(test)]
 use helios_bsc_consensus::VoteData;
 use helios_bsc_consensus::{
-    checkpoint_age_secs, checkpoint_at_snapshot, header_hash, proof_lag, unix_now,
+    checkpoint_age_secs, checkpoint_at_snapshot, ecrecover, header_hash, proof_lag, unix_now,
     within_proof_window, Snapshot, VerifiedBlock,
 };
 use helios_bsc_execution::{
-    encode_consensus_receipt, encode_data32, encode_qty, eth_call_verified,
-    eth_estimate_gas_verified, pad32, retain_requested_storage, tx_to_address, validate_bsc_raw_tx,
-    verify_account_code, verify_eth_get_proof, verify_receipt_list, verify_storage_slot,
-    verify_tx_list, CallBlock, CallError, CallTx, ConsensusLog, ConsensusReceipt, EthAccountProof,
-    ProofError, ProveAtSafe, VerifiedAccount, CALL_GAS_CAP, EMPTY_CODE_HASH, EMPTY_TRIE_ROOT,
-    MAX_CALL_ACCOUNTS, MAX_CALL_DATA, MAX_CODE_SIZE, MAX_LOG_TOPICS, MAX_ORDERED_TRIE_ITEMS,
-    MAX_RAW_TX, MAX_RECEIPT_LOGS,
+    contract_address, encode_consensus_receipt, encode_data32, encode_qty, eth_call_verified,
+    eth_estimate_gas_verified, pad32, retain_requested_storage, tx_gas_price, tx_nonce,
+    tx_signing_hash, tx_to_address, validate_bsc_raw_tx, verify_account_code, verify_eth_get_proof,
+    verify_receipt_list, verify_storage_slot, verify_tx_list, CallBlock, CallError, CallTx,
+    ConsensusLog, ConsensusReceipt, EthAccountProof, ProofError, ProveAtSafe, VerifiedAccount,
+    CALL_GAS_CAP, EMPTY_CODE_HASH, EMPTY_TRIE_ROOT, MAX_CALL_ACCOUNTS, MAX_CALL_DATA,
+    MAX_CODE_SIZE, MAX_LOG_TOPICS, MAX_ORDERED_TRIE_ITEMS, MAX_RAW_TX, MAX_RECEIPT_LOGS,
 };
 use helios_bsc_rpc::{
     jsonrpc_id_ok, jsonrpc_is_v2, jsonrpc_params_len, jsonrpc_params_ok, rpc_err, rpc_err_data,
@@ -1759,6 +1759,13 @@ impl Node {
         // unprovable rather than wrong. Leave the label alone there instead of failing an
         // otherwise verified read — `docs/rpc-matrix.md` records that this is conditional.
         if let Some(envelopes) = self.bind_tx_envelopes(hdr)? {
+            // Sealed header field, so it is consensus-verified. Parlia's is the constant
+            // zero; reading it keeps the arithmetic right if that ever changes.
+            let base_fee = hdr
+                .base_fee_per_gas
+                .as_deref()
+                .and_then(|h| u128::from_str_radix(h.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0);
             for (i, item) in items.iter_mut().enumerate() {
                 let Some(envelope) = envelopes.get(i) else {
                     return Err((
@@ -1782,14 +1789,50 @@ impl Node {
                 // would be a bug in this client: leave the echoed value rather than
                 // inventing a recipient.
                 if let Ok(to) = tx_to_address(envelope) {
-                    if let Value::Object(map) = &mut item.json {
+                    let Value::Object(map) = &mut item.json else {
+                        continue;
+                    };
+                    map.insert(
+                        "to".into(),
+                        match to {
+                            Some(a) => json!(format!("0x{}", hex::encode(a))),
+                            None => Value::Null,
+                        },
+                    );
+                    // The sender is not a field of the envelope: it is recovered from the
+                    // signature over it. Because the envelope is bound to the sealed root,
+                    // the recovered address is as verified as the bytes it comes from.
+                    // `effectiveGasPrice` is what the sender actually paid per unit of
+                    // gas: the envelope's own price for a legacy tx, and EIP-1559's
+                    // `base + min(tip, cap - base)` otherwise. The base fee comes from the
+                    // sealed header, so no arm of this is taken on an upstream's word.
+                    if let Ok(price) = tx_gas_price(envelope) {
                         map.insert(
-                            "to".into(),
-                            match to {
-                                Some(a) => json!(format!("0x{}", hex::encode(a))),
-                                None => Value::Null,
-                            },
+                            "effectiveGasPrice".into(),
+                            json!(format!("0x{:x}", price.effective(base_fee))),
                         );
+                    }
+                    if let Some(from) = tx_signing_hash(envelope)
+                        .ok()
+                        .and_then(|(digest, sig)| ecrecover(&digest, &sig).ok())
+                    {
+                        map.insert("from".into(), json!(format!("0x{}", hex::encode(from))));
+                        // A call has no contract address; a creation's is fixed by
+                        // consensus as keccak(rlp([sender, nonce]))[12..].
+                        match to {
+                            Some(_) => {
+                                map.insert("contractAddress".into(), Value::Null);
+                            }
+                            None => {
+                                if let Ok(nonce) = tx_nonce(envelope) {
+                                    let addr = contract_address(&from, nonce);
+                                    map.insert(
+                                        "contractAddress".into(),
+                                        json!(format!("0x{}", hex::encode(addr))),
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
             }

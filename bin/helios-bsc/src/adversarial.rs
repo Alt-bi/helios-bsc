@@ -7,10 +7,10 @@ use crate::sync::{
 };
 use crate::{Node, RpcUpstream};
 use anyhow::{anyhow, Result};
-use helios_bsc_consensus::{header_hash, newest_safe, Snapshot, VerifiedBlock};
+use helios_bsc_consensus::{ecrecover, header_hash, newest_safe, Snapshot, VerifiedBlock};
 use helios_bsc_execution::{
-    encode_consensus_receipt, encode_data32, encode_qty, ordered_trie_root, ConsensusReceipt,
-    EMPTY_TRIE_ROOT, MAX_CALL_ACCOUNTS, MAX_RAW_TX, TX_GAS,
+    encode_consensus_receipt, encode_data32, encode_qty, ordered_trie_root, tx_signing_hash,
+    ConsensusReceipt, EMPTY_TRIE_ROOT, MAX_CALL_ACCOUNTS, MAX_RAW_TX, TX_GAS,
 };
 use helios_bsc_mock::{
     cycling_sealer_chain, distinct_sealer_chain, header_from_verified, headers_from_chain, n_seal,
@@ -2554,6 +2554,76 @@ fn receipt_labelled_with_the_wrong_transaction_is_refused() {
             .unwrap_or_default()
             .contains("transactionsRoot"),
         "{bad}"
+    );
+}
+
+/// Sender recovery must agree with the chain on every EIP-2718 envelope type.
+///
+/// This is the check that decides whether `from` can be derived at all. Getting a signing
+/// hash subtly wrong does not fail loudly — it recovers a **different, well-formed
+/// address**, which is worse than the echoed value it replaces. So the fixture is five
+/// real mainnet envelopes, one per type, and the expected sender is what BSC's own RPC
+/// reports for them.
+#[test]
+fn sender_recovery_matches_the_chain_for_every_tx_type() {
+    #[derive(serde::Deserialize)]
+    struct Tx {
+        r#type: u8,
+        from: String,
+        raw: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Doc {
+        transactions: Vec<Tx>,
+    }
+    let doc: Doc =
+        serde_json::from_str(include_str!("../../../fixtures/mainnet/txs_sender.json")).unwrap();
+    assert_eq!(doc.transactions.len(), 5, "one envelope per EIP-2718 type");
+    for tx in &doc.transactions {
+        let bytes = decode_hex(&tx.raw).unwrap();
+        let (digest, sig) = tx_signing_hash(&bytes)
+            .unwrap_or_else(|e| panic!("type 0x{:02x}: signing hash: {e}", tx.r#type));
+        let got = ecrecover(&digest, &sig)
+            .unwrap_or_else(|e| panic!("type 0x{:02x}: recover: {e}", tx.r#type));
+        assert_eq!(
+            format!("0x{}", hex::encode(got)),
+            tx.from.to_lowercase(),
+            "type 0x{:02x} recovered the wrong sender",
+            tx.r#type
+        );
+    }
+}
+
+/// One flipped byte in the envelope must not still recover the real sender.
+///
+/// A recovery that ignored part of the preimage would pass the fixture above while
+/// binding nothing: mutate a field and the answer has to move.
+#[test]
+fn a_mutated_envelope_does_not_recover_the_same_sender() {
+    #[derive(serde::Deserialize)]
+    struct Tx {
+        from: String,
+        raw: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Doc {
+        transactions: Vec<Tx>,
+    }
+    let doc: Doc =
+        serde_json::from_str(include_str!("../../../fixtures/mainnet/txs_sender.json")).unwrap();
+    let tx = &doc.transactions[0];
+    let mut bytes = decode_hex(&tx.raw).unwrap();
+    // Middle of the payload: a value or calldata byte, not the type prefix or the seal.
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0x01;
+    let recovered = tx_signing_hash(&bytes)
+        .ok()
+        .and_then(|(d, s)| ecrecover(&d, &s).ok())
+        .map(|a| format!("0x{}", hex::encode(a)));
+    assert_ne!(
+        recovered.as_deref(),
+        Some(tx.from.to_lowercase().as_str()),
+        "a mutated envelope recovered the real sender: the preimage is not binding"
     );
 }
 
