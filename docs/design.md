@@ -251,7 +251,7 @@ checkpoint := {
 
 **Security note (parity with Helios):** A malicious checkpoint syncs the client to the wrong chain. Mitigations:
 
-- Prefer checkpoints within **MVP max age driven by header-walk cost**: default **≤24 hours** (configurable; soft warn >6h; hard fail default >24h under `--strict-checkpoint-age`). The old “7–14 days like Helios” window is **unsafe as a UX default here**—see Sync performance.
+- Prefer checkpoints within **MVP max age driven by header-walk cost**: default **≤24 hours** (configurable; soft warn >6h; hard fail default >24h; `--max-checkpoint-age-hours` retunes it and `--allow-stale-checkpoint` overrides). The old “7–14 days like Helios” window is **unsafe as a UX default here**—see Sync performance.
 - Cross-check hash/number/`stateRoot` across **≥2 independent sources** (explorers + RPCs) before accept (`--require-multisource-checkpoint`).
 - Persist last verified safe/finalized header as next start checkpoint (Helios pattern)—**this is what makes day-2 sync cheap**.
 - Document that community checkpoint lists are **best-effort**, not a security oracle.
@@ -490,27 +490,33 @@ Default: **refuse** unsupported methods. Opt-in `--allow-unverified-passthrough`
 
 This project does not require changes to unrelated production APIs.
 
-### CLI (sketch)
+### CLI
 
 ```bash
-helios-bsc \
-  --network bsc-mainnet \
-  --execution-rpc https://bsc-dataseed.example \
-  --execution-rpc https://backup.example/bsc \
-  --checkpoint 0x… \
-  --checkpoint-file ~/.helios-bsc/checkpoint.json \
-  --max-checkpoint-age 24h \
-  --rpc-bind 127.0.0.1 --rpc-port 8545 \
-  --finality confirmation-depth \
-  # run --finality fast        # opt-in: latest/safe/finalized resolve to the BEP-126 BLS-finalized
-  #                            # head (~2 blocks behind) instead of confirmation depth (~110).
-  #                            # Needs vote keys (checkpoint written --sealing-set-from-epoch);
-  #                            # falls back to confirmation depth when no finalized head is known.
-  #                            # Attestation *verification* itself is always on — it needs no flag.
-  # min_distinct_sealers derived: floor(2*N_seal/3)+1  (e.g. 15 when N_seal=21)
-  # default (this tree): proof-backed "latest" maps to Safe (wallet mode)
-  # --allow-unsafe-head-reads   # NOT IMPLEMENTED — unused BlockTagMode::AllowUnsafeHead only; do not pass
-  --strict-checkpoint-age
+# 1. Write a checkpoint — the root of trust. Two independent hosts must agree on it.
+helios-bsc write-checkpoint \
+  --upstream https://bsc-rpc.publicnode.com \
+  --checkpoint-oracle https://bsc-dataseed.bnbchain.org \
+  --block latest \
+  --out checkpoint.json
+
+# 2. Serve verified JSON-RPC.
+helios-bsc run \
+  --upstream https://bsc-rpc.publicnode.com \
+  --checkpoint checkpoint.json \
+  --listen 127.0.0.1:8545
+  # --finality confirmation-depth  # pin the ~110-block rule. The default is the BEP-126
+  #                                # BLS-finalized head (~2 blocks), which falls back to
+  #                                # confirmation depth whenever no finalized head is known.
+  #                                # Attestation *verification* is always on; it needs no flag.
+  # --require-checkpoint           # fail rather than run without sealing-set membership
+  # --max-checkpoint-age-hours 24  # default; --allow-stale-checkpoint overrides
+  # --allow-non-loopback           # LAN bind — no in-process auth
+  # --metrics                      # Prometheus text format on GET /metrics
+  # --backup URL                   # transport failover only, never a trust oracle
+  #
+  # min_distinct_sealers is derived, not configurable: floor(2*N_seal/3)+1 = 15 at N_seal=21.
+  # --allow-unsafe-head-reads is NOT IMPLEMENTED (unused BlockTagMode::AllowUnsafeHead).
 ```
 
 ### Library sketch

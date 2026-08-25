@@ -71,14 +71,20 @@ Times are Unix seconds. Block-number forks are absolute heights.
 | **Osaka / Mendel** | time **1_777_343_400** (2026-04-28 02:30 UTC) | 1000 | epoch-embedded (live **8**) | 0.45 s | Execution-layer; no Parlia extraData change observed |
 | **Pasteur** | time **1_787_625_000** (2026-08-25 02:30 UTC) | 1000 (expected) | epoch-embedded (live **8**) | 0.45 s (expected) | Named in `params_at`; extraData family still Bohr. **Re-pin after activation if extraData/epoch/turnLength change.** |
 
-## Current mainnet profile (2026-08-19)
+## Current mainnet profile (verified live 2026-08-25)
 
-Use this until Pasteur activates. After unix `1_787_625_000`, `params_at` names the fork `pasteur` with the **same** Parlia numbers below until a re-pin proves otherwise.
+Pasteur activated at unix `1_787_625_000` (2026-08-25 02:30 UTC). `params_at` now names the
+fork `pasteur`, and every Parlia number below was **confirmed unchanged** against live
+mainnet after activation — `helios-bsc info` reports `live_fork: pasteur` with
+`turn_length: 8`, `n_seal: 21`, `epoch_length: 1000`, and a checkpoint written after
+activation carries `fork=pasteur n_seal=21`. The Parlia *profile* pin stays `fermi`
+because Pasteur changed none of these constants; `info` prints both, as
+`fork_profile: fermi (pin)` and `live_fork: pasteur`.
 
 | Param | Value |
 |-------|------:|
 | `chainId` | 56 |
-| `fork_id` | `fermi` (Mendel/Osaka execution-active; Parlia profile still Fermi) |
+| `fork_id` | `fermi` — the Parlia *profile* pin. Live fork is `pasteur` (active 2026-08-25); it changed no Parlia constant, so the profile did not move |
 | `epoch_length` | 1000 |
 | `turn_length` | **8** (from epoch extraData; do not hard-code 16) |
 | `block_interval_ms` | 450 |

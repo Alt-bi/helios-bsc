@@ -10,6 +10,7 @@ Organised by what you came here to do.
 | [checkpointing.md](checkpointing.md) | What a checkpoint is, how to write one, why two sources matter, when it goes stale |
 | [deploy.md](deploy.md) | Docker, and the rules for binding anywhere but loopback |
 | [slo.md](slo.md) | What "working" looks like — lag targets, Prometheus metrics, what to alert on |
+| [runbooks/proof-fail-storm.md](runbooks/proof-fail-storm.md) | When proofs start failing: what to check, in order, and what not to do |
 
 ## I want to know what to trust
 
@@ -27,6 +28,7 @@ Organised by what you came here to do.
 | [consensus-appendix.md](consensus-appendix.md) | Normative pins into geth's `parlia.go` / `snapshot.go`, with pseudo-code |
 | [hardfork-table.md](hardfork-table.md) | Fork schedule and Parlia constants, pinned to a `bnb-chain/bsc` commit |
 | [proof-provider-matrix.md](proof-provider-matrix.md) | Which RPC providers can actually serve `eth_getProof`, measured |
+| [../fixtures/mainnet/README.md](../fixtures/mainnet/README.md) | The pinned mainnet headers the test suite runs against, and how to capture more |
 
 Also: [STATUS.md](../STATUS.md) for the engineering record of what closed when, and
 [CONTRIBUTING.md](../CONTRIBUTING.md).

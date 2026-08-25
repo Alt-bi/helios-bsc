@@ -215,8 +215,9 @@ One caveat about the differential above, because it bit me while measuring: comp
 requests a second apart legitimately disagree — an artefact that looks exactly like a
 verification failure.
 
-It stays opt-in because changing what `latest` means to a wallet is a behavioural change,
-and the ≥24h differential soak is the gate for making it the default.
+It was held back as opt-in because changing what `latest` means to a wallet is a
+behavioural change. The ≥24 h differential soak that gated it passed 2026-08-24, and it
+became the default on 2026-08-25 — `run --finality confirmation-depth` pins the older rule.
 
 ## Trust model
 
