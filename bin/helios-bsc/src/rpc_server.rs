@@ -8,8 +8,8 @@ use crate::sync::{
 use crate::upstream::RpcUpstream;
 use anyhow::{bail, Result};
 use helios_bsc_config::{
-    expected_safe_lag_blocks, mainnet_current_fork, mainnet_n_seal, max_reorg_depth,
-    safe_lag_seconds, safe_lag_within_slo, PROVIDER_PROOF_LOOKBACK,
+    expected_safe_lag_blocks, mainnet_current_fork, mainnet_min_distinct_sealers, mainnet_n_seal,
+    max_reorg_depth, safe_lag_seconds, safe_lag_within_slo, PROVIDER_PROOF_LOOKBACK,
 };
 #[cfg(test)]
 use helios_bsc_consensus::VoteData;
@@ -208,9 +208,44 @@ impl Node {
         );
         let origin_n = checkpoint.number;
         let fork_id = checkpoint.fork_id.clone();
-        let (chain, snapshot) =
+        let (mut chain, mut snapshot) =
             walk_from_checkpoint(up.as_ref(), checkpoint.clone(), tip, max_sync)?;
-        let safe = safe_of(&chain)?;
+        // Confirmation depth names no head until ~112 blocks of distinct sealers sit
+        // behind the tip, so a checkpoint written at `latest` has nothing to serve yet —
+        // and `write-checkpoint --block latest` followed by `run` exited with "no Safe
+        // head in lookback" and no hint that waiting was the whole fix. The chain
+        // produces ~2.2 blocks a second; extend the walk until a head exists.
+        //
+        // This is a wait, not a weakening: the threshold is unchanged, and a checkpoint
+        // that is genuinely unusable still fails, just with a message that says so.
+        let safe = {
+            let deadline = Instant::now() + Duration::from_secs(180);
+            loop {
+                match safe_of(&chain) {
+                    Ok(s) => break s,
+                    Err(e) => {
+                        if Instant::now() >= deadline {
+                            return Err(e.context(
+                                "no confirmation-depth head after 180s — the checkpoint is too close to the tip for its sealing set to have produced enough distinct sealers",
+                            ));
+                        }
+                        let lag = chain.last().map(|b| b.number).unwrap_or(0);
+                        eprintln!(
+                            "waiting for a confirmation-depth head (walked to {lag}, need ~{} distinct sealers)",
+                            mainnet_min_distinct_sealers()
+                        );
+                        std::thread::sleep(Duration::from_millis(1500));
+                        let newer = up.block_number()?;
+                        append_new_with_snapshot(
+                            up.as_ref(),
+                            &mut chain,
+                            newer,
+                            Some(&mut snapshot),
+                        )?;
+                    }
+                }
+            }
+        };
         let n = chain.len() as u64;
         let justified = snapshot.justified().map(|(b, _)| b);
         let finalized = snapshot.finalized().map(|(b, _)| b);

@@ -30,6 +30,23 @@ pub const BOHR_TIME: u64 = 1_727_317_200;
 pub const LORENTZ_TIME: u64 = 1_745_903_100;
 pub const MAXWELL_TIME: u64 = 1_751_250_600;
 pub const FERMI_TIME: u64 = 1_768_357_800;
+/// Mainnet `CancunTime` (Haber shares the instant). EVM rules, not a Parlia parameter.
+pub const CANCUN_TIME: u64 = 1_718_863_500;
+/// v1.7.8 `params/protocol_params.go`:
+///
+/// ```text
+/// MaxTxGas uint64 = 1 << 24 // Maximum transaction gas limit after eip-7825 (16,777,216).
+/// ```
+///
+/// Enforced from Osaka in `core/state_transition.go`:
+/// `if isOsaka && msg.GasLimit > params.MaxTxGas { ... ErrGasLimitTooHigh }`.
+///
+/// Note this is far below BSC's *block* gas limit — it caps one transaction, not a block.
+pub const MAX_TX_GAS: u64 = 1 << 24;
+
+/// Mainnet `PragueTime`. BSC sets `PascalTime` to the same instant, and this is the fork
+/// that brought EIP-7623's calldata floor cost and the BLS12-381 precompiles.
+pub const PRAGUE_TIME: u64 = 1_742_436_600;
 pub const OSAKA_MENDEL_TIME: u64 = 1_777_343_400;
 /// Live since 2026-08-25 02:30 UTC. Already in the pinned v1.7.8 tree, and it changes
 /// no Parlia rule — see [`fermi_family`] — so activation needed no client change.

@@ -7,6 +7,9 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# EVM fork times live with the rest of the fork table rather than being copied here.
+# `helios-bsc-config` depends only on `-types`, so this adds no cycle.
+helios-bsc-config = { workspace = true }
 helios-bsc-types = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

@@ -594,6 +594,9 @@ fn confirm_loaded_checkpoint(
     }
     if let Some(url) = oracle_url.filter(|u| !u.trim().is_empty()) {
         if !independent_rpc_hosts(upstream, url) {
+            // Not silent, and not fatal either: the operator asked for a second source
+            // and did not get one, which is worth saying even though the run continues.
+            eprintln!("{}", UNCONFIRMED_CHECKPOINT_WARNING);
             eprintln!(
                 "ignoring --checkpoint-oracle: same host as upstream ({})",
                 rpc_host(url)
@@ -602,9 +605,23 @@ fn confirm_loaded_checkpoint(
         }
         confirm_checkpoint_with_oracle(cp, &Upstream::new(url))?;
         eprintln!("checkpoint oracle OK ({})", rpc_host(url));
+        return Ok(());
+    }
+    if checkpoint_path.is_some() {
+        eprintln!("{}", UNCONFIRMED_CHECKPOINT_WARNING);
     }
     Ok(())
 }
+
+/// Said whenever a checkpoint is loaded without an independent source agreeing to it.
+///
+/// Everything this client verifies is verified *relative to the checkpoint*: the sealing
+/// set comes from it, and every later header is checked against that set. A checkpoint
+/// taken from a lying provider is therefore not one bad answer among many — it is a
+/// self-consistent fake chain that passes every check downstream of it. That single fact
+/// used to be the one thing the client never mentioned; `checkpoint_policy` already warns
+/// when there is *no* checkpoint, and this is the symmetric case.
+const UNCONFIRMED_CHECKPOINT_WARNING: &str = "warning: checkpoint not confirmed by a second source — it is the whole root of trust here, and every later check is relative to it. Pass --checkpoint-oracle <other-host> (add --require-multisource-checkpoint to make disagreement fatal).";
 
 fn checkpoint_age_secs(timestamp: u64, now: u64) -> u64 {
     helios_bsc_consensus::checkpoint_age_secs(timestamp, now)
@@ -664,7 +681,12 @@ fn fetch_header(up: &Upstream, block: &str) -> Result<RpcBlockHeader> {
 /// `walk_from_checkpoint` refuses such a checkpoint because adopting the announced set
 /// would mean trusting an unverified header; catching it at write time turns a restart
 /// failure into an immediate one, with a block number the operator can use instead.
-fn assert_outside_activation_window(up: &Upstream, number: u64, epoch_length: u64) -> Result<()> {
+fn assert_outside_activation_window(
+    up: &Upstream,
+    number: u64,
+    epoch_length: u64,
+    chosen_epoch: Option<u64>,
+) -> Result<()> {
     if epoch_length == 0 {
         return Ok(());
     }
@@ -676,6 +698,17 @@ fn assert_outside_activation_window(up: &Upstream, number: u64, epoch_length: u6
     let prev_header = fetch_header(up, &format!("0x{prev_block:x}"))?;
     match epoch_seed_at(number, epoch_length, &epoch_header, &prev_header)? {
         EpochSeed::Active { turn_length, .. } => {
+            // An *already activated* epoch is not automatically the *current* one. Every
+            // epoch below the checkpoint has activated, so `--sealing-set-from-epoch` with
+            // a superseded one passed every check here and wrote a checkpoint carrying a
+            // stale sealing set — which then failed at run time as
+            // "difficulty 2 does not match in-turn (want 1)", a message that says nothing
+            // about the real mistake.
+            if let Some(chosen) = chosen_epoch.filter(|c| *c != epoch_block) {
+                bail!(
+                    "--sealing-set-from-epoch {chosen} is not the epoch in force at block {number}: that is {epoch_block}. Epoch {chosen} did activate, but {epoch_block} has since superseded it, so the set would be stale."
+                );
+            }
             println!("epoch     {epoch_block} active, turnLength={turn_length}");
             Ok(())
         }
@@ -704,10 +737,12 @@ fn write_checkpoint(
     // operator-supplied address list — so `--sealing-set` yields a checkpoint that runs
     // confirmation-depth until the client sees an epoch header for itself.
     let mut vote_keys: Option<Vec<String>> = None;
+    let mut chosen_epoch: Option<u64> = None;
     let set = match (sealing_set, sealing_set_from_epoch) {
         (Some(s), None) => parse_sealing_set(s)?,
         (None, Some(epoch_id)) => {
             let epoch_header = fetch_header(&up, epoch_id)?;
+            chosen_epoch = Some(decode_u64(&epoch_header.number)?);
             vote_keys = Some(vote_keys_from_activated_epoch(&epoch_header, number)?);
             sealing_set_from_activated_epoch(&epoch_header, number)?
         }
@@ -733,7 +768,7 @@ fn write_checkpoint(
     // Refuse here what `walk_from_checkpoint` would refuse at run time, so the operator
     // finds out while writing the file rather than at the next restart. Roughly one block
     // in twelve falls in this window.
-    assert_outside_activation_window(&up, number, fork.epoch_length)?;
+    assert_outside_activation_window(&up, number, fork.epoch_length, chosen_epoch)?;
     write_checkpoint_file(out, &cp)?;
     println!(
         "wrote checkpoint {} hash={} n_seal={} fork={} fastFinality={}",
@@ -1682,6 +1717,26 @@ mod cli_tests {
             }
             other => panic!("expected Soak, got {other:?}"),
         }
+    }
+
+    /// The checkpoint is the whole root of trust: the sealing set comes from it and every
+    /// later header is checked against that set, so a checkpoint from a lying provider is
+    /// a self-consistent fake chain rather than one bad answer. Loading one unconfirmed
+    /// used to say nothing at all. Pinned so the warning cannot quietly lose the parts
+    /// that make it actionable.
+    #[test]
+    fn the_unconfirmed_checkpoint_warning_says_what_to_do() {
+        let w = UNCONFIRMED_CHECKPOINT_WARNING;
+        assert!(w.starts_with("warning:"), "{w}");
+        assert!(
+            w.contains("root of trust"),
+            "it must say why it matters: {w}"
+        );
+        assert!(w.contains("--checkpoint-oracle"), "and how to fix it: {w}");
+        assert!(
+            w.contains("--require-multisource-checkpoint"),
+            "and how to make it fatal: {w}"
+        );
     }
 
     #[test]

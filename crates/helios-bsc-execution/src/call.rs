@@ -12,11 +12,13 @@ use crate::proof::{
     ProofError, MAX_CODE_SIZE,
 };
 use crate::EMPTY_TRIE_ROOT;
+use helios_bsc_config::{CANCUN_TIME, MAX_TX_GAS, OSAKA_MENDEL_TIME, PRAGUE_TIME};
 use helios_bsc_types::BSC_MAINNET_CHAIN_ID;
 use revm::bytecode::Bytecode;
 use revm::context::result::{EVMError, ExecutionResult, HaltReason};
 use revm::context::{BlockEnv, CfgEnv, TxEnv};
 use revm::database_interface::DBErrorMarker;
+use revm::precompile::{PrecompileSpecId, Precompiles};
 use revm::primitives::hardfork::SpecId;
 use revm::primitives::{Address, Bytes, TxKind, B256, KECCAK_EMPTY, U256};
 use revm::state::AccountInfo;
@@ -147,6 +149,9 @@ pub struct ProofDb {
     block_hashes: HashMap<u64, B256>,
     /// Executing block number (`BLOCKHASH` protocol window).
     block_number: u64,
+    /// EVM rules for the executing block. Always overwritten by `seed_block_hashes`
+    /// before anything runs; the `Default` value is never the one used.
+    spec: SpecId,
 }
 
 impl ProofDb {
@@ -156,6 +161,7 @@ impl ProofDb {
 
     fn seed_block_hashes(&mut self, block: &CallBlock) {
         self.block_number = block.number;
+        self.spec = evm_spec_at(block.timestamp);
         self.block_hashes.clear();
         for (n, hash) in block
             .historical_hashes
@@ -225,11 +231,58 @@ enum PrecompileKind {
     Unsupported,
 }
 
-/// Which precompile, if any, lives at `address`.
+/// EVM rules for the block being executed.
 ///
-/// The local set is revm's at [`SpecId::CANCUN`], which is **exactly** `0x01..=0x0a`
-/// (asked of `Precompiles::new(PrecompileSpecId::from_spec_id(SpecId::CANCUN))` rather
-/// than assumed).
+/// Not a constant, and not Cancun. `params/config.go` at the pin sets BSC mainnet
+/// `CancunTime = 1718863500`, `PragueTime = 1742436600` (Pascal shares the instant, live
+/// since 2025-03-20) and `OsakaTime = 1777343400` (Mendel, live since 2026-04-28), so the
+/// chain has been two forks past Cancun for over a year.
+///
+/// Executing at the wrong fork is not a refusal, it is a wrong number. Measured against
+/// geth before this was fixed, `eth_estimateGas` came back **low** and drifted further as
+/// calldata grew, because EIP-7623's calldata floor cost arrived in Prague. Low is the
+/// dangerous direction: a wallet that trusts it sends a transaction that runs out of gas
+/// and pays for the privilege.
+///
+/// ```text
+/// calldata      before    after     geth
+///    0 bytes    21407     21407     21573
+///  200 bytes    22207     23160     23497
+/// 1000 bytes    25407     31160     31513
+/// 4000 bytes        -     61160     61986
+/// ```
+///
+/// After the fix each of ours is exactly EIP-7623's floor, `21000 + 10 * tokens` with
+/// `tokens = zero_bytes + 4 * nonzero_bytes`. geth still reads ~1% higher because
+/// `eth/gasestimator` stops its binary search once `(hi-lo)/hi < ErrorRatio` — an
+/// "allowed overestimation ratio for faster estimation termination", 1.5% by default.
+/// Every measured ratio above is inside it, so what is left is geth's slack rather than
+/// this client's error.
+///
+/// Keyed on the block's own timestamp rather than "now", so a historical read is executed
+/// under the rules that applied to it.
+fn evm_spec_at(timestamp: u64) -> SpecId {
+    if timestamp >= OSAKA_MENDEL_TIME {
+        SpecId::OSAKA
+    } else if timestamp >= PRAGUE_TIME {
+        SpecId::PRAGUE
+    } else if timestamp >= CANCUN_TIME {
+        SpecId::CANCUN
+    } else {
+        // Unreachable in practice: reads are capped at Safe and the provider proof window
+        // is ~112 blocks, so nothing this old can be executed. Total rather than
+        // panicking, because "cannot happen" is how the last three of these started.
+        SpecId::SHANGHAI
+    }
+}
+
+/// Which precompile, if any, lives at `address`, under `spec`.
+///
+/// The local set is whatever revm implements at `spec` — asked of
+/// `Precompiles::new(PrecompileSpecId::from_spec_id(spec))` rather than assumed. At
+/// Cancun that is exactly `0x01..=0x0a`; Prague adds the BLS12-381 group at
+/// `0x0b..=0x11`, which this client refused as unsupported for as long as it executed at
+/// Cancun.
 ///
 /// BSC's live set is much larger. v1.7.8 `core/vm/contracts.go`
 /// `PrecompiledContractsPrague`, which `activePrecompiledContracts` selects from Prague
@@ -250,7 +303,7 @@ enum PrecompileKind {
 /// with no code — which succeeds and returns nothing. A contract asking `0x66` to check
 /// a BLS signature, or `0x0100` to check a P-256 signature, got a silent wrong answer
 /// out of a method this client calls **verified**. They are refused now.
-fn precompile_kind(address: Address) -> PrecompileKind {
+fn precompile_kind(address: Address, spec: SpecId) -> PrecompileKind {
     let n = address.into_array();
     // `0x0100` is the only precompile whose address needs two bytes.
     if n[..18] == [0u8; 18] && n[18] == 0x01 && n[19] == 0x00 {
@@ -260,8 +313,17 @@ fn precompile_kind(address: Address) -> PrecompileKind {
         return PrecompileKind::Account;
     }
     match n[19] {
-        0x01..=0x0a => PrecompileKind::Local,
-        0x0b..=0x11 | 0x64..=0x69 => PrecompileKind::Unsupported,
+        // Derived, not listed: the boundary between "revm runs this" and "we must refuse
+        // it" moved when the spec did, and a second hand-maintained copy of that boundary
+        // is how it went stale the first time.
+        0x01..=0x11 => {
+            if Precompiles::new(PrecompileSpecId::from_spec_id(spec)).contains(&address) {
+                PrecompileKind::Local
+            } else {
+                PrecompileKind::Unsupported
+            }
+        }
+        0x64..=0x69 => PrecompileKind::Unsupported,
         _ => PrecompileKind::Account,
     }
 }
@@ -274,9 +336,22 @@ fn u256_to_slot(index: U256) -> [u8; 32] {
     index.to_be_bytes()
 }
 
+/// Gas budget for one call, capped by everything that can cap it.
+///
+/// `CALL_GAS_CAP` is this client's own ceiling. `block.gas_limit` is the block's. The
+/// third is the chain's own, and it was missing: from Osaka, BSC enforces EIP-7825 in
+/// `core/state_transition.go` — a transaction whose gas limit exceeds
+/// [`MAX_TX_GAS`] (16,777,216) is rejected outright. Our 50,000,000 ceiling sat three
+/// times above it, so `eth_estimateGas` could hand a wallet a number the chain would
+/// refuse to accept, and `eth_call` could succeed on an execution no transaction could
+/// ever perform.
 fn call_gas(tx: &CallTx, block: &CallBlock) -> u64 {
     let user = tx.gas.unwrap_or(CALL_GAS_CAP);
-    user.min(CALL_GAS_CAP).min(block.gas_limit)
+    let mut cap = CALL_GAS_CAP.min(block.gas_limit);
+    if evm_spec_at(block.timestamp) >= SpecId::OSAKA {
+        cap = cap.min(MAX_TX_GAS);
+    }
+    user.min(cap)
 }
 
 /// The slot a `storageProof[].key` denotes. Over-long keys are refused, not folded:
@@ -328,7 +403,7 @@ impl Database for ProofDb {
         // Before the map lookup on purpose: an `eth_getProof` for `0x64` verifies as an
         // empty account, so a seeded entry would otherwise let execution proceed as if
         // the precompile were not there.
-        match precompile_kind(address) {
+        match precompile_kind(address, self.spec) {
             PrecompileKind::Unsupported => {
                 return Err(CallError::UnsupportedPrecompile(addr_bytes(address)))
             }
@@ -483,7 +558,7 @@ fn transact_call(
     // revm 42: the `optional_*` cargo features are gone; `disable_base_fee` and
     // `disable_eip3607` are plain `CfgEnv` fields now. Same two knobs, same meaning —
     // `eth_call` has no fee payer and no sender-is-EOA requirement.
-    let mut cfg = CfgEnv::new_with_spec(SpecId::CANCUN);
+    let mut cfg = CfgEnv::new_with_spec(evm_spec_at(block.timestamp));
     cfg.chain_id = BSC_MAINNET_CHAIN_ID;
     cfg.disable_base_fee = true;
     cfg.disable_eip3607 = true;
@@ -555,7 +630,9 @@ fn seed_call_accounts<P: ProveAtSafe>(
     access_list_within_caps(tx)?;
     let mut seen: Vec<[u8; 20]> = Vec::with_capacity(3);
     for address in [tx.to, tx.from, block.beneficiary] {
-        if precompile_kind(Address::from(address)) != PrecompileKind::Account {
+        if precompile_kind(Address::from(address), evm_spec_at(block.timestamp))
+            != PrecompileKind::Account
+        {
             continue;
         }
         if seen.iter().any(|a| a == &address) {
@@ -597,7 +674,9 @@ fn seed_access_list<P: ProveAtSafe>(
         return Ok(());
     }
     for (address, slots) in &tx.access_list {
-        if precompile_kind(Address::from(*address)) != PrecompileKind::Account {
+        if precompile_kind(Address::from(*address), evm_spec_at(block.timestamp))
+            != PrecompileKind::Account
+        {
             continue;
         }
         fetch_and_load(prover, db, block, address, slots)?;
@@ -830,15 +909,20 @@ mod tests {
 
     /// Every address BSC runs a precompile at, from v1.7.8
     /// `PrecompiledContractsPrague` (the set `activePrecompiledContracts` selects from
-    /// Prague onwards), that revm at `SpecId::CANCUN` does not implement.
+    /// Prague onwards), that revm does **not** implement at the spec this client
+    /// executes.
     ///
     /// Before the classifier these executed as ordinary empty accounts: a `CALL`
     /// succeeded and returned nothing. `0x66` is `blsSignatureVerify` and `0x0100` is
     /// `p256Verify` — a contract asking either "is this signature valid" got a silent
     /// empty answer out of a *verified* method.
+    ///
+    /// `0x0b..=0x11` used to be in this list and no longer is: they are BLS12-381, revm
+    /// implements them from Prague, and the only reason they were refused is that this
+    /// client executed everything at Cancun.
     #[test]
     fn bsc_precompiles_the_local_evm_lacks_are_refused() {
-        let unsupported: Vec<u16> = (0x0b..=0x11).chain(0x64..=0x69).chain([0x0100]).collect();
+        let unsupported: Vec<u16> = (0x64..=0x69).chain([0x0100]).collect();
         for low in unsupported {
             let addr = precompile_addr(low);
             let mut db = ProofDb::new();
@@ -850,6 +934,27 @@ mod tests {
             assert!(
                 matches!(err, CallError::UnsupportedPrecompile(a) if a == addr),
                 "0x{low:x} -> {err}"
+            );
+        }
+    }
+
+    /// The BLS12-381 group is the half of the old refusal that was this client's fault
+    /// rather than revm's. On a Prague+ chain a `CALL` to `0x0b..=0x11` must reach the
+    /// precompile, so it must not come back `UnsupportedPrecompile`.
+    #[test]
+    fn bls12_381_precompiles_are_reachable_on_a_prague_chain() {
+        for low in 0x0bu16..=0x11 {
+            let addr = precompile_addr(low);
+            let mut db = ProofDb::new();
+            db.insert_account([9u8; 20], 0, [0u8; 32], EMPTY_TRIE_ROOT, &[]);
+            db.insert_account([0u8; 20], 0, [0u8; 32], EMPTY_TRIE_ROOT, &[]);
+            let block = sample_block([0u8; 32]);
+            // Empty input, so the precompile itself rejects it — the point is only that
+            // the refusal comes from the precompile and not from this client's classifier.
+            let out = eth_call_with_db(&mut db, &block, &call_tx([9u8; 20], addr, Vec::new()));
+            assert!(
+                !matches!(out, Err(CallError::UnsupportedPrecompile(_))),
+                "0x{low:x} is implemented from Prague and must not be refused: {out:?}"
             );
         }
     }
@@ -869,20 +974,51 @@ mod tests {
         assert!(matches!(err, CallError::UnsupportedPrecompile(_)), "{err}");
     }
 
-    /// The ten revm implements keep working without any proof, and an ordinary
-    /// address next to the ranges is still an ordinary address.
+    /// The ones revm implements keep working without any proof, and an ordinary address
+    /// next to the ranges is still an ordinary address.
+    ///
+    /// Asserted per spec, because the boundary moves with the fork: Cancun implements
+    /// `0x01..=0x0a` and Prague onwards adds the BLS12-381 group at `0x0b..=0x11`. While
+    /// this client executed everything at Cancun it refused those seven on a chain that
+    /// had implemented them since March 2025.
     #[test]
-    fn local_precompiles_need_no_proof_and_neighbours_still_do() {
+    fn local_precompiles_track_the_spec_and_neighbours_are_still_accounts() {
         for low in 0x01u16..=0x0a {
+            for spec in [SpecId::CANCUN, SpecId::PRAGUE, SpecId::OSAKA] {
+                assert_eq!(
+                    precompile_kind(Address::from(precompile_addr(low)), spec),
+                    PrecompileKind::Local,
+                    "0x{low:x} at {spec:?}"
+                );
+            }
+        }
+        for low in 0x0bu16..=0x11 {
             assert_eq!(
-                precompile_kind(Address::from(precompile_addr(low))),
-                PrecompileKind::Local,
-                "0x{low:x}"
+                precompile_kind(Address::from(precompile_addr(low)), SpecId::CANCUN),
+                PrecompileKind::Unsupported,
+                "0x{low:x} does not exist at Cancun"
             );
+            for spec in [SpecId::PRAGUE, SpecId::OSAKA] {
+                assert_eq!(
+                    precompile_kind(Address::from(precompile_addr(low)), spec),
+                    PrecompileKind::Local,
+                    "BLS12-381 0x{low:x} at {spec:?}"
+                );
+            }
+        }
+        // BSC's own precompiles are refused at every spec: revm implements none of them.
+        for low in 0x64u16..=0x69 {
+            for spec in [SpecId::CANCUN, SpecId::OSAKA] {
+                assert_eq!(
+                    precompile_kind(Address::from(precompile_addr(low)), spec),
+                    PrecompileKind::Unsupported,
+                    "0x{low:x} at {spec:?}"
+                );
+            }
         }
         for low in [0x00u16, 0x12, 0x13, 0x63, 0x6a, 0xff, 0x0101] {
             assert_eq!(
-                precompile_kind(Address::from(precompile_addr(low))),
+                precompile_kind(Address::from(precompile_addr(low)), SpecId::OSAKA),
                 PrecompileKind::Account,
                 "0x{low:x}"
             );
@@ -891,8 +1027,25 @@ mod tests {
         let mut wbnb_like = [0xabu8; 20];
         wbnb_like[19] = 0x05;
         assert_eq!(
-            precompile_kind(Address::from(wbnb_like)),
+            precompile_kind(Address::from(wbnb_like), SpecId::OSAKA),
             PrecompileKind::Account
+        );
+    }
+
+    /// The spec is chosen from the block's own timestamp, so a historical read runs under
+    /// the rules that applied to it. Pinned against `params/config.go` at the pin.
+    #[test]
+    fn the_evm_spec_follows_the_chain_not_a_constant() {
+        assert_eq!(evm_spec_at(CANCUN_TIME), SpecId::CANCUN);
+        assert_eq!(evm_spec_at(PRAGUE_TIME - 1), SpecId::CANCUN);
+        assert_eq!(evm_spec_at(PRAGUE_TIME), SpecId::PRAGUE);
+        assert_eq!(evm_spec_at(OSAKA_MENDEL_TIME - 1), SpecId::PRAGUE);
+        assert_eq!(evm_spec_at(OSAKA_MENDEL_TIME), SpecId::OSAKA);
+        // Pasteur changes no EVM rule, so it must not move the spec off Osaka.
+        assert_eq!(
+            evm_spec_at(helios_bsc_config::PASTEUR_TIME),
+            SpecId::OSAKA,
+            "Pasteur is a Parlia-neutral fork; it must not select a new EVM spec"
         );
     }
 
@@ -949,7 +1102,11 @@ mod tests {
             number: 1,
             hash: [2u8; 32],
             state_root,
-            timestamp: 1,
+            // A live-chain timestamp, not `1`. The EVM spec is chosen from it now, and a
+            // block dated 1970 executes under Shanghai — where BLOBBASEFEE does not exist
+            // and half of what these tests assert cannot run. Tests should exercise the
+            // rules the chain is actually on.
+            timestamp: OSAKA_MENDEL_TIME + 1,
             beneficiary: [0u8; 20],
             gas_limit: CALL_GAS_CAP,
             difficulty: [0u8; 32],
