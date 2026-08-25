@@ -19,7 +19,7 @@ use helios_bsc_consensus::{
 };
 use helios_bsc_execution::{
     encode_consensus_receipt, encode_data32, encode_qty, eth_call_verified,
-    eth_estimate_gas_verified, pad32, retain_requested_storage, validate_bsc_raw_tx,
+    eth_estimate_gas_verified, pad32, retain_requested_storage, tx_to_address, validate_bsc_raw_tx,
     verify_account_code, verify_eth_get_proof, verify_receipt_list, verify_storage_slot,
     verify_tx_list, CallBlock, CallError, CallTx, ConsensusLog, ConsensusReceipt, EthAccountProof,
     ProofError, ProveAtSafe, VerifiedAccount, CALL_GAS_CAP, EMPTY_CODE_HASH, EMPTY_TRIE_ROOT,
@@ -1633,9 +1633,40 @@ impl Node {
         if raws.is_empty() {
             return Ok(TxBind::Omitted);
         }
+        let hashes = verify_tx_list(&raws, &root)
+            .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))?;
+        Ok(TxBind::List(hashes))
+    }
+
+    /// Verified tx hashes **and** the envelopes they were derived from.
+    ///
+    /// `bind_tx_hashes` drops the raw bytes once the root matches, which is all
+    /// `eth_getBlock*` needs. A receipt's `to` is a field of the envelope, so the receipt
+    /// path keeps them: once the list is bound to `transactionsRoot`, reading a field out
+    /// of it is reading verified data.
+    fn bind_tx_envelopes(
+        &self,
+        hdr: &RpcBlockHeader,
+    ) -> Result<Option<Vec<Vec<u8>>>, (i64, String)> {
+        let root = decode_hex_fixed::<32>(&hdr.transactions_root).map_err(|e| {
+            (
+                ERR_PROOF_FAILED,
+                format!("proof_verification_failed: transactionsRoot: {e}"),
+            )
+        })?;
+        if root == EMPTY_TRIE_ROOT {
+            return Ok(None);
+        }
+        let raws = self
+            .up
+            .block_raw_transactions(&hdr.hash)
+            .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))?;
+        if raws.is_empty() {
+            return Ok(None);
+        }
         verify_tx_list(&raws, &root)
-            .map(TxBind::List)
-            .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))
+            .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))?;
+        Ok(Some(raws))
     }
 
     fn bound_block_txs(&self, local: &VerifiedBlock) -> Result<BoundTxs, (i64, String)> {
@@ -1727,27 +1758,38 @@ impl Node {
         // `TxBind::Omitted` means the upstream declined the envelopes: the pairing is
         // unprovable rather than wrong. Leave the label alone there instead of failing an
         // otherwise verified read — `docs/rpc-matrix.md` records that this is conditional.
-        if let TxBind::List(hashes) = self.bind_tx_hashes(hdr)? {
-            for (i, item) in items.iter().enumerate() {
-                let Some(claimed) = item.tx_hash else {
-                    continue;
+        if let Some(envelopes) = self.bind_tx_envelopes(hdr)? {
+            for (i, item) in items.iter_mut().enumerate() {
+                let Some(envelope) = envelopes.get(i) else {
+                    return Err((
+                        ERR_PROOF_FAILED,
+                        "proof_verification_failed: more receipts than bound transactions".into(),
+                    ));
                 };
-                match hashes.get(i) {
-                    Some(bound) if *bound == claimed => {}
-                    Some(_) => {
+                if let Some(claimed) = item.tx_hash {
+                    if keccak256(envelope) != claimed {
                         return Err((
                             ERR_PROOF_FAILED,
                             format!(
                                 "proof_verification_failed: receipt {i}: transactionHash does not match transactionsRoot"
                             ),
-                        ))
+                        ));
                     }
-                    None => {
-                        return Err((
-                            ERR_PROOF_FAILED,
-                            "proof_verification_failed: more receipts than bound transactions"
-                                .into(),
-                        ))
+                }
+                // `to` is a field of an envelope now bound to the sealed root, so it can
+                // be read rather than believed. A decode failure cannot come from a lying
+                // upstream here — the list already hashed into `transactionsRoot` — so it
+                // would be a bug in this client: leave the echoed value rather than
+                // inventing a recipient.
+                if let Ok(to) = tx_to_address(envelope) {
+                    if let Value::Object(map) = &mut item.json {
+                        map.insert(
+                            "to".into(),
+                            match to {
+                                Some(a) => json!(format!("0x{}", hex::encode(a))),
+                                None => Value::Null,
+                            },
+                        );
                     }
                 }
             }

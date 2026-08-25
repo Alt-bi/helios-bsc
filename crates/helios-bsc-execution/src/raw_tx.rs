@@ -45,6 +45,49 @@ pub fn validate_bsc_raw_tx(bytes: &[u8]) -> Result<[u8; 32], RawTxError> {
     Ok(keccak256(bytes))
 }
 
+/// The `to` address of a signed envelope, or `None` for a contract creation.
+///
+/// Reads one field out of the already-decoded envelope: no signature work, no hashing.
+/// Callers must pass bytes that are already bound to a sealed `transactionsRoot` — this
+/// function decodes, it does not authenticate.
+///
+/// Field position is fixed per envelope type, so a truncated or misshaped list is an
+/// error rather than a guess at a neighbouring field:
+///
+/// | Type | Layout up to `to` | Index |
+/// |------|-------------------|-------|
+/// | legacy | nonce, gasPrice, gasLimit, **to** | 3 |
+/// | `0x01` EIP-2930 | chainId, nonce, gasPrice, gasLimit, **to** | 4 |
+/// | `0x02` EIP-1559 | chainId, nonce, maxPriorityFee, maxFee, gasLimit, **to** | 5 |
+/// | `0x03` EIP-4844 | same prefix as 1559 | 5 |
+/// | `0x04` EIP-7702 | same prefix as 1559 | 5 |
+pub fn tx_to_address(bytes: &[u8]) -> Result<Option<[u8; 20]>, RawTxError> {
+    if bytes.is_empty() {
+        return Err(RawTxError::Empty);
+    }
+    if bytes.len() > MAX_RAW_TX {
+        return Err(RawTxError::TooLarge);
+    }
+    let (items, idx) = match bytes[0] {
+        0x01 => (decode_list(&bytes[1..])?, 4usize),
+        0x02..=0x04 => (decode_list(&bytes[1..])?, 5usize),
+        0x05..=0x7f => return Err(RawTxError::UnknownType(bytes[0])),
+        _ => (decode_list(bytes)?, 3usize),
+    };
+    let item = items.get(idx).ok_or(RawTxError::Truncated)?;
+    let b = item.as_bytes().map_err(|_| RawTxError::InvalidRlp)?;
+    match b.len() {
+        // Empty string is the canonical encoding of "no recipient" (contract creation).
+        0 => Ok(None),
+        20 => {
+            let mut out = [0u8; 20];
+            out.copy_from_slice(b);
+            Ok(Some(out))
+        }
+        _ => Err(RawTxError::InvalidRlp),
+    }
+}
+
 fn parse_chain_id(bytes: &[u8]) -> Result<u64, RawTxError> {
     match bytes[0] {
         0x01..=0x04 => parse_typed(bytes[0], &bytes[1..]),
@@ -156,6 +199,68 @@ mod tests {
         let mut v = vec![0x94];
         v.extend_from_slice(&[0u8; 20]);
         v
+    }
+
+    /// Envelope of `n_items` fields with a 20-byte recipient at `to_idx`.
+    fn envelope_with_to(ty: Option<u8>, n_items: usize, to_idx: usize, to: &[u8; 20]) -> Vec<u8> {
+        let mut items: Vec<Vec<u8>> = (0..n_items).map(|_| rlp_bytes(&[])).collect();
+        let mut a = vec![0x94];
+        a.extend_from_slice(to);
+        items[to_idx] = a;
+        let list = rlp_list(&items);
+        match ty {
+            Some(t) => {
+                let mut out = vec![t];
+                out.extend(list);
+                out
+            }
+            None => list,
+        }
+    }
+
+    #[test]
+    fn to_address_is_read_at_the_right_index_for_every_type() {
+        let want = [0xABu8; 20];
+        // (type, field count, index of `to`) straight from the EIP field orders.
+        for (ty, n, idx) in [
+            (None, 9usize, 3usize), // legacy
+            (Some(0x01), 11, 4),    // EIP-2930
+            (Some(0x02), 12, 5),    // EIP-1559
+            (Some(0x03), 14, 5),    // EIP-4844
+            (Some(0x04), 13, 5),    // EIP-7702
+        ] {
+            let raw = envelope_with_to(ty, n, idx, &want);
+            assert_eq!(
+                tx_to_address(&raw).unwrap(),
+                Some(want),
+                "type {ty:?} index {idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn contract_creation_has_no_recipient() {
+        // Empty string at the `to` position is the canonical "create".
+        let raw = rlp_list(&(0..9).map(|_| rlp_bytes(&[])).collect::<Vec<_>>());
+        assert_eq!(tx_to_address(&raw).unwrap(), None);
+    }
+
+    #[test]
+    fn a_short_envelope_is_an_error_not_a_neighbouring_field() {
+        // Three fields: index 3 does not exist, so legacy `to` must not fall back to one
+        // of the fields that does.
+        let raw = rlp_list(&(0..3).map(|_| rlp_bytes(&[])).collect::<Vec<_>>());
+        assert_eq!(tx_to_address(&raw), Err(RawTxError::Truncated));
+    }
+
+    #[test]
+    fn a_recipient_that_is_not_twenty_bytes_is_refused() {
+        let mut items: Vec<Vec<u8>> = (0..9).map(|_| rlp_bytes(&[])).collect();
+        items[3] = rlp_bytes(&[1, 2, 3]);
+        assert_eq!(
+            tx_to_address(&rlp_list(&items)),
+            Err(RawTxError::InvalidRlp)
+        );
     }
 
     /// Minimal signed EIP-1559 skeleton (dummy r/s).
