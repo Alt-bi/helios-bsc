@@ -681,7 +681,12 @@ fn fetch_header(up: &Upstream, block: &str) -> Result<RpcBlockHeader> {
 /// `walk_from_checkpoint` refuses such a checkpoint because adopting the announced set
 /// would mean trusting an unverified header; catching it at write time turns a restart
 /// failure into an immediate one, with a block number the operator can use instead.
-fn assert_outside_activation_window(up: &Upstream, number: u64, epoch_length: u64) -> Result<()> {
+fn assert_outside_activation_window(
+    up: &Upstream,
+    number: u64,
+    epoch_length: u64,
+    chosen_epoch: Option<u64>,
+) -> Result<()> {
     if epoch_length == 0 {
         return Ok(());
     }
@@ -693,6 +698,17 @@ fn assert_outside_activation_window(up: &Upstream, number: u64, epoch_length: u6
     let prev_header = fetch_header(up, &format!("0x{prev_block:x}"))?;
     match epoch_seed_at(number, epoch_length, &epoch_header, &prev_header)? {
         EpochSeed::Active { turn_length, .. } => {
+            // An *already activated* epoch is not automatically the *current* one. Every
+            // epoch below the checkpoint has activated, so `--sealing-set-from-epoch` with
+            // a superseded one passed every check here and wrote a checkpoint carrying a
+            // stale sealing set — which then failed at run time as
+            // "difficulty 2 does not match in-turn (want 1)", a message that says nothing
+            // about the real mistake.
+            if let Some(chosen) = chosen_epoch.filter(|c| *c != epoch_block) {
+                bail!(
+                    "--sealing-set-from-epoch {chosen} is not the epoch in force at block {number}: that is {epoch_block}. Epoch {chosen} did activate, but {epoch_block} has since superseded it, so the set would be stale."
+                );
+            }
             println!("epoch     {epoch_block} active, turnLength={turn_length}");
             Ok(())
         }
@@ -721,10 +737,12 @@ fn write_checkpoint(
     // operator-supplied address list — so `--sealing-set` yields a checkpoint that runs
     // confirmation-depth until the client sees an epoch header for itself.
     let mut vote_keys: Option<Vec<String>> = None;
+    let mut chosen_epoch: Option<u64> = None;
     let set = match (sealing_set, sealing_set_from_epoch) {
         (Some(s), None) => parse_sealing_set(s)?,
         (None, Some(epoch_id)) => {
             let epoch_header = fetch_header(&up, epoch_id)?;
+            chosen_epoch = Some(decode_u64(&epoch_header.number)?);
             vote_keys = Some(vote_keys_from_activated_epoch(&epoch_header, number)?);
             sealing_set_from_activated_epoch(&epoch_header, number)?
         }
@@ -750,7 +768,7 @@ fn write_checkpoint(
     // Refuse here what `walk_from_checkpoint` would refuse at run time, so the operator
     // finds out while writing the file rather than at the next restart. Roughly one block
     // in twelve falls in this window.
-    assert_outside_activation_window(&up, number, fork.epoch_length)?;
+    assert_outside_activation_window(&up, number, fork.epoch_length, chosen_epoch)?;
     write_checkpoint_file(out, &cp)?;
     println!(
         "wrote checkpoint {} hash={} n_seal={} fork={} fastFinality={}",
