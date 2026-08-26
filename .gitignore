@@ -13,8 +13,10 @@ last-verified.json
 req.json
 **/__pycache__/
 *.pyc
-# Grant application drafts — never publish
+# Grant application drafts — never publish. Contact details, budgets and
+# unlisted demo links live here; nothing under these paths belongs on a public remote.
 docs/grant/
+helios-bsc-grant/
 
 # local agent/tooling state — never publish
 .claude/
