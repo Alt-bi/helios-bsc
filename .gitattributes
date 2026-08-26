@@ -1,0 +1,29 @@
+# Line endings are normalised to LF in the repository, whatever the contributor's
+# platform does in their working copy.
+#
+# This is not cosmetic. Everything that runs in CI runs on Linux: the `run:` blocks in
+# .github/workflows are executed by bash, and a stray CR at the end of a line there is a
+# syntax error rather than whitespace. Today the tree is LF because the people who wrote
+# it happened to have core.autocrlf=true; without a rule in the repository, one
+# contributor with a different setting can commit CRLF into a workflow or a script and
+# break the build for everyone, with a diff that looks empty.
+* text=auto eol=lf
+
+# Explicit for the files where a CR is fatal rather than untidy.
+*.sh      text eol=lf
+*.py      text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.toml    text eol=lf
+*.rs      text eol=lf
+Dockerfile text eol=lf
+
+# Binary: never translated, never diffed as text.
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.gif     binary
+*.ico     binary
+*.mp4     binary
+*.tar.gz  binary
+*.zip     binary

@@ -20,7 +20,37 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all -- --check
       - name: cargo test
-        run: cargo test --workspace --locked
+        # `set -o pipefail` is load-bearing, not decoration. The default shell here is
+        # `bash -e`, where the exit status of a pipeline is the *last* command's -- so
+        # `cargo test | tee` would report tee's success and a failing test suite would
+        # stop failing the build. Piping into tee to count the tests must not disarm the
+        # reason the step exists.
+        run: |
+          set -euo pipefail
+          cargo test --workspace --locked | tee test-output.txt
+
+      - name: STATUS.md must state the real test count
+        # This number has been wrong twice in one day: it is written by hand and nothing
+        # checks it, so every PR that adds a test silently makes the project's own account
+        # of itself false. A stale count is small on its own and corrosive in aggregate --
+        # a document that is casually wrong about something this checkable earns no trust
+        # on the claims a reader cannot check.
+        #
+        # Same principle as the warning-phrase test in bin/helios-bsc/src/bind.rs: a claim
+        # nobody verifies is a claim that drifts.
+        run: |
+          set -euo pipefail
+          actual=$(grep -E '^test result:' test-output.txt | awk '{s+=$4} END {print s}')
+          claimed=$(grep -oE '^\| Tests \| [0-9]+' STATUS.md | grep -oE '[0-9]+' || true)
+          if [ -z "${claimed}" ]; then
+            echo "::error::could not find the '| Tests | N' row in STATUS.md"
+            exit 1
+          fi
+          if [ "${claimed}" != "${actual}" ]; then
+            echo "::error::STATUS.md claims ${claimed} tests; cargo test ran ${actual}. Update the row."
+            exit 1
+          fi
+          echo "STATUS.md and cargo test agree: ${actual}"
       - name: cargo test helios-bsc-execution
         run: cargo test -p helios-bsc-execution --lib --locked
       - name: cargo clippy
