@@ -849,11 +849,22 @@ impl Node {
                     let Some(cp) = self.origin.clone() else {
                         return Err(e);
                     };
-                    eprintln!(
-                        "reorg/link break ({e}); replay from checkpoint {}",
-                        cp.number
-                    );
-                    let (c, s) = walk_from_checkpoint(self.up.as_ref(), cp, tip, self.max_sync)?;
+                    let cp_number = cp.number;
+                    // `{e:#}` rather than `{e}`: the cause is what says *why* this is a
+                    // reorg, and plain Display prints only the outermost context -- the
+                    // same property that stopped `is_link_err` seeing it at all.
+                    eprintln!("reorg/link break ({e:#}); replay from checkpoint {cp_number}");
+                    let (c, s) = walk_from_checkpoint(self.up.as_ref(), cp, tip, self.max_sync)
+                        .map_err(|replay| {
+                            // The origin checkpoint is fixed at bootstrap and never moves,
+                            // so once the chain has run more than `max_sync` past it this
+                            // replay can no longer reach the tip -- and no later attempt
+                            // will either. Every sync from here fails identically while
+                            // the process stays up, which is a restart, and the operator
+                            // has to be told that rather than left reading a repeat.
+                            let behind = tip.saturating_sub(cp_number);
+                            anyhow::anyhow!("reorg recovery failed: {replay:#}. The replay starts at the checkpoint this process booted from ({cp_number}), now {behind} blocks behind the tip; nothing recovers that in place. Write a fresh checkpoint and restart.")
+                        })?;
                     *chain = c;
                     *snapshot = Some(s);
                 }

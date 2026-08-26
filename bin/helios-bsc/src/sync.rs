@@ -86,11 +86,51 @@ pub fn walk_headers(up: &dyn RpcUpstream, from: u64, to: u64) -> Result<Vec<Veri
 }
 
 /// Parent-link / consecutive-number failures — typically a 1-block reorg at tip.
+/// Every message a broken parent link can arrive as.
+///
+/// This is a substring search over an error string, which is a bad way to make a control
+/// decision and is done anyway: the two producers are in different crates, one of them
+/// returns a `thiserror` enum whose `Display` is the only thing that crosses the
+/// boundary, and both are wrapped in `anyhow` context by the time this sees them.
+///
+/// What makes it survivable is that the list is *pinned by a test that constructs the
+/// real errors* rather than by these literals. `LINK_ERR_PHRASES` grew by discovery --
+/// the same condition renders as `parent_hash mismatch` in this file and as
+/// `parent hash mismatch` from `SnapshotError` -- and the cost of missing one is silent:
+/// a reorg stops being recognised as a reorg, the recovery below never runs, and the
+/// client simply fails every sync from then on with no line saying why.
+pub const LINK_ERR_PHRASES: &[&str] = &[
+    // sync.rs `link_ok`
+    "parent_hash mismatch",
+    "non-consecutive header",
+    // helios_bsc_consensus::SnapshotError
+    "parent hash mismatch",
+    "does not follow parent",
+];
+
+/// True if any error in the chain reports a broken parent link.
+///
+/// **`err.chain()`, not `err.to_string()`.** `anyhow`'s `Display` prints only the
+/// outermost context, so an error built as
+///
+/// ```text
+/// snap.apply_header(h).with_context(|| format!("snapshot {}", h.number))?
+/// ```
+///
+/// renders as exactly `"snapshot 118189232"` -- the cause is still attached and simply
+/// not printed. This function used to search that string, which meant it returned `false`
+/// for every parent-link failure arriving through the snapshot, and the snapshot path is
+/// the one `--checkpoint` uses, i.e. the documented way to run this client.
+///
+/// The consequence was not a wrong answer, it was a stuck one: a reorg at the chain tip
+/// was not recognised as a reorg, so the recovery below never ran, `refresh` returned the
+/// error, and the chain was left pointing at an orphaned block. Every later sync failed
+/// the same way, forever, with the process still up and answering `-32003`.
 pub fn is_link_err(err: &anyhow::Error) -> bool {
-    let s = err.to_string().to_ascii_lowercase();
-    s.contains("parent_hash mismatch")
-        || s.contains("parent hash mismatch")
-        || s.contains("non-consecutive header")
+    err.chain().any(|cause| {
+        let s = cause.to_string().to_ascii_lowercase();
+        LINK_ERR_PHRASES.iter().any(|p| s.contains(p))
+    })
 }
 
 /// True if `new` shares a hash with `old` at a height within `depth` of `old`'s tip.
@@ -542,7 +582,34 @@ pub(crate) fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(anyhow::Error::new(e).context(format!("rename {tmp:?} → {path:?}")));
     }
+    sync_parent_dir(path);
     Ok(())
+}
+
+/// Flush the *directory entry* the rename above created.
+///
+/// `sync_all` on the temp file makes its contents durable; it says nothing about the name
+/// now pointing at them. On Linux a rename is a directory metadata change, and until the
+/// directory is fsynced a power loss can leave the entry missing entirely -- which is the
+/// "operator has no trust anchor at all" outcome the whole temp-then-rename dance above
+/// exists to rule out. Every serious implementation of this pattern does both.
+///
+/// Best-effort and deliberately silent. Windows cannot open a directory as a file at all
+/// (`File::open` on one fails), and some filesystems refuse the fsync; in both cases the
+/// write already succeeded and there is nothing an operator could do about the difference.
+/// Failing the checkpoint write over it would trade a durability nicety for an outage.
+fn sync_parent_dir(path: &std::path::Path) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let dir = if parent.as_os_str().is_empty() {
+        std::path::Path::new(".")
+    } else {
+        parent
+    };
+    if let Ok(f) = std::fs::File::open(dir) {
+        let _ = f.sync_all();
+    }
 }
 
 #[cfg(test)]
@@ -870,6 +937,47 @@ mod tests {
     fn wait_window_accepts_lag_at_lookback() {
         assert!(proof_lag(1000, 888) <= PROVIDER_PROOF_LOOKBACK);
         assert!(proof_lag(1000, 887) > PROVIDER_PROOF_LOOKBACK);
+    }
+
+    /// The list in `LINK_ERR_PHRASES` is a control decision made by string matching, so
+    /// it is only as good as its coverage of what the producers actually say. This builds
+    /// the real errors -- from this file and from `SnapshotError`, which is a different
+    /// crate and a different wording -- and requires each to be recognised.
+    ///
+    /// The gap this closed: `SnapshotError::NumberMismatch` renders as
+    /// "header N does not follow parent M" and matched none of the three phrases the list
+    /// used to hold, so a height break coming out of the snapshot was not a reorg as far
+    /// as the recovery was concerned.
+    #[test]
+    fn every_real_link_error_is_recognised_as_one() {
+        use helios_bsc_consensus::SnapshotError;
+
+        let prev = blk(10, 0xaa);
+        let real: Vec<anyhow::Error> = vec![
+            // this file, height break and parent break
+            link_ok(&prev, [9u8; 32], prev.hash, 12).unwrap_err(),
+            link_ok(&prev, [9u8; 32], [2u8; 32], 11).unwrap_err(),
+            // the consensus crate, both variants, as they arrive: wrapped in context
+            anyhow::Error::new(SnapshotError::ParentHashMismatch).context("snapshot 12"),
+            anyhow::Error::new(SnapshotError::NumberMismatch { want: 11, got: 13 })
+                .context("snapshot 13"),
+        ];
+        for e in real {
+            assert!(
+                is_link_err(&e),
+                "a real link error is not recognised, so a reorg would not be recovered: {e}"
+            );
+        }
+
+        // And the negative: an unrelated consensus rejection must not be read as a reorg,
+        // or a lying upstream could push the client into a checkpoint replay at will.
+        for not_link in [
+            anyhow::anyhow!("snapshot 12: 0xabc not in active sealing set"),
+            anyhow::anyhow!("cascading 12: gas limit out of bounds"),
+            anyhow::anyhow!("upstream HTTP: connection reset"),
+        ] {
+            assert!(!is_link_err(&not_link), "{not_link}");
+        }
     }
 
     #[test]
