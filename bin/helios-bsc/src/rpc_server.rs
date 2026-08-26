@@ -1963,7 +1963,7 @@ impl Node {
                 _ => return rpc_err(id, ERR_PARAMS, "eth_getLogs filter must be an object"),
             },
         };
-        let local = match self.resolve_get_logs_block(id.clone(), filter) {
+        let blocks = match self.resolve_get_logs_blocks(id.clone(), filter) {
             Ok(b) => b,
             Err(e) => return e,
         };
@@ -1975,31 +1975,45 @@ impl Node {
             Ok(t) => t,
             Err(e) => return rpc_err(id, ERR_PARAMS, &e),
         };
-        let (header, bind) = match self.bound_block_receipts(&local) {
-            Ok(v) => v,
-            Err((code, msg)) => return rpc_err(id, code, &msg),
-        };
-        let receipts = match bind {
-            ReceiptBind::List(list) => list,
-            ReceiptBind::Empty | ReceiptBind::Omitted => return rpc_ok(id, json!([])),
-        };
         let mut out = Vec::new();
-        let mut log_index: u64 = 0;
-        for (tx_i, rec) in receipts.iter().enumerate() {
-            for log in &rec.logs {
-                if log_matches(log, &addresses, &topics) {
-                    if out.len() >= MAX_GET_LOGS {
-                        break;
-                    }
-                    out.push(rpc_log_json(
-                        log,
-                        &header,
-                        rec.tx_hash,
-                        tx_i as u64,
-                        log_index,
-                    ));
+        for local in &blocks {
+            let (header, bind) = match self.bound_block_receipts(local) {
+                Ok(v) => v,
+                Err((code, msg)) => return rpc_err(id, code, &msg),
+            };
+            let receipts = match bind {
+                ReceiptBind::List(list) => list,
+                // Proven to have no transactions: it contributes no logs.
+                ReceiptBind::Empty => continue,
+                // The upstream declined the receipts, so this block's logs are unknown.
+                // Answering without them would report "no matching logs here" for a block
+                // nobody checked — a wrong answer rather than a partial one.
+                ReceiptBind::Omitted => {
+                    return rpc_err(
+                        id,
+                        ERR_PROOF_FAILED,
+                        &format!(
+                            "proof_verification_failed: upstream served no receipts for block {}, so its logs cannot be proven absent",
+                            local.number
+                        ),
+                    )
                 }
-                log_index = log_index.saturating_add(1);
+            };
+            // Block-wide index, restarting per block exactly as geth reports it.
+            let mut log_index: u64 = 0;
+            for (tx_i, rec) in receipts.iter().enumerate() {
+                for log in &rec.logs {
+                    if log_matches(log, &addresses, &topics) && out.len() < MAX_GET_LOGS {
+                        out.push(rpc_log_json(
+                            log,
+                            &header,
+                            rec.tx_hash,
+                            tx_i as u64,
+                            log_index,
+                        ));
+                    }
+                    log_index = log_index.saturating_add(1);
+                }
             }
             if out.len() >= MAX_GET_LOGS {
                 break;
@@ -2008,11 +2022,12 @@ impl Node {
         rpc_ok(id, Value::Array(out))
     }
 
-    fn resolve_get_logs_block(
+    /// Blocks an `eth_getLogs` filter selects, ascending, all locally verified.
+    fn resolve_get_logs_blocks(
         &self,
         id: Value,
         filter: Option<&serde_json::Map<String, Value>>,
-    ) -> Result<VerifiedBlock, Value> {
+    ) -> Result<Vec<VerifiedBlock>, Value> {
         let block_hash = filter.and_then(|m| m.get("blockHash"));
         let from_v = filter.and_then(|m| m.get("fromBlock"));
         let to_v = filter.and_then(|m| m.get("toBlock"));
@@ -2038,6 +2053,7 @@ impl Node {
             let chain = self.chain.lock().expect("chain lock");
             return wallet_get_block_by_hash(hash, safe.number, &chain)
                 .cloned()
+                .map(|b| vec![b])
                 .ok_or_else(|| {
                     rpc_err(
                         id,
@@ -2067,14 +2083,24 @@ impl Node {
                 "wallet mode only serves Safe or below (latest→Safe)",
             )
         })?;
-        if from_n != to_n {
+        if to_n < from_n {
             return Err(rpc_err(
                 id,
                 ERR_PARAMS,
-                "eth_getLogs is single-block only (fromBlock==toBlock or blockHash)",
+                "eth_getLogs fromBlock is above toBlock",
             ));
         }
-        if from_n > safe.number {
+        let span = to_n - from_n + 1;
+        if span > MAX_GET_LOGS_RANGE {
+            return Err(rpc_err(
+                id,
+                ERR_PARAMS,
+                &format!(
+                    "eth_getLogs range is {span} blocks; this client keeps no log index and serves at most {MAX_GET_LOGS_RANGE}"
+                ),
+            ));
+        }
+        if to_n > safe.number {
             return Err(rpc_err(
                 id,
                 ERR_NOT_SYNCED,
@@ -2082,17 +2108,22 @@ impl Node {
             ));
         }
         let chain = self.chain.lock().expect("chain lock");
-        chain
+        let mut blocks: Vec<VerifiedBlock> = chain
             .iter()
-            .find(|b| b.number == from_n)
+            .filter(|b| b.number >= from_n && b.number <= to_n)
             .cloned()
-            .ok_or_else(|| {
-                rpc_err(
-                    id,
-                    ERR_NOT_SYNCED,
-                    "wallet mode only serves Safe or below (latest→Safe)",
-                )
-            })
+            .collect();
+        blocks.sort_by_key(|b| b.number);
+        // Every block in the span must be one this client walked and verified. A gap is
+        // a range this client cannot answer, not a range with fewer logs in it.
+        if blocks.len() as u64 != span {
+            return Err(rpc_err(
+                id,
+                ERR_NOT_SYNCED,
+                "eth_getLogs range reaches outside the locally verified chain",
+            ));
+        }
+        Ok(blocks)
     }
 
     fn local_block_by_number_or_hash(&self, req: &Value) -> Result<VerifiedBlock, Value> {
@@ -2875,6 +2906,15 @@ const TX_ENVELOPES_UNAVAILABLE: &str =
 const MAX_LOG_DATA: usize = 64 * 1024;
 const MAX_FEE_HISTORY_ITEMS: usize = 1024;
 const MAX_GET_LOGS: usize = MAX_RECEIPT_LOGS;
+
+/// Largest `eth_getLogs` span, in blocks.
+///
+/// This client keeps no log index, so every block in a range costs one upstream
+/// `eth_getBlockReceipts` and one `receiptsRoot` verification. The cap is what stops a
+/// single request from turning into an unbounded fan-out; it sits just above the
+/// confirmation-depth window (~112), so any range a wallet could ask for over the blocks
+/// this client can actually see is servable. Wider ranges are `-32602` and say why.
+const MAX_GET_LOGS_RANGE: u64 = 128;
 
 fn bind_optional_logs(
     v: Option<&Value>,

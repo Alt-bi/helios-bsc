@@ -299,6 +299,94 @@ impl Upstream {
     }
 
     /// One JSON-RPC batch of at most 8 headers (Ankr free times out on larger batches).
+    /// `eth_getRawTransactionByHash` for a whole block, in JSON-RPC batches.
+    ///
+    /// Every envelope is still checked to keccak to the hash it was asked for, so a batch
+    /// that answers out of order, drops an entry or swaps two is rejected rather than
+    /// silently reordering a list that is about to be hashed into `transactionsRoot`.
+    fn raw_txs_batched(&self, hashes: &[[u8; 32]]) -> Result<Vec<Vec<u8>>> {
+        const RAW_TX_BATCH: usize = 64;
+        let mut raws = Vec::with_capacity(hashes.len());
+        for chunk in hashes.chunks(RAW_TX_BATCH) {
+            let batch: Vec<Value> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, h)| {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": i as u64,
+                        "method": "eth_getRawTransactionByHash",
+                        "params": [format!("0x{}", hex::encode(h))],
+                    })
+                })
+                .collect();
+            let resp = self.post_json(&Value::Array(batch))?;
+            let arr = resp
+                .as_array()
+                .ok_or_else(|| anyhow!("raw tx batch response not array: {resp}"))?;
+            if arr.len() != chunk.len() {
+                return Err(anyhow!(
+                    "raw tx batch: {} answers for {} requests",
+                    arr.len(),
+                    chunk.len()
+                ));
+            }
+            let mut slots: Vec<Option<Vec<u8>>> = vec![None; chunk.len()];
+            for item in arr {
+                let id = item
+                    .get("id")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow!("raw tx batch: answer without an id"))?
+                    as usize;
+                let slot = slots
+                    .get_mut(id)
+                    .ok_or_else(|| anyhow!("raw tx batch: id {id} was not requested"))?;
+                if slot.is_some() {
+                    return Err(anyhow!("raw tx batch: id {id} answered twice"));
+                }
+                let s = item
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("raw tx batch: id {id} has no hex result"))?;
+                *slot = Some(decode_hex(s).map_err(|e| anyhow!("raw tx hex: {e}"))?);
+            }
+            for (i, slot) in slots.into_iter().enumerate() {
+                let raw = slot.ok_or_else(|| anyhow!("raw tx batch: id {i} unanswered"))?;
+                Self::check_raw_tx(&raw, &chunk[i])?;
+                raws.push(raw);
+            }
+        }
+        Ok(raws)
+    }
+
+    fn raw_txs_serial(&self, hashes: &[[u8; 32]]) -> Result<Vec<Vec<u8>>> {
+        let mut raws = Vec::with_capacity(hashes.len());
+        for h in hashes {
+            let hx = format!("0x{}", hex::encode(h));
+            let raw_v = self.call("eth_getRawTransactionByHash", json!([hx]))?;
+            if raw_v.is_null() {
+                return Err(anyhow!("eth_getRawTransactionByHash: missing {hx}"));
+            }
+            let s = raw_v
+                .as_str()
+                .ok_or_else(|| anyhow!("eth_getRawTransactionByHash: expected hex"))?;
+            let raw = decode_hex(s).map_err(|e| anyhow!("raw tx hex: {e}"))?;
+            Self::check_raw_tx(&raw, h)?;
+            raws.push(raw);
+        }
+        Ok(raws)
+    }
+
+    fn check_raw_tx(raw: &[u8], want: &[u8; 32]) -> Result<()> {
+        if raw.len() > MAX_RAW_TX {
+            return Err(anyhow!("raw tx too large"));
+        }
+        if keccak256(raw) != *want {
+            return Err(anyhow!("raw tx keccak mismatch"));
+        }
+        Ok(())
+    }
+
     fn headers_one_batch(&self, from: u64, to: u64) -> Result<Vec<RpcBlockHeader>> {
         let batch: Vec<Value> = (from..=to)
             .map(|i| {
@@ -463,26 +551,18 @@ impl RpcUpstream for Upstream {
             let h = decode_hex_fixed::<32>(s).map_err(|e| anyhow!("tx hash: {e}"))?;
             hashes.push(h);
         }
-        let mut raws = Vec::with_capacity(hashes.len());
-        for h in &hashes {
-            let hx = format!("0x{}", hex::encode(h));
-            let raw_v = self.call("eth_getRawTransactionByHash", json!([hx]))?;
-            if raw_v.is_null() {
-                return Err(anyhow!("eth_getRawTransactionByHash: missing {hx}"));
+        // One request per transaction would be ~60 round trips for a BSC block. Since
+        // receipts started binding to `transactionsRoot`, that cost lands on every
+        // `eth_getTransactionReceipt`, and on every block of an `eth_getLogs` range —
+        // measured at ~13 s per block before batching. Batch, and fall back to the serial
+        // path for an upstream that does not answer batches.
+        match self.raw_txs_batched(&hashes) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                eprintln!("batched raw-tx fetch failed ({e:#}); serial");
+                self.raw_txs_serial(&hashes)
             }
-            let s = raw_v
-                .as_str()
-                .ok_or_else(|| anyhow!("eth_getRawTransactionByHash: expected hex"))?;
-            let raw = decode_hex(s).map_err(|e| anyhow!("raw tx hex: {e}"))?;
-            if raw.len() > MAX_RAW_TX {
-                return Err(anyhow!("raw tx too large"));
-            }
-            if keccak256(&raw) != *h {
-                return Err(anyhow!("raw tx keccak mismatch"));
-            }
-            raws.push(raw);
         }
-        Ok(raws)
     }
 
     fn block_receipts_json(&self, block_hash: &str) -> Result<Vec<Value>> {

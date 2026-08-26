@@ -14,7 +14,7 @@ in CI against live mainnet.
 
 | | |
 |---|---|
-| Verified reads | balances, nonces, code, storage, `eth_call`, `eth_estimateGas`, headers, receipts, single-block logs |
+| Verified reads | balances, nonces, code, storage, `eth_call`, `eth_estimateGas`, headers, receipts, logs over ranges up to 128 blocks |
 | Read head | BLS-finalized, ~2 blocks behind the tip (falls back to ~110 without vote keys) |
 | History | ~112 blocks; not an archive node |
 | Tests | 427, plus an adversarial in-process lying upstream |
@@ -102,9 +102,11 @@ The MVP-1 and MVP-2 gates are closed and v0.1.0 has shipped. What is open:
 
 1. **No audit.** Nothing here has been reviewed by a third party. This is the single
    largest gap between the current state and anything anyone should hold funds behind.
-2. **Log ranges and filters.** `eth_getLogs` serves a single block; a range, `eth_newFilter`
-   and `eth_subscribe` stay `-32601`. Ranges need an index this client deliberately does not
-   keep, so this is a design question, not a missing function.
+2. **Filters and subscriptions.** `eth_newFilter` and `eth_subscribe` stay `-32601`: they
+   need server-side state this client does not keep. `eth_getLogs` ranges were closed on
+   2026-08-25 — up to 128 blocks, built from `receiptsRoot`-bound receipts one block at a
+   time rather than from an upstream's own `eth_getLogs`. Wider spans are refused because
+   there is no log index, and each block costs an upstream fetch.
 3. **Receipt fields — closed 2026-08-25.** Nothing on a receipt is echoed from the
    upstream any more. `gasUsed` is derived from the verified cumulative chain;
    `transactionHash` is bound to `transactionsRoot`; and `to`, `from`, `contractAddress`
