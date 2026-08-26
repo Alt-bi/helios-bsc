@@ -108,6 +108,41 @@ The rows still worth re-probing under ≥3 are the ones rejected purely on depth
 (~96) and especially **QuickNode free, whose 5-block window was a hard fail at 112 and is
 ample at 2**.
 
+## The matrix was right and the README was not (2026-08-26)
+
+Re-measured against live mainnet, by number, address zero, one probe per lag:
+
+| Provider | tag `latest` | lag 2 | lag 64 | lag 112 | lag 128 |
+|---|---|---|---|---|---|
+| `bsc-mainnet.public.blastapi.io` | OK | **OK** | **OK** | **OK** | `missing trie node` |
+| `bsc-rpc.publicnode.com` | OK | refused | refused | refused | refused |
+| `bsc.drpc.org` | OK | rate-limited | OK | rate-limited | rate-limited |
+
+publicnode's refusal is the same `-32602 distance to target block exceeds maximum proof
+window` this file has recorded since 2026-08-18, at every lag including the tip. Nothing
+changed. blastapi's window has *widened* since the 2026-08-21 sweep — 112 answers now
+where 96 failed then — which is a reminder that these are provider-side settings and not
+protocol facts.
+
+**What was new is where that host was named.** `README.md`, `docs/quickstart.md` and
+`docs/deploy.md` all told a first-time reader to run
+`--upstream https://bsc-rpc.publicnode.com` — the host this table marks *tag-only, no*.
+Verified end to end: the same differential soak, changing only `--upstream`, gives
+`compared=0` with a `proof_verification_failed` on the first `eth_getBalance` against
+publicnode, and `compared=1466 match=1466 mismatch=0` against blastapi. So the getting
+started command did not work, and this file had said why for eight days.
+
+Two fixes. The commands now name a measured proof provider and keep publicnode where it
+is genuinely good — as `--checkpoint-oracle` and `--backup`, neither of which needs a
+proof. And `run` now probes its upstream at startup and prints the diagnosis itself, so
+the next provider that turns out to be tag-only does not need anybody to read this file:
+
+```
+!!! This upstream serves eth_getProof for the tag `latest` but refuses it at
+!!! its own verified head 118191284 (lag 2):
+!!!   rpc error: {"code":-32602,"message":"distance to target block exceeds maximum proof window"}
+```
+
 ## Re-probe notes (2026-08-21)
 
 Two traps that cost time when re-running this matrix — neither is a client bug:

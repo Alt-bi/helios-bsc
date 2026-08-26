@@ -75,6 +75,49 @@ pub fn non_loopback_warning(listen: &str) -> String {
     )
 }
 
+/// The upstream answers `eth_getProof` for the tag `latest` and refuses it at a number.
+///
+/// This is the single most common way to have a working provider and a client that
+/// cannot use it, and it is not recoverable by tuning: proving against `latest` would
+/// mean asking the upstream which block that is, which is the one question this client
+/// exists not to take an upstream's word on. Every verified read fails, forever, and the
+/// operator sees it as `proof_verification_failed` — a phrase that points at this client.
+///
+/// Named after the provider class rather than the symptom, because the fix is to change
+/// the provider. `docs/proof-provider-matrix.md` measures which ones are which.
+pub fn tag_only_upstream_warning(at: &str, err: &str) -> String {
+    format!(
+        "\n\
+         !!! This upstream serves eth_getProof for the tag `latest` but refuses it at\n\
+         !!! {at}:\n\
+         !!!   {err}\n\
+         !!!\n\
+         !!! That is a tag-only provider. It cannot serve this client at all -- not at a\n\
+         !!! shorter lag, not under --finality confirmation-depth. Proving against\n\
+         !!! `latest` would mean trusting the upstream to say which block that is.\n\
+         !!!\n\
+         !!! Every verified read (eth_getBalance, eth_call, eth_getStorageAt, ...) will\n\
+         !!! fail. Pick an upstream from docs/proof-provider-matrix.md. This provider is\n\
+         !!! still fine as --backup or --checkpoint-oracle: neither needs a proof.\n"
+    )
+}
+
+/// The upstream refused `eth_getProof` at the read head and at `latest` alike.
+///
+/// Unlike the tag-only case this may clear on its own — a rate limit, a node still
+/// catching up — so the wording says what to watch rather than what to replace.
+pub fn proof_refused_warning(at: &str, err: &str) -> String {
+    format!(
+        "\n\
+         !!! This upstream would not serve eth_getProof at {at}:\n\
+         !!!   {err}\n\
+         !!!\n\
+         !!! Verified reads will fail while that lasts. A rate limit clears on its own; a\n\
+         !!! node that keeps no state this far back does not. Check the error above, and\n\
+         !!! docs/proof-provider-matrix.md for hosts measured to serve proofs by number.\n"
+    )
+}
+
 /// Non-loopback binds need `--allow-non-loopback` (no RPC auth in this binary).
 pub fn assert_listen_policy(listen: &str, allow_non_loopback: bool) -> Result<()> {
     if listen_is_loopback(listen) {
@@ -90,6 +133,43 @@ pub fn assert_listen_policy(listen: &str, allow_non_loopback: bool) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tag-only case is the one an operator cannot fix by tuning, so the text has to
+    /// say *change the provider* and has to say the provider is still useful elsewhere.
+    /// Pinning the phrases means a reword breaks here rather than quietly turning the
+    /// warning into something that no longer tells anyone what to do.
+    #[test]
+    fn the_tag_only_warning_names_the_cause_and_the_fix() {
+        let w = tag_only_upstream_warning("its own verified head 42 (lag 2)", "some rpc error");
+        for phrase in [
+            "tag-only provider",
+            "cannot serve this client at all",
+            "not under --finality confirmation-depth",
+            "docs/proof-provider-matrix.md",
+            "still fine as --backup",
+            "its own verified head 42 (lag 2)",
+            "some rpc error",
+        ] {
+            assert!(
+                w.contains(phrase),
+                "missing {phrase:?} in:
+{w}"
+            );
+        }
+    }
+
+    /// The recoverable case must *not* tell the operator to replace a provider that may
+    /// simply be rate limited -- and must not claim the tag-only diagnosis it did not make.
+    #[test]
+    fn the_refused_warning_does_not_overstate() {
+        let w = proof_refused_warning("its own verified head 42 (lag 2)", "limit exceeded");
+        assert!(w.contains("limit exceeded"));
+        assert!(w.contains("clears on its own"));
+        assert!(
+            !w.contains("tag-only"),
+            "this path made no tag-only finding; it must not claim one"
+        );
+    }
 
     #[test]
     fn loopback_hosts() {

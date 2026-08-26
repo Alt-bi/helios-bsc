@@ -360,6 +360,15 @@ async fn main() -> Result<()> {
                 "{}",
                 finality_startup_line(finality, node.fast_finality_armed())
             );
+            // Ask the upstream, once, the question the first verified read will ask it.
+            // A provider that only serves `eth_getProof` for the tag `latest` cannot
+            // serve this client at all, and until now said so as a
+            // `proof_verification_failed` on the operator's first balance query -- which
+            // reads as a fault in the client rather than a provider that was never going
+            // to work. See docs/proof-provider-matrix.md.
+            if let Some(warning) = node.proof_capability_warning() {
+                eprintln!("{warning}");
+            }
             rpc_server::serve(Arc::new(node), &listen)
         }
         Commands::WriteCheckpoint {
