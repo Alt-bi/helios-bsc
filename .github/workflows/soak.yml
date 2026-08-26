@@ -103,20 +103,28 @@ jobs:
         # probe. `--no-checkpoint-store` keeps this run from rewriting the file the soak
         # is about to use.
         #
-        # Provider split, measured 2026-08-25 (docs/proof-provider-matrix.md): no free
-        # keyless host serves both eth_getProof and eth_getBlockReceipts. BlastAPI serves
-        # proofs and answers 401 for receipts; publicnode is the reverse. `--backup` is
-        # transport failover and covers exactly that -- it changes who is asked, never
-        # what is checked, since receipts still bind to the sealed receiptsRoot.
+        # Provider split, measured (docs/proof-provider-matrix.md): no free keyless host
+        # serves both eth_getProof and eth_getBlockReceipts, so the data plane needs two.
+        # `--backup` is transport failover and covers exactly that -- it changes who is
+        # asked, never what is checked, since receipts still bind to the sealed
+        # receiptsRoot and envelopes to transactionsRoot.
         #
-        # The comparison oracle is the third host, so nothing is compared against the
-        # process that served it. dataseed refuses eth_getLogs outright, so the log check
-        # reports SKIP there; receipts and the filter round trip still run.
+        # Role assignment, measured rather than guessed (2026-08-26):
+        #
+        #   blastapi   eth_getProof OK          -> primary, serves the proofs
+        #   dataseed   receipts + rawTx OK,
+        #              eth_getLogs refused      -> backup, serves the block data plane
+        #   publicnode receipts + rawTx + logs  -> comparison oracle
+        #
+        # The first run of this job had dataseed as the oracle, and every round reported
+        # `logs SKIP: limit exceeded` — a check that never checks. Swapping the two puts
+        # the host that answers eth_getLogs on the comparison side, and still compares our
+        # receipts (served by dataseed) against a different host.
         run: |
           set -euo pipefail
           ./target/release/helios-bsc run \
             --upstream "$UPSTREAM" \
-            --backup "$ORACLE" \
+            --backup "$CHECKPOINT_ORACLE" \
             --checkpoint checkpoint.json \
             --no-checkpoint-store \
             --listen 127.0.0.1:8545 > rpc.log 2>&1 &
@@ -132,7 +140,7 @@ jobs:
             sleep 5
           done
           HELIOS_BSC_LOCAL=http://127.0.0.1:8545 \
-          HELIOS_BSC_ORACLE="$CHECKPOINT_ORACLE" \
+          HELIOS_BSC_ORACLE="$ORACLE" \
             python3 scripts/soak_vs_oracle.py --rounds 4 --interval 45 2>&1 | tee surface.log
 
       - name: Stop the local RPC
