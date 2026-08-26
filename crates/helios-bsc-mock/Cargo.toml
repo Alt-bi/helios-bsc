@@ -14,4 +14,5 @@ helios-bsc-execution = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
+secp256k1 = { workspace = true }
 anyhow = { workspace = true }

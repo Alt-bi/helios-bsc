@@ -1,7 +1,7 @@
 //! PR 10: lying upstream through `Node::handle` (no network).
 
 use crate::diff::{diff_vs_oracle, soak_list, SOAK_ADDRESSES};
-use crate::rpc_server::FinalityMode;
+use crate::rpc_server::{FinalityMode, ROLLBACK_EVERY, ROLLBACK_KEEP};
 use crate::sync::{
     confirm_checkpoint_with_oracle, walk_from_checkpoint, walk_from_checkpoint_inturn, walk_headers,
 };
@@ -14,7 +14,8 @@ use helios_bsc_execution::{
 };
 use helios_bsc_mock::{
     cycling_sealer_chain, distinct_sealer_chain, header_from_verified, headers_from_chain, n_seal,
-    relink_dummy_chain, MockRpc, Scenario, WBNB_ADDRESS, WRONG_STATE_ROOT,
+    relink_dummy_chain, sealed_chain, MockRpc, Scenario, SealedChain, WBNB_ADDRESS,
+    WRONG_STATE_ROOT,
 };
 use helios_bsc_rpc::{
     ERR_INVALID, ERR_METHOD, ERR_NOT_SYNCED, ERR_PARAMS, ERR_PARSE, ERR_PROOF_FAILED,
@@ -25,6 +26,10 @@ use helios_bsc_types::{
     decode_hex, decode_hex_fixed, decode_u64, keccak256, Checkpoint, RpcBlockHeader, SafeHead,
 };
 use serde_json::{json, Value};
+
+/// `(tip, headers)` a mock upstream currently serves, swappable behind a lock so a test
+/// can reorg the chain under a node that is already running on it.
+type ServedBranch = std::sync::Arc<std::sync::Mutex<Option<(u64, Vec<RpcBlockHeader>)>>>;
 
 struct MockUpstream {
     tip: u64,
@@ -51,6 +56,10 @@ struct MockUpstream {
     /// from inside `resync_locked`, i.e. while the chain and snapshot locks are held,
     /// which is the case that used to take the whole RPC surface down with it.
     panic_in: Option<&'static str>,
+    /// A branch this upstream switches to, so a test can reorg the chain under a node
+    /// that is already running on the old one. Shared with the test, which sets it
+    /// between two `refresh()` calls; `None` serves `headers` / `tip` above.
+    reorg: ServedBranch,
 }
 
 impl MockUpstream {
@@ -75,6 +84,7 @@ impl MockUpstream {
             raw_txs: Vec::new(),
             block_number_calls: std::sync::Arc::default(),
             panic_in: None,
+            reorg: std::sync::Arc::default(),
         })
     }
 
@@ -94,6 +104,23 @@ impl MockUpstream {
             raw_txs: Vec::new(),
             block_number_calls: std::sync::Arc::default(),
             panic_in: None,
+            reorg: std::sync::Arc::default(),
+        }
+    }
+
+    /// Serve a chain with real Parlia seals, i.e. one the snapshot path will accept.
+    fn for_sealed(sc: &SealedChain) -> Self {
+        let mut up = Self::for_chain(&[], json!({}));
+        up.tip = sc.tip();
+        up.headers = sc.headers.clone();
+        up
+    }
+
+    /// What this upstream currently claims the chain is.
+    fn served(&self) -> (u64, Vec<RpcBlockHeader>) {
+        match self.reorg.lock().expect("reorg lock").as_ref() {
+            Some((tip, headers)) => (*tip, headers.clone()),
+            None => (self.tip, self.headers.clone()),
         }
     }
 }
@@ -102,11 +129,12 @@ impl RpcUpstream for MockUpstream {
     fn block_number(&self) -> Result<u64> {
         self.block_number_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(self.tip)
+        Ok(self.served().0)
     }
 
     fn header_by_number(&self, n: u64) -> Result<RpcBlockHeader> {
-        self.headers
+        self.served()
+            .1
             .iter()
             .chain(self.epoch_headers.iter())
             .find(|h| decode_u64(&h.number).ok() == Some(n))
@@ -116,10 +144,10 @@ impl RpcUpstream for MockUpstream {
 
     fn header_by_hash(&self, hash: &str) -> Result<RpcBlockHeader> {
         let mut h = self
-            .headers
-            .iter()
+            .served()
+            .1
+            .into_iter()
             .find(|h| h.hash.eq_ignore_ascii_case(hash))
-            .cloned()
             .ok_or_else(|| anyhow!("header {hash} missing"))?;
         if self.lie_state_root {
             h.state_root = format!("0x{}", hex::encode(WRONG_STATE_ROOT));
@@ -133,14 +161,14 @@ impl RpcUpstream for MockUpstream {
             "injected panic under the chain lock"
         );
         let mut out: Vec<RpcBlockHeader> = self
-            .headers
-            .iter()
+            .served()
+            .1
+            .into_iter()
             .filter(|h| {
                 decode_u64(&h.number)
                     .ok()
                     .is_some_and(|n| n >= from && n <= to)
             })
-            .cloned()
             .collect();
         out.sort_by_key(|h| decode_u64(&h.number).unwrap_or(0));
         Ok(out)
@@ -3135,4 +3163,477 @@ fn the_dispatcher_agrees_with_the_method_policy_table() {
             ),
         }
     }
+}
+
+// --- reorgs on the checkpoint path -------------------------------------------------
+//
+// This surface had no test at all, and that was not an oversight: until `is_link_err`
+// learned to walk `err.chain()` the recovery branch below `append_new_with_snapshot` had
+// never executed, so there was nothing to write a test against. It could not be tested
+// afterwards either, because reaching it needs two *sealed* branches of the same chain and
+// the mock could only mutate the five captured mainnet headers. `helios_bsc_mock::sealed`
+// is what closes that: synthetic headers with real Parlia seals, so both branches pass
+// `verify_seal_coinbase` on their own merits and a reorg here is two honest chains rather
+// than one honest chain and one broken header.
+
+/// What a `MockUpstream` currently serves, so a test can grow the chain the way a run
+/// grows it -- several syncs -- and then swap the branch under a node that is running.
+#[derive(Clone)]
+struct Branch(ServedBranch);
+
+impl Branch {
+    fn serve(&self, sc: &SealedChain, upto: u64) {
+        let headers: Vec<RpcBlockHeader> = sc
+            .headers
+            .iter()
+            .filter(|h| decode_u64(&h.number).unwrap_or(0) <= upto)
+            .cloned()
+            .collect();
+        *self.0.lock().expect("branch lock") = Some((upto, headers));
+    }
+}
+
+/// A node on the checkpoint path, holding only its checkpoint, plus the branch handle.
+fn sealed_node(sc: &SealedChain) -> (Node, Branch) {
+    let up = MockUpstream::for_sealed(sc);
+    let branch = Branch(up.reorg.clone());
+    let node = Node::from_parts_with_snapshot(
+        Box::new(up),
+        130,
+        vec![sc.root_block().expect("root block")],
+        sc.snapshot().expect("snapshot"),
+        "fermi",
+    );
+    (node, branch)
+}
+
+/// Advance a node a few blocks at a time, so rollback points accumulate the way they do
+/// over real uptime rather than all at once.
+///
+/// The step is a literal and deliberately finer than `ROLLBACK_EVERY`: stepping in units
+/// of the constant would make every measurement below move with it, and a test whose
+/// expectation is derived from the thing it checks cannot notice that thing narrowing.
+const WALK_STEP: u64 = 8;
+
+fn walk_in_steps(node: &Node, branch: &Branch, sc: &SealedChain, to: u64) {
+    // The first sync has to bring enough blocks for a Safe head to exist at all -- 15
+    // distinct sealers -- or `resync_locked` fails before any of this is reached.
+    let mut at = sc.checkpoint.number + u64::from(n_seal());
+    while at < to {
+        branch.serve(sc, at);
+        node.poll_sync()
+            .unwrap_or_else(|e| panic!("sync to {at}: {e:#}"));
+        at += WALK_STEP;
+    }
+    branch.serve(sc, to);
+    node.poll_sync()
+        .unwrap_or_else(|e| panic!("sync to {to}: {e:#}"));
+}
+
+fn header_at(sc: &SealedChain, number: u64) -> &RpcBlockHeader {
+    sc.headers
+        .iter()
+        .find(|h| decode_u64(&h.number).ok() == Some(number))
+        .unwrap_or_else(|| panic!("no header {number}"))
+}
+
+/// The whole point: a reorg arrives, and the node ends up on the winning branch, at its
+/// tip, without a restart and without replaying from the checkpoint it booted with.
+///
+/// Before rollback points there was exactly one way out of here -- `walk_from_checkpoint`
+/// from `self.origin` -- and this node has no origin at all, which is the state every node
+/// built from a running snapshot is in. So the old code could only return the error: chain
+/// stuck on an orphaned branch, process up, every later sync failing identically.
+#[test]
+fn a_reorg_leaves_the_node_on_the_winning_branch_at_its_tip() {
+    let sc = sealed_chain(80).expect("sealed chain");
+    let (node, branch) = sealed_node(&sc);
+    walk_in_steps(&node, &branch, &sc, sc.tip());
+    assert_eq!(node.poll_sync().expect("settled").0, sc.tip());
+
+    // A ten-block reorg replaced by a longer branch, the shape of a real one.
+    let fork_at = sc.tip() - 10;
+    let fork = sc.forked_after(fork_at, 18).expect("fork");
+    branch.serve(&fork, fork.tip());
+
+    let (head, safe) = node.poll_sync().expect("recovery must not fail");
+    assert_eq!(head, fork.tip(), "recovery has to reach the new tip");
+
+    // The head alone would be satisfied by a node that kept the orphaned blocks and
+    // appended to them. Check a block *inside* the reorged range: the node's own Safe
+    // head, which is what every verified read is served against.
+    assert!(
+        safe.number > fork_at,
+        "safe head {} is below the fork point {fork_at}, so this proves nothing",
+        safe.number
+    );
+    assert_eq!(
+        safe.hash.to_ascii_lowercase(),
+        header_at(&fork, safe.number).hash.to_ascii_lowercase(),
+        "the node is serving the losing branch at {}",
+        safe.number
+    );
+}
+
+/// The rewind goes back as far as it has to, not as far as the first guess.
+///
+/// The newest retained point is above the fork here, so it is on the losing branch and its
+/// re-walk fails the parent link exactly as the original sync did. That is the loop being
+/// exercised: a candidate is *tried*, not reasoned about, and the next one back is tried
+/// when it fails.
+#[test]
+fn recovery_walks_back_past_rollback_points_that_lost() {
+    let sc = sealed_chain(80).expect("sealed chain");
+    let (node, branch) = sealed_node(&sc);
+    walk_in_steps(&node, &branch, &sc, sc.tip());
+
+    let before = node.rollback_points();
+    let fork_at = sc.tip() - 30;
+    assert!(
+        before.iter().any(|n| *n > fork_at),
+        "test needs at least one retained point above the fork; had {before:?}"
+    );
+
+    let fork = sc.forked_after(fork_at, 40).expect("fork");
+    branch.serve(&fork, fork.tip());
+    assert_eq!(node.poll_sync().expect("recovery").0, fork.tip());
+
+    // Points above the fork describe the branch that lost. Keeping them would offer a
+    // later recovery a starting state this client has already established is not on the
+    // chain -- and it would fail there silently, one candidate at a time.
+    let after = node.rollback_points();
+    assert!(
+        after.iter().all(|n| *n <= fork_at || *n > sc.tip()),
+        "retained a point from the losing branch: {after:?} (fork at {fork_at})"
+    );
+}
+
+/// Two reorgs in a row, the second below the first, so the second recovery has to use a
+/// point that survived the first one's pruning.
+#[test]
+fn a_second_reorg_below_the_first_still_recovers() {
+    let sc = sealed_chain(80).expect("sealed chain");
+    let (node, branch) = sealed_node(&sc);
+    walk_in_steps(&node, &branch, &sc, sc.tip());
+
+    let first = sc.forked_after(sc.tip() - 8, 20).expect("first fork");
+    branch.serve(&first, first.tip());
+    assert_eq!(node.poll_sync().expect("first recovery").0, first.tip());
+
+    let second = sc.forked_after(sc.tip() - 24, 40).expect("second fork");
+    branch.serve(&second, second.tip());
+    let (head, safe) = node.poll_sync().expect("second recovery");
+    assert_eq!(head, second.tip());
+    assert_eq!(
+        safe.hash.to_ascii_lowercase(),
+        header_at(&second, safe.number).hash.to_ascii_lowercase()
+    );
+}
+
+/// How far back the retained points reach, which is how deep a reorg this client can
+/// absorb without a restart.
+///
+/// Written as a literal, not as `ROLLBACK_EVERY * (ROLLBACK_KEEP - 1)`. The derived form
+/// passes just as happily with either constant cut to a quarter, because the expectation
+/// moves with the thing it is checking -- the same defect as a hand-written test count
+/// nothing verifies. 240 blocks is roughly twelve times `max_reorg_depth()`, about three
+/// minutes of chain, and it costs sixteen `Snapshot` clones.
+#[test]
+fn rollback_points_reach_back_at_least_240_blocks() {
+    const REACH: u64 = 240;
+    /// Memory, not reach: whatever the spacing, the store stays a fixed small size.
+    const MAX_POINTS: usize = 32;
+
+    let sc = sealed_chain(REACH + 64).expect("sealed chain");
+    let (node, branch) = sealed_node(&sc);
+    walk_in_steps(&node, &branch, &sc, sc.tip());
+
+    let points = node.rollback_points();
+    assert!(
+        points.windows(2).all(|w| w[1] > w[0]),
+        "points must be oldest first and distinct: {points:?}"
+    );
+    assert!(
+        points.len() <= MAX_POINTS,
+        "{} retained points is unbounded growth: {points:?}",
+        points.len()
+    );
+    let reach = sc.tip() - points.first().copied().expect("at least one point");
+    assert!(
+        reach >= REACH,
+        "reach shrank to {reach} blocks, below the {REACH} this client promises: {points:?}"
+    );
+    // Sanity: the constants and the literal have to agree, or one of them is stale.
+    assert_eq!(
+        ROLLBACK_EVERY * (ROLLBACK_KEEP as u64 - 1),
+        REACH,
+        "ROLLBACK_EVERY/ROLLBACK_KEEP no longer produce the documented {REACH}-block reach"
+    );
+}
+
+/// A reorg deeper than everything retained is refused, and says why.
+///
+/// This node has no origin checkpoint, so there is no fallback replay: the honest answer
+/// is an error. It has to name the two things an operator cannot otherwise know -- that
+/// rollback points were tried, and that this process cannot replay -- because the
+/// alternative is the raw parent-link error, which reads like a broken upstream.
+#[test]
+fn a_reorg_below_every_retained_point_is_refused_with_a_reason() {
+    let span = ROLLBACK_EVERY * (ROLLBACK_KEEP as u64 + 4);
+    let sc = sealed_chain(span).expect("sealed chain");
+    let (node, branch) = sealed_node(&sc);
+    walk_in_steps(&node, &branch, &sc, sc.tip());
+    let oldest = node
+        .rollback_points()
+        .first()
+        .copied()
+        .expect("retained points");
+    assert!(
+        oldest > sc.checkpoint.number,
+        "the seeded checkpoint point must have aged out for this test to mean anything"
+    );
+
+    let fork = sc.forked_after(oldest - 1, span).expect("deep fork");
+    branch.serve(&fork, fork.tip());
+    let err = format!("{:#}", node.poll_sync().expect_err("must refuse"));
+    assert!(err.contains("rollback point"), "{err}");
+    assert!(err.contains("--checkpoint"), "{err}");
+
+    // Fail-closed: a refused recovery must leave the node on what it had verified, not on
+    // half of a branch it could not finish.
+    assert!(
+        node.rollback_points().iter().all(|n| *n <= sc.tip()),
+        "a failed recovery moved the retained state"
+    );
+}
+
+// --- the log cap, and who can act on it ---------------------------------------------
+
+/// A chain whose first `blocks` blocks each carry `per_receipt * receipts` matching logs.
+///
+/// More than one receipt per block because `MAX_RECEIPT_LOGS` is 1024 as well, so a single
+/// receipt cannot on its own carry more logs than `eth_getLogs` is willing to return.
+fn node_with_fat_log_blocks(per_receipt: usize, receipts: usize, blocks: usize) -> Node {
+    let mut chain = distinct_sealer_chain(18);
+    let addr = [0x11u8; 20];
+    let raws: Vec<Vec<u8>> = (0..receipts)
+        .map(|i| {
+            encode_consensus_receipt(&ConsensusReceipt {
+                status: 1,
+                cumulative_gas_used: 21_000 * (i as u64 + 1),
+                logs_bloom: [0u8; 256],
+                logs: (0..per_receipt)
+                    .map(|_| ConsensusLog {
+                        address: addr,
+                        topics: Vec::new(),
+                        data: Vec::new(),
+                    })
+                    .collect(),
+                tx_type: 2,
+            })
+            .unwrap()
+        })
+        .collect();
+    let root = format!("0x{}", hex::encode(ordered_trie_root(&raws)));
+    for block in chain.iter_mut().take(blocks + 1).skip(1) {
+        let mut hdr = header_from_verified(block, [0u8; 32]);
+        hdr.receipts_root = root.clone();
+        let h = header_hash(&hdr).unwrap();
+        hdr.hash = format!("0x{}", hex::encode(h));
+        block.hash = h;
+        block.header = Some(hdr);
+    }
+    let logs_json: Vec<Value> = (0..per_receipt)
+        .map(|_| json!({"address": format!("0x{}", hex::encode(addr)), "topics": [], "data": "0x"}))
+        .collect();
+    let mut up = MockUpstream::for_chain(&chain, json!({}));
+    up.receipts = (0..receipts)
+        .map(|i| {
+            json!({
+                "status": "0x1",
+                "cumulativeGasUsed": format!("0x{:x}", 21_000 * (i as u64 + 1)),
+                "logsBloom": format!("0x{}", hex::encode([0u8; 256])),
+                "type": "0x2",
+                "logs": logs_json,
+            })
+        })
+        .collect();
+    Node::from_parts(Box::new(up), 130, chain)
+}
+
+fn new_log_filter(node: &Node, from: &str) -> Value {
+    let v = node.handle(&req("eth_newFilter", json!([{"fromBlock": from}])));
+    v["result"].clone()
+}
+
+/// A poll that hits the log cap narrows its own span instead of wedging the filter.
+///
+/// `eth_getFilterChanges` does not choose its span -- the cursor does -- so refusing it
+/// used to tell the caller to "narrow the block range", which for a filter is not
+/// something they can do, *and* leave the cursor unmoved so every later poll re-read the
+/// same span and failed identically. The filter stayed stuck until someone re-installed
+/// it. The cursor already supports a poll that stops short, so the fix is to use it.
+#[test]
+fn a_filter_poll_over_the_log_cap_narrows_instead_of_wedging() {
+    // 600 per block: one block is inside the cap, two are over it.
+    let node = node_with_fat_log_blocks(300, 2, 3);
+    let id = new_log_filter(&node, "0x1");
+
+    let first = node.handle(&req("eth_getFilterChanges", json!([id])));
+    let got = first["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("poll must answer, not refuse: {first}"));
+    assert_eq!(got.len(), 600, "one block's worth: {}", got.len());
+    assert!(
+        got.iter().all(|l| l["blockNumber"] == json!("0x1")),
+        "the narrowed span must be the oldest blocks, not the newest"
+    );
+
+    // And the cursor moved over exactly what was read, so the caller catches up rather
+    // than losing the blocks the poll could not fit.
+    let second = node.handle(&req("eth_getFilterChanges", json!([id])));
+    let more = second["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("second poll: {second}"));
+    assert_eq!(more.len(), 600, "{second}");
+    assert!(
+        more.iter().all(|l| l["blockNumber"] == json!("0x2")),
+        "the second poll must resume where the first stopped: {second}"
+    );
+}
+
+/// One block over the cap is the only case a caller really has to act on, so it is the
+/// only case that says so -- and it names something a filter's owner can actually change.
+#[test]
+fn a_single_block_over_the_cap_says_what_can_be_changed() {
+    // 1200 matching logs in one block, split across two receipts.
+    let node = node_with_fat_log_blocks(600, 2, 3);
+    let id = new_log_filter(&node, "0x1");
+
+    let v = node.handle(&req("eth_getFilterChanges", json!([id])));
+    assert_eq!(err_code(&v), ERR_PARAMS, "{v}");
+    let msg = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("single block"),
+        "must say why narrowing stopped: {v}"
+    );
+    assert!(
+        msg.contains("address/topic"),
+        "must name the thing the caller can change: {v}"
+    );
+    assert!(
+        !msg.contains("narrow the block range"),
+        "a filter's owner cannot narrow a range the cursor chose: {v}"
+    );
+    assert!(
+        v["result"].is_null(),
+        "a refusal carries no partial list: {v}"
+    );
+}
+
+/// `eth_getFilterLogs` answers the filter's whole range every time and moves no cursor,
+/// so there is no smaller span to fall back to -- but "narrow the block range" is still
+/// the wrong advice, because the range belongs to a filter that already exists.
+#[test]
+fn get_filter_logs_over_the_cap_points_at_a_new_filter() {
+    let node = node_with_fat_log_blocks(300, 2, 3);
+    let id = node.handle(&req(
+        "eth_newFilter",
+        json!([{"fromBlock":"0x1","toBlock":"0x3"}]),
+    ))["result"]
+        .clone();
+
+    let v = node.handle(&req("eth_getFilterLogs", json!([id])));
+    assert_eq!(err_code(&v), ERR_PARAMS, "{v}");
+    let msg = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("install a new filter"), "{v}");
+    assert!(msg.contains("more than"), "the refusal must say why: {v}");
+}
+
+/// `eth_getLogs` keeps the advice it had: there the caller *did* choose the range.
+#[test]
+fn get_logs_over_the_cap_still_says_narrow_the_range() {
+    let node = node_with_fat_log_blocks(300, 2, 3);
+    let v = node.handle(&req(
+        "eth_getLogs",
+        json!([{"fromBlock":"0x1","toBlock":"0x2"}]),
+    ));
+    assert_eq!(err_code(&v), ERR_PARAMS, "{v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("narrow the block range"),
+        "{v}"
+    );
+}
+
+/// `transactionHash` is derived from the envelope, not echoed -- including when the
+/// upstream never sent one.
+///
+/// The envelope list is bound to the sealed `transactionsRoot`, so its keccak *is* the
+/// transaction hash: a computed fact this client already had in hand. It was used only to
+/// check a label the upstream supplied, so an upstream that omitted the field left a
+/// null on a receipt that could have been labelled -- and left the receipt lookup unable
+/// to match it to the hash it was asked for.
+#[test]
+fn transaction_hash_is_derived_when_the_upstream_omits_it() {
+    let mut chain = distinct_sealer_chain(15);
+    let raw_txs: Vec<Vec<u8>> = vec![vec![0x02, 0xaa, 0xbb]];
+    let tx_hash = keccak256(&raw_txs[0]);
+    let log = ConsensusLog {
+        address: [0x11u8; 20],
+        topics: Vec::new(),
+        data: Vec::new(),
+    };
+    let rec = ConsensusReceipt {
+        status: 1,
+        cumulative_gas_used: 21_000,
+        logs_bloom: [0u8; 256],
+        logs: vec![log],
+        tx_type: 2,
+    };
+    let mut hdr = header_from_verified(&chain[0], [0u8; 32]);
+    hdr.receipts_root = format!(
+        "0x{}",
+        hex::encode(ordered_trie_root(
+            &[encode_consensus_receipt(&rec).unwrap()]
+        ))
+    );
+    hdr.transactions_root = format!("0x{}", hex::encode(ordered_trie_root(&raw_txs)));
+    let hash = header_hash(&hdr).unwrap();
+    hdr.hash = format!("0x{}", hex::encode(hash));
+    chain[0].hash = hash;
+    chain[0].header = Some(hdr);
+
+    let mut up = MockUpstream::for_chain(&chain, json!({}));
+    up.raw_txs = raw_txs;
+    // `eth_getTransactionReceipt` asks the upstream only *which block* to look in; the
+    // answer is then verified against the local chain, so an unverified stub is all this
+    // needs and all it is allowed to contribute.
+    up.unverified = json!({
+        "blockHash": format!("0x{}", hex::encode(hash)),
+        "blockNumber": "0x0",
+    });
+    // No `transactionHash` field at all: the case an upstream is free to serve.
+    up.receipts = vec![json!({
+        "status": "0x1",
+        "cumulativeGasUsed": "0x5208",
+        "logsBloom": format!("0x{}", hex::encode([0u8; 256])),
+        "type": "0x2",
+        "logs": [{"address": format!("0x{}", hex::encode([0x11u8; 20])), "topics": [], "data": "0x"}],
+    })];
+    let node = Node::from_parts(Box::new(up), 130, chain);
+
+    let want = format!("0x{}", hex::encode(tx_hash));
+    let v = node.handle(&req("eth_getBlockReceipts", json!(["latest"])));
+    let r = &v["result"][0];
+    assert_eq!(r["transactionHash"], json!(want), "{v}");
+    // The logs repeat the field, and a receipt whose logs disagree with it is worse than
+    // one that says nothing.
+    assert_eq!(r["logs"][0]["transactionHash"], json!(want), "{v}");
+
+    // And the derived label is what makes the receipt findable by hash at all.
+    let one = node.handle(&req("eth_getTransactionReceipt", json!([want])));
+    assert_eq!(one["result"]["transactionHash"], json!(want), "{one}");
 }

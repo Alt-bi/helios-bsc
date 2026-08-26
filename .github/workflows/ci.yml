@@ -13,10 +13,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # Channel matches rust-toolchain.toml (stable + clippy, rustfmt); not nightly.
-      - uses: dtolnay/rust-toolchain@stable
+      # Third-party actions run arbitrary code in this job, with access to the tree
+      # before `cargo build` sees it. A tag or a branch is a name its owner can move;
+      # a commit SHA is not. Dependabot updates these lines and shows the diff, which
+      # is the point: an update becomes something a human reads rather than something
+      # that happens. `# stable` / `# v2.9.2` say what the SHA was when it was pinned.
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
+          toolchain: stable
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: cargo fmt
         run: cargo fmt --all -- --check
       - name: cargo test
@@ -113,5 +119,84 @@ jobs:
             | map(select((.published | tostring) == "8545" or (.target | tostring) == "8545"))
             | length > 0 and all(.host_ip == "127.0.0.1")
           '
+      - name: compose must keep the container hardening
+        # docs/threat-model.md calls the container the one path where both in-process
+        # guards are inactive by construction, so what is left is the runtime the
+        # operator gets handed. Each of these four is free here -- this process needs no
+        # capabilities, writes nothing outside the checkpoint volume, and never becomes
+        # another user -- which is exactly why a future edit could drop one without
+        # noticing anything break. Assert them, or they are decoration.
+        #
+        # The second half is the assertions asserting themselves. A check that cannot
+        # fail is worse than none, and "jq -e on a missing key exits non-zero" is a claim
+        # about jq, not about this repository -- so the same four queries are run against
+        # a copy of the config with the hardening stripped out, and every one of them has
+        # to fail. If a query is ever mistyped into something vacuously true, that half
+        # goes red even while the real config is fine.
+        env:
+          HELIOS_BSC_UPSTREAM: http://127.0.0.1:1
+        run: |
+          set -euo pipefail
+          cp .env.example .env
+          docker compose config --format json > compose.json
+
+          READ_ONLY='.services["helios-bsc"].read_only == true'
+          CAP_DROP='.services["helios-bsc"].cap_drop == ["ALL"]'
+          NO_NEW_PRIV='.services["helios-bsc"].security_opt | index("no-new-privileges:true")'
+          TMPFS='.services["helios-bsc"].tmpfs | length > 0'
+
+          check() {
+            if ! jq -e "$1" compose.json > /dev/null; then
+              echo "::error::compose lost $2"
+              exit 1
+            fi
+          }
+          check "${READ_ONLY}" 'read_only'
+          check "${CAP_DROP}" 'cap_drop: [ALL]'
+          check "${NO_NEW_PRIV}" 'no-new-privileges'
+          check "${TMPFS}" 'the tmpfs a read-only root needs for tmp+rename'
+          echo "compose hardening intact"
+
+          jq 'del(.services["helios-bsc"].read_only,
+                  .services["helios-bsc"].cap_drop,
+                  .services["helios-bsc"].security_opt,
+                  .services["helios-bsc"].tmpfs)' compose.json > stripped.json
+          for q in "${READ_ONLY}" "${CAP_DROP}" "${NO_NEW_PRIV}" "${TMPFS}"; do
+            if jq -e "${q}" stripped.json > /dev/null 2>&1; then
+              echo "::error::this check passes on a config with the hardening removed, so it checks nothing: ${q}"
+              exit 1
+            fi
+          done
+          echo "and each of those four checks fails when the setting is removed"
+
+      - name: the Dockerfile must declare a healthcheck
+        # A grep, not an inspection: building the image here would add minutes to every
+        # PR, and the image *is* built and its healthcheck *is* inspected on every
+        # release -- see the "the published image is healthy-by-construction" step in
+        # release.yml. This catches the edit that deletes the line.
+        run: |
+          set -euo pipefail
+          grep -q '^HEALTHCHECK ' Dockerfile || {
+            echo "::error::Dockerfile has no HEALTHCHECK -- a container can then be up, answering, and stalled, with nothing saying so"
+            exit 1
+          }
+          grep -q '"health"' Dockerfile || {
+            echo "::error::HEALTHCHECK no longer calls the health subcommand"
+            exit 1
+          }
+          echo "Dockerfile declares a healthcheck that runs the health subcommand"
+
       - name: Dockerfile syntax check
         run: docker build --check .
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Markdown tables must render as tables
+        # STATUS.md is the page a reader lands on first, and its milestone table had two
+        # stray blank lines in it: GitHub renders a `| a | b |` line after a blank line as
+        # literal text, so the four newest entries showed as pipe-soup. No test, link
+        # checker or one-row diff catches that. This does, and it found a second one in
+        # docs/README.md the moment it was written.
+        run: python3 scripts/check_markdown_tables.py

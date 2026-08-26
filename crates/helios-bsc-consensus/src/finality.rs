@@ -25,7 +25,6 @@ pub fn newest_safe(chain: &[VerifiedBlock], n_seal: u32) -> Option<SafeHead> {
         return None;
     }
     let threshold = min_distinct_sealers(n_seal);
-    let tip = chain.last()?;
     let mut seen: Vec<[u8; 20]> = Vec::new();
     for (i, block) in chain.iter().enumerate().rev() {
         if !seen.iter().any(|a| a == &block.miner) {
@@ -45,7 +44,6 @@ pub fn newest_safe(chain: &[VerifiedBlock], n_seal: u32) -> Option<SafeHead> {
                 required_sealers: threshold,
             });
         }
-        let _ = tip;
     }
     None
 }

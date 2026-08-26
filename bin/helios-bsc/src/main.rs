@@ -8,6 +8,7 @@ use helios_bsc::diff::{
     soak_empty_burst, soak_list, soak_repeat_full_list, unmatched, DiffOutcome, DiffReport,
     SOAK_ADDRESSES,
 };
+use helios_bsc::health::{judge, Health, HealthLimits, DEFAULT_MAX_LAG_SECONDS};
 use helios_bsc::rpc_server::{self, FinalityMode, Node};
 use helios_bsc::soak_state::{human_secs, SoakFingerprint, SoakState};
 use helios_bsc::sync::{
@@ -62,6 +63,30 @@ enum Commands {
     Info,
     /// Env + host check (does not print API keys).
     Doctor,
+    /// Liveness probe for a running `run`: exit 0 while the head is moving, 1 otherwise.
+    ///
+    /// Asks the local RPC for `helios_bsc_syncStatus`, which is the one call that cannot
+    /// be answered out of stale state. Reports; never restarts anything.
+    Health {
+        /// Local verified RPC to probe.
+        #[arg(
+            long,
+            env = "HELIOS_BSC_LOCAL",
+            default_value = "http://127.0.0.1:8545"
+        )]
+        url: String,
+        /// Seconds of chain the Safe head may be behind the tip before this fails.
+        #[arg(long, default_value_t = DEFAULT_MAX_LAG_SECONDS)]
+        max_lag_seconds: u64,
+        /// Optional additional bound in blocks. Unset by default: seconds is the honest
+        /// unit for "the head stopped moving", and two bounds that disagree is one too many.
+        #[arg(long)]
+        max_lag_blocks: Option<u64>,
+        /// Seconds to wait for a reply. Deliberately short and without retries: a probe
+        /// that takes longer than the interval it runs on stops being a probe.
+        #[arg(long, default_value_t = 5)]
+        timeout_secs: u64,
+    },
     /// Walk recent headers, compute newest Safe, verify eth_getProof via MPT.
     ProbeSafe {
         #[arg(long, env = "HELIOS_BSC_UPSTREAM")]
@@ -255,6 +280,19 @@ fn main() -> Result<()> {
     match cli.cmd {
         Commands::Info => print_info(),
         Commands::Doctor => doctor(),
+        Commands::Health {
+            url,
+            max_lag_seconds,
+            max_lag_blocks,
+            timeout_secs,
+        } => health_probe(
+            &url,
+            HealthLimits {
+                max_lag_seconds: Some(max_lag_seconds),
+                max_lag_blocks,
+            },
+            Duration::from_secs(timeout_secs),
+        ),
         Commands::ProbeSafe {
             upstream,
             lookback,
@@ -359,6 +397,15 @@ fn main() -> Result<()> {
                 "{}",
                 finality_startup_line(finality, node.fast_finality_armed())
             );
+            // Ask the upstream, once, the question the first verified read will ask it.
+            // A provider that only serves `eth_getProof` for the tag `latest` cannot
+            // serve this client at all, and until now said so as a
+            // `proof_verification_failed` on the operator's first balance query -- which
+            // reads as a fault in the client rather than a provider that was never going
+            // to work. See docs/proof-provider-matrix.md.
+            if let Some(warning) = node.proof_capability_warning() {
+                eprintln!("{warning}");
+            }
             rpc_server::serve(Arc::new(node), &listen)
         }
         Commands::WriteCheckpoint {
@@ -504,6 +551,52 @@ fn print_info() -> Result<()> {
 
 fn env_opt(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.trim().is_empty())
+}
+
+/// One request, one verdict, no retries.
+///
+/// Retrying here would be wrong twice over: the container runs this every 30 s, so a
+/// probe that spends 90 s backing off overlaps its own next run; and a single failed
+/// attempt is exactly the signal HEALTHCHECK is built to accumulate -- Docker already
+/// applies its own `--retries` before it calls a container unhealthy. Doing it again in
+/// here would just make the state change later and mean less.
+fn health_probe(url: &str, limits: HealthLimits, timeout: Duration) -> Result<()> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .build()
+        .into();
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "helios_bsc_syncStatus",
+        "params": [],
+    });
+    let reply = agent
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("User-Agent", "helios-bsc-health")
+        .send_json(&body);
+
+    let verdict = match reply {
+        Err(e) => Health::Unhealthy(format!("no answer from {}: {e}", rpc_host(url))),
+        Ok(resp) => match resp.into_body().read_json::<serde_json::Value>() {
+            Err(e) => Health::Unhealthy(format!("reply was not JSON: {e}")),
+            Ok(envelope) => match helios_bsc::health::result_of(&envelope) {
+                Err(reason) => Health::Unhealthy(reason),
+                Ok(status) => judge(status, &limits),
+            },
+        },
+    };
+
+    if verdict.is_ok() {
+        println!("healthy: {}", verdict.message());
+        Ok(())
+    } else {
+        // stderr, and a plain non-zero exit. Docker records the last output line against
+        // the container, so `docker inspect` carries the reason without a log dive.
+        eprintln!("unhealthy: {}", verdict.message());
+        std::process::exit(1);
+    }
 }
 
 fn doctor() -> Result<()> {

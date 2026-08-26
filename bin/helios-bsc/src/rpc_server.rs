@@ -1,6 +1,55 @@
 //! Fail-closed local JSON-RPC (wallet mode: latest → Safe).
+//!
+//! This file was 4,773 lines, with a single 2,594-line `impl Node` in the middle of it.
+//! It is the largest thing an auditor has to read here and the place a reviewer is least
+//! able to say what changed, which is a poor combination for the file that decides what
+//! this client will and will not answer.
+//!
+//! It now keeps the parts that are genuinely about the whole server — the `Node` and its
+//! state, sync and refresh, metrics, and the dispatch table that names every method — and
+//! hands each surface to its own module:
+//!
+//! | module | what it decides |
+//! |---|---|
+//! | [`http`] | the listener, its workers, and the rejections before dispatch |
+//! | [`state`] | balances, nonces, code, storage, `eth_getProof` |
+//! | [`calls`] | `eth_call` / `eth_estimateGas` and the prover behind them |
+//! | [`blocks`] | headers, uncles, transaction counts and by-index lookups |
+//! | [`receipts`] | receipts, raw envelopes, the opt-in passthrough |
+//! | [`logs`] | log ranges and poll-based filters |
+//! | [`validate`] | shape checks on every field an upstream chooses |
+//!
+//! The split was mechanical and is checkable as such: `scripts/check_pure_move.py`
+//! compares the token multiset before and after, and reports zero code tokens added or
+//! removed. Nothing outside this file changed — not `main.rs`, not the adversarial suite.
 
-use crate::bind::{listen_is_loopback, rpc_http_host_reject};
+// Submodules are a filing decision, not an interface one: the `pub use` below re-exports
+// the transport entry points at `crate::rpc_server::*`, so every path outside this file
+// reads exactly as it did.
+//
+// `logs` is the exception, and the direction to move the others in: it exports nothing.
+// The only thing the parent needs from it by name is the store the `Node` owns, and
+// keeping the rest unreachable from here is the part of a split that is worth something
+// beyond a smaller file.
+mod blocks;
+mod calls;
+mod http;
+mod logs;
+mod receipts;
+mod state;
+mod validate;
+
+pub(crate) use blocks::*;
+pub(crate) use calls::*;
+pub use http::*;
+use logs::FilterStore;
+pub(crate) use receipts::*;
+pub(crate) use state::*;
+pub(crate) use validate::*;
+
+use crate::bind::{
+    listen_is_loopback, proof_refused_warning, rpc_http_host_reject, tag_only_upstream_warning,
+};
 use crate::sync::{
     accept_lookback_resync, append_new, append_new_with_snapshot, is_link_err, safe_of,
     walk_from_checkpoint, walk_headers, write_checkpoint_file,
@@ -38,6 +87,7 @@ use helios_bsc_types::{
     BSC_MAINNET_CHAIN_ID,
 };
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -54,6 +104,18 @@ pub struct Node {
     max_sync: u64,
     chain: Mutex<Vec<VerifiedBlock>>,
     snapshot: Mutex<Option<Snapshot>>,
+    /// Verified states this client can rewind to when the branch it was following turns
+    /// out to have lost.
+    ///
+    /// Oldest first, one every [`ROLLBACK_EVERY`] blocks. A `Snapshot` is a value: cloning
+    /// one captures the sealing set, the `recents` window and the attestation exactly as
+    /// they stood at that block, which is the entire state a re-walk needs. The chain
+    /// prefix does not have to be stored -- it is already in `chain`, and recovery
+    /// truncates rather than refetches.
+    ///
+    /// Taken only inside `resync_locked`, which already holds `chain` and `snapshot`, so
+    /// the lock order is chain -> snapshot -> rollbacks and no other path can invert it.
+    rollbacks: Mutex<VecDeque<Snapshot>>,
     checkpoint_store: Option<PathBuf>,
     fork_id: String,
     origin: Option<Checkpoint>,
@@ -158,6 +220,18 @@ pub struct RequestPanicked;
 /// scrape is worth having. Fixed and small, so this cannot become a thread-spawn amplifier.
 const RPC_WORKER_THREADS: usize = 4;
 
+/// How far apart retained rollback points are, in blocks.
+pub(crate) const ROLLBACK_EVERY: u64 = 16;
+
+/// How many rollback points are retained.
+///
+/// 16 x 16 = 256 blocks, roughly twelve times `max_reorg_depth()` (21) and comfortably
+/// inside the 512-block window `append_new_with_snapshot` keeps -- a point below that is
+/// useless, because the blocks a rewind would keep have already been dropped. Each entry
+/// is one `Snapshot`: a 21-address validator set, an ~87-entry `recents` map and a
+/// bounded ancestor list, so the whole store is tens of kilobytes.
+pub(crate) const ROLLBACK_KEEP: usize = 16;
+
 impl Node {
     pub fn bootstrap(up: Box<dyn RpcUpstream>, lookback: u64) -> Result<Self> {
         let tip = up.block_number()?;
@@ -172,6 +246,7 @@ impl Node {
             max_sync: lookback,
             chain: Mutex::new(chain),
             snapshot: Mutex::new(None),
+            rollbacks: Mutex::new(VecDeque::new()),
             checkpoint_store: None,
             fork_id: "fermi".into(),
             origin: None,
@@ -258,6 +333,9 @@ impl Node {
             lookback,
             max_sync,
             chain: Mutex::new(chain),
+            // Seeded with the state the walk ended on: recovery has somewhere to rewind
+            // to from the first sync, rather than only after `ROLLBACK_EVERY` blocks.
+            rollbacks: Mutex::new(VecDeque::from([snapshot.clone()])),
             snapshot: Mutex::new(Some(snapshot)),
             checkpoint_store: None,
             fork_id,
@@ -292,6 +370,7 @@ impl Node {
             max_sync: lookback,
             chain: Mutex::new(chain),
             snapshot: Mutex::new(None),
+            rollbacks: Mutex::new(VecDeque::new()),
             checkpoint_store: None,
             fork_id: "fermi".into(),
             origin: None,
@@ -329,6 +408,9 @@ impl Node {
             lookback,
             max_sync: lookback,
             chain: Mutex::new(chain),
+            // Seeded with the state the walk ended on: recovery has somewhere to rewind
+            // to from the first sync, rather than only after `ROLLBACK_EVERY` blocks.
+            rollbacks: Mutex::new(VecDeque::from([snapshot.clone()])),
             snapshot: Mutex::new(Some(snapshot)),
             checkpoint_store: None,
             fork_id: fork_id.into(),
@@ -414,6 +496,62 @@ impl Node {
             .expect("snapshot lock")
             .as_ref()
             .is_some_and(Snapshot::fast_finality_available)
+    }
+
+    /// One `eth_getProof` at the read head, to find out at startup what an operator
+    /// currently finds out on their first `eth_getBalance`.
+    ///
+    /// Providers split into those that serve `eth_getProof` at a **named block** and
+    /// those that only serve it for the tag `latest` — `docs/proof-provider-matrix.md`
+    /// measures which. This client can never use the tag: the whole point is to prove
+    /// against a header it sealed itself, and `latest` on the upstream is whatever that
+    /// upstream says it is. So a tag-only provider cannot serve this client at all, at
+    /// any lag, under any finality rule.
+    ///
+    /// Without this probe that surfaces as `proof_verification_failed` on the first
+    /// balance read, wrapped in two retries and a backup attempt, with the real cause —
+    /// `-32602 distance to target block exceeds maximum proof window` — somewhere in the
+    /// middle of the string. It reads like a fault in this client. It is a provider that
+    /// was never going to work.
+    ///
+    /// A warning, not a refusal: a provider having a bad minute at startup must not stop
+    /// a client that would serve fine once it recovers.
+    pub fn proof_capability_warning(&self) -> Option<String> {
+        // The published view is empty until the first `refresh`, and at startup that has
+        // not happened yet -- reading it and giving up is how this probe spent its first
+        // live run printing nothing at all. Sync first if there is nothing published.
+        let published = self
+            .finality
+            .lock()
+            .expect("finality lock")
+            .read_head
+            .clone();
+        let head = match published {
+            Some(h) => h,
+            None => match self.poll_sync() {
+                Ok((_, safe)) => safe,
+                // No head means nothing to prove against, and the operator already has a
+                // louder error than this one.
+                Err(_) => return None,
+            },
+        };
+        // Address zero: every node has it, it needs no fixture, and a verified exclusion
+        // is as good an answer as any. This asks whether the provider will answer at a
+        // named block at all, not what the answer is.
+        let zero = "0x0000000000000000000000000000000000000000";
+        let err = match self.up.get_proof(zero, &format!("0x{:x}", head.number)) {
+            Ok(_) => return None,
+            Err(e) => e.to_string(),
+        };
+        let lag = proof_lag(self.last_tip.load(Ordering::Relaxed), head.number);
+        let at = format!("its own verified head {} (lag {lag})", head.number);
+        // If the tag works where the number does not, the provider is tag-only and no
+        // amount of waiting, retrying or shortening the lag will help. Say that outright
+        // rather than leaving the operator to tune a knob that cannot reach.
+        if self.up.get_proof(zero, "latest").is_ok() {
+            return Some(tag_only_upstream_warning(&at, &err));
+        }
+        Some(proof_refused_warning(&at, &err))
     }
 
     pub fn metrics_enabled(&self) -> bool {
@@ -846,29 +984,12 @@ impl Node {
             match append_new_with_snapshot(self.up.as_ref(), chain, tip, snapshot.as_mut()) {
                 Ok(()) => {}
                 Err(e) if is_link_err(&e) => {
-                    let Some(cp) = self.origin.clone() else {
-                        return Err(e);
-                    };
-                    let cp_number = cp.number;
-                    // `{e:#}` rather than `{e}`: the cause is what says *why* this is a
-                    // reorg, and plain Display prints only the outermost context -- the
-                    // same property that stopped `is_link_err` seeing it at all.
-                    eprintln!("reorg/link break ({e:#}); replay from checkpoint {cp_number}");
-                    let (c, s) = walk_from_checkpoint(self.up.as_ref(), cp, tip, self.max_sync)
-                        .map_err(|replay| {
-                            // The origin checkpoint is fixed at bootstrap and never moves,
-                            // so once the chain has run more than `max_sync` past it this
-                            // replay can no longer reach the tip -- and no later attempt
-                            // will either. Every sync from here fails identically while
-                            // the process stays up, which is a restart, and the operator
-                            // has to be told that rather than left reading a repeat.
-                            let behind = tip.saturating_sub(cp_number);
-                            anyhow::anyhow!("reorg recovery failed: {replay:#}. The replay starts at the checkpoint this process booted from ({cp_number}), now {behind} blocks behind the tip; nothing recovers that in place. Write a fresh checkpoint and restart.")
-                        })?;
-                    *chain = c;
-                    *snapshot = Some(s);
+                    self.recover_from_link_break(chain, snapshot, tip, e)?
                 }
                 Err(e) => return Err(e),
+            }
+            if let Some(s) = snapshot.as_ref() {
+                self.record_rollback(s, chain.first().map(|b| b.number).unwrap_or(0));
             }
             let new_last = chain.last().map(|b| b.number).unwrap_or(0);
             grew = new_last > last;
@@ -900,6 +1021,157 @@ impl Node {
         let conf_safe = safe_of(chain)?;
         let head = self.read_head(chain, snapshot.as_ref(), &conf_safe);
         Ok((head, conf_safe, verified_this, grew))
+    }
+
+    /// Rewind to the newest verified state the canonical chain still contains, and walk
+    /// forward from there.
+    ///
+    /// Recovery used to have exactly one starting point: the checkpoint this process
+    /// booted from, fixed at bootstrap and never moved. That works for the first
+    /// `max_sync` blocks of uptime -- about two hours at the default -- and after that
+    /// `walk_from_checkpoint` refuses the lag outright and no later attempt can do better,
+    /// because the thing it starts from only ever gets further away. A reorg past that
+    /// point left the process up, on an orphaned branch, answering `-32003` until someone
+    /// restarted it: exactly the failure a month-long run is meant to survive.
+    ///
+    /// So the client keeps its own rollback points as it goes. Each candidate is *tried*
+    /// rather than reasoned about: the chain is truncated to the point, the retained
+    /// snapshot is restored, and the walk forward re-runs the same parent-link, cascading
+    /// and seal checks as any other sync. A point that was itself on the losing branch
+    /// fails that walk at its first header, and the next one back is tried. Nothing is
+    /// committed until a walk succeeds, so a failed recovery leaves the node exactly as it
+    /// was -- the same discipline as `append_new_with_snapshot`, and for the same reason.
+    fn recover_from_link_break(
+        &self,
+        chain: &mut Vec<VerifiedBlock>,
+        snapshot: &mut Option<Snapshot>,
+        tip: u64,
+        err: anyhow::Error,
+    ) -> Result<()> {
+        // `{err:#}` rather than `{err}`: the cause is what says *why* this is a reorg, and
+        // plain Display prints only the outermost context -- the same property that
+        // stopped `is_link_err` seeing it at all.
+        eprintln!("reorg/link break ({err:#})");
+        let points: Vec<Snapshot> = {
+            let rb = self.rollbacks.lock().expect("rollback lock");
+            rb.iter().rev().cloned().collect()
+        };
+        let head = chain.last().map(|b| b.number).unwrap_or(0);
+        let floor = chain.first().map(|b| b.number).unwrap_or(0);
+        let mut tried = 0usize;
+        for point in points {
+            // Below the chain's own window there is nothing to rewind to: `KEEP` has
+            // already dropped the blocks a truncation would have kept.
+            if point.number < floor || point.number > tip {
+                continue;
+            }
+            let mut candidate: Vec<VerifiedBlock> = chain
+                .iter()
+                .take_while(|b| b.number <= point.number)
+                .cloned()
+                .collect();
+            // A snapshot describes the state *after* its own block, so the prefix has to
+            // end exactly there, or the walk would check the next header against the
+            // wrong parent.
+            if candidate.last().map(|b| b.number) != Some(point.number) {
+                continue;
+            }
+            let mut restored = point.clone();
+            tried += 1;
+            match append_new_with_snapshot(
+                self.up.as_ref(),
+                &mut candidate,
+                tip,
+                Some(&mut restored),
+            ) {
+                Ok(()) => {
+                    eprintln!(
+                        "reorg recovered: rewound {} block(s) to {} and re-walked to {tip}",
+                        head.saturating_sub(point.number),
+                        point.number
+                    );
+                    *chain = candidate;
+                    *snapshot = Some(restored);
+                    // Every point above the fork describes the branch that lost. Keeping
+                    // them would offer a later recovery a starting state this client has
+                    // just established is not on the chain.
+                    let mut rb = self.rollbacks.lock().expect("rollback lock");
+                    while rb.back().is_some_and(|s| s.number > point.number) {
+                        rb.pop_back();
+                    }
+                    return Ok(());
+                }
+                // This point was on the losing branch as well: go further back.
+                Err(again) if is_link_err(&again) => continue,
+                // Not a fork. A transport or seal failure would meet every older point the
+                // same way, so stop here and leave the node untouched.
+                Err(other) => return Err(other),
+            }
+        }
+        let span = ROLLBACK_EVERY.saturating_mul(ROLLBACK_KEEP as u64);
+        let Some(cp) = self.origin.clone() else {
+            return Err(err.context(format!(
+                "reorg recovery: {tried} rollback point(s) tried and none was on the canonical chain, and this process booted without a --checkpoint to replay from"
+            )));
+        };
+        let cp_number = cp.number;
+        eprintln!("no usable rollback point ({tried} tried); replay from checkpoint {cp_number}");
+        let (c, s) =
+            walk_from_checkpoint(self.up.as_ref(), cp, tip, self.max_sync).map_err(|replay| {
+                // Reached only when the reorg is deeper than everything retained, which on
+                // this chain means something considerably worse than a reorg. The origin
+                // checkpoint does not move, so once uptime has carried the chain more than
+                // `max_sync` past it this replay cannot reach the tip and no later attempt
+                // will either: every sync from here fails identically while the process
+                // stays up. That is a restart, and the operator has to be told so rather
+                // than left reading the same line repeat.
+                let behind = tip.saturating_sub(cp_number);
+                anyhow::anyhow!("reorg recovery failed: {replay:#}. {tried} rollback point(s) covering up to {span} blocks were tried first and none was on the canonical chain. The fallback replays from the checkpoint this process booted from ({cp_number}), now {behind} blocks behind the tip; nothing recovers that in place. Write a fresh checkpoint and restart.")
+            })?;
+        *chain = c;
+        *snapshot = Some(s);
+        // The replay established a different chain; nothing retained describes it.
+        self.rollbacks.lock().expect("rollback lock").clear();
+        Ok(())
+    }
+
+    /// Block numbers of the retained rollback points, oldest first.
+    ///
+    /// `pub(crate)` for the reorg tests. How deep a reorg this client can absorb without a
+    /// restart is decided entirely by the retention arithmetic below, and a test that only
+    /// watched a recovery succeed would not notice that arithmetic quietly narrowing.
+    #[cfg(test)]
+    pub(crate) fn rollback_points(&self) -> Vec<u64> {
+        self.rollbacks
+            .lock()
+            .expect("rollback lock")
+            .iter()
+            .map(|s| s.number)
+            .collect()
+    }
+
+    /// Retain the current verified state as a rollback point, every [`ROLLBACK_EVERY`]
+    /// blocks.
+    ///
+    /// `chain_floor` is the oldest block the chain still holds. Points below it are
+    /// dropped rather than kept as dead weight: recovery truncates the live chain to a
+    /// point, and it cannot truncate to a block that has already been aged out.
+    fn record_rollback(&self, snapshot: &Snapshot, chain_floor: u64) {
+        let mut rb = self.rollbacks.lock().expect("rollback lock");
+        while rb.front().is_some_and(|s| s.number < chain_floor) {
+            rb.pop_front();
+        }
+        let due = match rb.back() {
+            Some(newest) => snapshot.number >= newest.number.saturating_add(ROLLBACK_EVERY),
+            None => true,
+        };
+        if !due {
+            return;
+        }
+        rb.push_back(snapshot.clone());
+        while rb.len() > ROLLBACK_KEEP {
+            rb.pop_front();
+        }
     }
 
     /// JSON-RPC 2.0 envelope: single object, batch array, or parse error.
@@ -1180,2040 +1452,6 @@ impl Node {
             Err(e) => rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
         }
     }
-
-    fn account_field(&self, id: Value, req: &Value, field: AccountField) -> Value {
-        let params = req.get("params").and_then(Value::as_array);
-        let Some(params) = params else {
-            return rpc_err(id, ERR_PARAMS, "invalid params");
-        };
-        let Some(addr) = params.first().and_then(Value::as_str) else {
-            return rpc_err(id, ERR_PARAMS, "address required");
-        };
-        if let Err(e) = require_rpc_address(addr) {
-            return rpc_err(id, ERR_PARAMS, &e);
-        }
-        let tag = match wallet_block_id_str(id.clone(), params.get(1)) {
-            Ok(t) => t,
-            Err(e) => return e,
-        };
-        let (tip, safe) = match self.refresh() {
-            Ok(v) => v,
-            Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
-        };
-        let local = match self.resolve_wallet_exec_block(id.clone(), tag, tip, &safe) {
-            Ok(b) => b,
-            Err(e) => return e,
-        };
-        match self.verified_account(id.clone(), addr, tip, &local) {
-            Ok(acc) => match field {
-                AccountField::Balance => rpc_ok(id, json!(encode_qty(&acc.balance_wei))),
-                AccountField::Nonce => rpc_ok(id, json!(format!("0x{:x}", acc.nonce))),
-            },
-            Err(e) => e,
-        }
-    }
-
-    fn get_code(&self, id: Value, req: &Value) -> Value {
-        let params = req.get("params").and_then(Value::as_array);
-        let Some(params) = params else {
-            return rpc_err(id, ERR_PARAMS, "invalid params");
-        };
-        let Some(addr) = params.first().and_then(Value::as_str) else {
-            return rpc_err(id, ERR_PARAMS, "address required");
-        };
-        if let Err(e) = require_rpc_address(addr) {
-            return rpc_err(id, ERR_PARAMS, &e);
-        }
-        let tag = match wallet_block_id_str(id.clone(), params.get(1)) {
-            Ok(t) => t,
-            Err(e) => return e,
-        };
-        let (tip, safe) = match self.refresh() {
-            Ok(v) => v,
-            Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
-        };
-        let local = match self.resolve_wallet_exec_block(id.clone(), tag, tip, &safe) {
-            Ok(b) => b,
-            Err(e) => return e,
-        };
-        let acc = match self.verified_account(id.clone(), addr, tip, &local) {
-            Ok(a) => a,
-            Err(e) => return e,
-        };
-        if acc.code_hash == EMPTY_CODE_HASH {
-            return rpc_ok(id, json!("0x"));
-        }
-        let hash = format!("0x{}", hex::encode(local.hash));
-        let number = format!("0x{:x}", local.number);
-        let code = match self
-            .up
-            .get_code(addr, &hash)
-            .or_else(|_| self.up.get_code(addr, &number))
-        {
-            Ok(c) => c,
-            Err(e) => {
-                return rpc_err(
-                    id,
-                    ERR_PROOF_FAILED,
-                    &format!("proof_verification_failed: {e}"),
-                )
-            }
-        };
-        if code.len() > MAX_CODE_SIZE {
-            return rpc_err(id, ERR_PROOF_FAILED, "bytecode exceeds MaxCodeSize");
-        }
-        match verify_account_code(&acc, &code) {
-            Ok(()) => rpc_ok(id, json!(format!("0x{}", hex::encode(code)))),
-            Err(e) => rpc_err(
-                id,
-                ERR_PROOF_FAILED,
-                &format!("proof_verification_failed: {e}"),
-            ),
-        }
-    }
-
-    fn prepare_verified_call(&self, id: Value, req: &Value) -> Result<(CallTx, CallBlock), Value> {
-        let tx = match parse_eth_call_tx(req) {
-            Ok(t) => t,
-            Err(e) => return Err(rpc_err(id, ERR_PARAMS, &e)),
-        };
-        let tag = wallet_block_id_str(
-            id.clone(),
-            req.get("params")
-                .and_then(Value::as_array)
-                .and_then(|p| p.get(1)),
-        )?;
-        let (tip, safe) = match self.refresh() {
-            Ok(v) => v,
-            Err(e) => return Err(rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}"))),
-        };
-        // One lock acquisition for both the executing header and its BLOCKHASH window.
-        let block = {
-            let chain = self.chain.lock().expect("chain lock");
-            let local = self.resolve_wallet_exec_block_in(id, tag, tip, &safe, &chain)?;
-            call_block_from_verified(&local, &chain)
-        };
-        Ok((tx, block))
-    }
-
-    fn eth_call(&self, id: Value, req: &Value) -> Value {
-        let (tx, block) = match self.prepare_verified_call(id.clone(), req) {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
-        let prover = UpstreamProve {
-            up: self.up.as_ref(),
-        };
-        match eth_call_verified(&prover, &block, &tx) {
-            Ok(out) => {
-                self.bump_proof_ok();
-                rpc_ok(id, json!(format!("0x{}", hex::encode(out))))
-            }
-            Err(e) => self.map_call_error(id, e),
-        }
-    }
-
-    fn eth_estimate_gas(&self, id: Value, req: &Value) -> Value {
-        let (tx, block) = match self.prepare_verified_call(id.clone(), req) {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
-        let prover = UpstreamProve {
-            up: self.up.as_ref(),
-        };
-        match eth_estimate_gas_verified(&prover, &block, &tx) {
-            Ok(gas) => {
-                self.bump_proof_ok();
-                rpc_ok(id, json!(format!("0x{gas:x}")))
-            }
-            Err(e) => self.map_call_error(id, e),
-        }
-    }
-
-    fn map_call_error(&self, id: Value, e: CallError) -> Value {
-        if matches!(
-            &e,
-            CallError::Missing(_) | CallError::Proof(_) | CallError::Budget
-        ) {
-            self.bump_proof_fail();
-        }
-        let (code, msg, data) = call_error_rpc(e);
-        match data {
-            Some(d) => rpc_err_data(id, code, &msg, json!(d)),
-            None => rpc_err(id, code, &msg),
-        }
-    }
-
-    fn get_eth_proof(&self, id: Value, req: &Value) -> Value {
-        let params = req.get("params").and_then(Value::as_array);
-        let Some(params) = params else {
-            return rpc_err(id, ERR_PARAMS, "invalid params");
-        };
-        let Some(addr) = params.first().and_then(Value::as_str) else {
-            return rpc_err(id, ERR_PARAMS, "address required");
-        };
-        if let Err(e) = require_rpc_address(addr) {
-            return rpc_err(id, ERR_PARAMS, &e);
-        }
-        let keys = match parse_storage_keys(params.get(1)) {
-            Ok(k) => k,
-            Err(e) => return rpc_err(id, ERR_PARAMS, &e),
-        };
-        let tag = match wallet_block_id_str(id.clone(), params.get(2)) {
-            Ok(t) => t,
-            Err(e) => return e,
-        };
-        let (tip, safe) = match self.refresh() {
-            Ok(v) => v,
-            Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
-        };
-        let local = match self.resolve_wallet_exec_block(id.clone(), tag, tip, &safe) {
-            Ok(b) => b,
-            Err(e) => return e,
-        };
-        let (acc, mut proof) = match self.verified_proof(id.clone(), addr, tip, &local, &keys) {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
-        proof.address = format!("0x{}", hex::encode(acc.address));
-        proof.nonce = format!("0x{:x}", acc.nonce);
-        proof.balance = encode_qty(&acc.balance_wei);
-        proof.code_hash = format!("0x{}", hex::encode(acc.code_hash));
-        proof.storage_hash = format!("0x{}", hex::encode(acc.storage_root));
-        for k in &keys {
-            let slot = match parse_slot(k) {
-                Ok(s) => s,
-                Err(e) => return rpc_err(id, ERR_PARAMS, &e),
-            };
-            if let Err(e) = verify_storage_slot(&acc, &slot, &proof) {
-                self.bump_proof_fail();
-                return rpc_err(
-                    id,
-                    ERR_PROOF_FAILED,
-                    &format!("proof_verification_failed: {e}"),
-                );
-            }
-        }
-        retain_requested_storage(&mut proof, &keys);
-        match serde_json::to_value(&proof) {
-            Ok(v) => rpc_ok(id, v),
-            Err(e) => rpc_err(
-                id,
-                ERR_PROOF_FAILED,
-                &format!("proof_verification_failed: {e}"),
-            ),
-        }
-    }
-
-    fn get_storage(&self, id: Value, req: &Value) -> Value {
-        let params = req.get("params").and_then(Value::as_array);
-        let Some(params) = params else {
-            return rpc_err(id, ERR_PARAMS, "invalid params");
-        };
-        let Some(addr) = params.first().and_then(Value::as_str) else {
-            return rpc_err(id, ERR_PARAMS, "address required");
-        };
-        if let Err(e) = require_rpc_address(addr) {
-            return rpc_err(id, ERR_PARAMS, &e);
-        }
-        let Some(slot_hex) = params.get(1).and_then(Value::as_str) else {
-            return rpc_err(id, ERR_PARAMS, "storage slot required");
-        };
-        let tag = match wallet_block_id_str(id.clone(), params.get(2)) {
-            Ok(t) => t,
-            Err(e) => return e,
-        };
-        let slot = match parse_slot(slot_hex) {
-            Ok(s) => s,
-            Err(e) => return rpc_err(id, ERR_PARAMS, &e),
-        };
-        let (tip, safe) = match self.refresh() {
-            Ok(v) => v,
-            Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
-        };
-        let local = match self.resolve_wallet_exec_block(id.clone(), tag, tip, &safe) {
-            Ok(b) => b,
-            Err(e) => return e,
-        };
-        let key = format!("0x{}", hex::encode(slot));
-        let (acc, proof) =
-            match self.verified_proof(id.clone(), addr, tip, &local, std::slice::from_ref(&key)) {
-                Ok(v) => v,
-                Err(e) => return e,
-            };
-        match verify_storage_slot(&acc, &slot, &proof) {
-            Ok(val) => rpc_ok(id, json!(encode_data32(&val))),
-            Err(e) => rpc_err(
-                id,
-                ERR_PROOF_FAILED,
-                &format!("proof_verification_failed: {e}"),
-            ),
-        }
-    }
-
-    fn get_block_by_number(&self, id: Value, req: &Value) -> Value {
-        let params = req.get("params").and_then(Value::as_array);
-        if let Some(first) = params.and_then(|p| p.first()) {
-            if !first.is_null() && !first.is_string() {
-                return rpc_err(id, ERR_PARAMS, "invalid params");
-            }
-        }
-        if wants_full_txs(params) {
-            return rpc_err(id, ERR_METHOD, "method_unsupported");
-        }
-        let tag =
-            params
-                .and_then(|p| p.first())
-                .and_then(|v| if v.is_null() { None } else { v.as_str() });
-        let (_, safe) = match self.refresh() {
-            Ok(v) => v,
-            Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
-        };
-        if wallet_block_number_allowed(tag, safe.number, &safe.hash).is_none() {
-            return rpc_err(
-                id,
-                ERR_NOT_SYNCED,
-                "wallet mode only serves Safe or below (latest→Safe)",
-            );
-        }
-        let local = {
-            let chain = self.chain.lock().expect("chain lock");
-            wallet_get_block_by_number(tag, safe.number, &safe.hash, &chain).cloned()
-        };
-        let Some(local) = local else {
-            return rpc_err(
-                id,
-                ERR_NOT_SYNCED,
-                "wallet mode only serves Safe or below (latest→Safe)",
-            );
-        };
-        self.verified_header_json(id, &local)
-    }
-
-    /// Parlia: uncles are forbidden (header `sha3Uncles` is the empty list hash).
-    fn uncle_count_by_number(&self, id: Value, req: &Value) -> Value {
-        match self.local_block_by_number(req) {
-            Ok(_) => rpc_ok(id, json!("0x0")),
-            Err(e) => e,
-        }
-    }
-
-    fn uncle_count_by_hash(&self, id: Value, req: &Value) -> Value {
-        match self.local_block_by_hash(req) {
-            Ok(_) => rpc_ok(id, json!("0x0")),
-            Err(e) => e,
-        }
-    }
-
-    fn uncle_by_number(&self, id: Value, req: &Value) -> Value {
-        match self.local_block_by_number(req) {
-            Ok(_) => rpc_ok(id, Value::Null),
-            Err(e) => e,
-        }
-    }
-
-    fn uncle_by_hash(&self, id: Value, req: &Value) -> Value {
-        match self.local_block_by_hash(req) {
-            Ok(_) => rpc_ok(id, Value::Null),
-            Err(e) => e,
-        }
-    }
-
-    fn local_block_by_number(&self, req: &Value) -> Result<VerifiedBlock, Value> {
-        let id = req.get("id").cloned().unwrap_or(Value::Null);
-        let params = req.get("params").and_then(Value::as_array);
-        if let Some(first) = params.and_then(|p| p.first()) {
-            if !first.is_null() && !first.is_string() {
-                return Err(rpc_err(id, ERR_PARAMS, "invalid params"));
-            }
-        }
-        let tag =
-            params
-                .and_then(|p| p.first())
-                .and_then(|v| if v.is_null() { None } else { v.as_str() });
-        let (_, safe) = match self.refresh() {
-            Ok(v) => v,
-            Err(e) => return Err(rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}"))),
-        };
-        if wallet_block_number_allowed(tag, safe.number, &safe.hash).is_none() {
-            return Err(rpc_err(
-                id,
-                ERR_NOT_SYNCED,
-                "wallet mode only serves Safe or below (latest→Safe)",
-            ));
-        }
-        let chain = self.chain.lock().expect("chain lock");
-        wallet_get_block_by_number(tag, safe.number, &safe.hash, &chain)
-            .cloned()
-            .ok_or_else(|| {
-                rpc_err(
-                    id,
-                    ERR_NOT_SYNCED,
-                    "wallet mode only serves Safe or below (latest→Safe)",
-                )
-            })
-    }
-
-    fn local_block_by_hash(&self, req: &Value) -> Result<VerifiedBlock, Value> {
-        let id = req.get("id").cloned().unwrap_or(Value::Null);
-        let params = req.get("params").and_then(Value::as_array);
-        let Some(params) = params else {
-            return Err(rpc_err(id, ERR_PARAMS, "invalid params"));
-        };
-        let Some(hash) = params.first().and_then(Value::as_str) else {
-            return Err(rpc_err(id, ERR_PARAMS, "block hash required"));
-        };
-        if decode_hex_fixed::<32>(hash).is_err() {
-            return Err(rpc_err(id, ERR_PARAMS, "bad block hash"));
-        }
-        let (_, safe) = match self.refresh() {
-            Ok(v) => v,
-            Err(e) => return Err(rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}"))),
-        };
-        let chain = self.chain.lock().expect("chain lock");
-        wallet_get_block_by_hash(hash, safe.number, &chain)
-            .cloned()
-            .ok_or_else(|| {
-                rpc_err(
-                    id,
-                    ERR_NOT_SYNCED,
-                    "wallet mode only serves verified hashes at or below Safe",
-                )
-            })
-    }
-
-    fn get_block_by_hash(&self, id: Value, req: &Value) -> Value {
-        let params = req.get("params").and_then(Value::as_array);
-        let Some(params) = params else {
-            return rpc_err(id, ERR_PARAMS, "invalid params");
-        };
-        let Some(hash) = params.first().and_then(Value::as_str) else {
-            return rpc_err(id, ERR_PARAMS, "block hash required");
-        };
-        if wants_full_txs(Some(params)) {
-            return rpc_err(id, ERR_METHOD, "method_unsupported");
-        }
-        if decode_hex_fixed::<32>(hash).is_err() {
-            return rpc_err(id, ERR_PARAMS, "bad block hash");
-        }
-        let (_, safe) = match self.refresh() {
-            Ok(v) => v,
-            Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
-        };
-        let local = {
-            let chain = self.chain.lock().expect("chain lock");
-            wallet_get_block_by_hash(hash, safe.number, &chain).cloned()
-        };
-        let Some(local) = local else {
-            return rpc_err(
-                id,
-                ERR_NOT_SYNCED,
-                "wallet mode only serves verified hashes at or below Safe",
-            );
-        };
-        self.verified_header_json(id, &local)
-    }
-
-    fn verified_header_json(&self, id: Value, local: &VerifiedBlock) -> Value {
-        match self.bound_block_txs(local) {
-            Ok(bound) => rpc_ok(id, rpc_block_json(&bound.header, bound.txs.hashes())),
-            Err((code, msg)) => rpc_err(id, code, &msg),
-        }
-    }
-
-    fn load_verified_header(&self, local: &VerifiedBlock) -> Result<RpcBlockHeader, (i64, String)> {
-        let hdr = if let Some(h) = local.header.clone() {
-            h
-        } else {
-            let hash = format!("0x{}", hex::encode(local.hash));
-            self.up
-                .header_by_hash(&hash)
-                .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))?
-        };
-        header_matches_local(&hdr, local)?;
-        let mut hdr = hdr;
-        hdr.hash = format!("0x{}", hex::encode(local.hash));
-        Ok(hdr)
-    }
-
-    /// Bind untrusted raw txs to the sealed `transactionsRoot`. Empty root → no fetch.
-    fn bind_tx_hashes(&self, hdr: &RpcBlockHeader) -> Result<TxBind, (i64, String)> {
-        let root = decode_hex_fixed::<32>(&hdr.transactions_root).map_err(|e| {
-            (
-                ERR_PROOF_FAILED,
-                format!("proof_verification_failed: transactionsRoot: {e}"),
-            )
-        })?;
-        if root == EMPTY_TRIE_ROOT {
-            return Ok(TxBind::Empty);
-        }
-        let raws = self
-            .up
-            .block_raw_transactions(&hdr.hash)
-            .map_err(|e| (ERR_UPSTREAM, format!("unverified_upstream: {e}")))?;
-        // No envelopes: omit hashes (do not invent, do not fail the header read).
-        // Distinct from `Empty` — see [`TxBind`].
-        if raws.is_empty() {
-            return Ok(TxBind::Omitted);
-        }
-        let hashes = verify_tx_list(&raws, &root)
-            .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))?;
-        Ok(TxBind::List(hashes))
-    }
-
-    /// Verified tx hashes **and** the envelopes they were derived from.
-    ///
-    /// `bind_tx_hashes` drops the raw bytes once the root matches, which is all
-    /// `eth_getBlock*` needs. A receipt's `to` is a field of the envelope, so the receipt
-    /// path keeps them: once the list is bound to `transactionsRoot`, reading a field out
-    /// of it is reading verified data.
-    fn bind_tx_envelopes(
-        &self,
-        hdr: &RpcBlockHeader,
-    ) -> Result<Option<Vec<Vec<u8>>>, (i64, String)> {
-        let root = decode_hex_fixed::<32>(&hdr.transactions_root).map_err(|e| {
-            (
-                ERR_PROOF_FAILED,
-                format!("proof_verification_failed: transactionsRoot: {e}"),
-            )
-        })?;
-        if root == EMPTY_TRIE_ROOT {
-            return Ok(None);
-        }
-        let raws = self
-            .up
-            .block_raw_transactions(&hdr.hash)
-            .map_err(|e| (ERR_UPSTREAM, format!("unverified_upstream: {e}")))?;
-        if raws.is_empty() {
-            return Ok(None);
-        }
-        verify_tx_list(&raws, &root)
-            .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))?;
-        Ok(Some(raws))
-    }
-
-    fn bound_block_txs(&self, local: &VerifiedBlock) -> Result<BoundTxs, (i64, String)> {
-        let header = self.load_verified_header(local)?;
-        let txs = self.bind_tx_hashes(&header)?;
-        Ok(BoundTxs { header, txs })
-    }
-
-    /// Bind untrusted receipt JSON to sealed `receiptsRoot`. Empty root → no fetch.
-    /// Empty fetch + non-empty root → omitted (cannot prove; do not invent).
-    fn bind_receipts(&self, hdr: &RpcBlockHeader) -> Result<ReceiptBind, (i64, String)> {
-        let root = decode_hex_fixed::<32>(&hdr.receipts_root).map_err(|e| {
-            (
-                ERR_PROOF_FAILED,
-                format!("proof_verification_failed: receiptsRoot: {e}"),
-            )
-        })?;
-        if root == EMPTY_TRIE_ROOT {
-            return Ok(ReceiptBind::Empty);
-        }
-        // A provider that cannot serve receipts at all is a capability gap in the data
-        // plane, not a lie about them. `-32001` claims verification failed and sends an
-        // operator hunting a mismatch that never happened; `-32000` is the documented
-        // transport code and names the provider. The read still fails either way.
-        let jsons = self
-            .up
-            .block_receipts_json(&hdr.hash)
-            .map_err(|e| (ERR_UPSTREAM, format!("unverified_upstream: {e}")))?;
-        if jsons.is_empty() {
-            return Ok(ReceiptBind::Omitted);
-        }
-        if jsons.len() > MAX_ORDERED_TRIE_ITEMS {
-            return Err((
-                ERR_PROOF_FAILED,
-                "proof_verification_failed: too many receipts".into(),
-            ));
-        }
-        let mut raws = Vec::with_capacity(jsons.len());
-        let mut items = Vec::with_capacity(jsons.len());
-        // Block-wide log index, the same counter `eth_getLogs` uses, so the two methods
-        // cannot disagree about `logIndex` for the same block.
-        let mut log_index: u64 = 0;
-        // Running total the derived `gasUsed` is taken against. Both counters are folded
-        // over the same ordered list the trie is built from, so neither can drift from it.
-        let mut prev_cumulative: u64 = 0;
-        for (i, v) in jsons.iter().enumerate() {
-            let parsed = parse_consensus_receipt_json(v).map_err(|e| {
-                (
-                    ERR_PROOF_FAILED,
-                    format!("proof_verification_failed: receipt {i}: {e}"),
-                )
-            })?;
-            let raw = encode_consensus_receipt(&parsed.consensus).map_err(|e| {
-                (
-                    ERR_PROOF_FAILED,
-                    format!("proof_verification_failed: receipt {i}: {e}"),
-                )
-            })?;
-            raws.push(raw);
-            // Saturating because verification of the whole list happens below: a
-            // non-monotonic cumulative sequence cannot survive `verify_receipt_list`, so
-            // the clamped value can never reach a caller.
-            let gas_used = parsed
-                .consensus
-                .cumulative_gas_used
-                .saturating_sub(prev_cumulative);
-            prev_cumulative = parsed.consensus.cumulative_gas_used;
-            let json = decorate_receipt_json(
-                v.clone(),
-                hdr,
-                i,
-                parsed.tx_hash,
-                &parsed.consensus.logs,
-                log_index,
-                gas_used,
-            );
-            log_index = log_index.saturating_add(parsed.consensus.logs.len() as u64);
-            items.push(BoundReceipt {
-                json,
-                tx_hash: parsed.tx_hash,
-                logs: parsed.consensus.logs,
-            });
-        }
-        verify_receipt_list(&raws, &root)
-            .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))?;
-        // `receiptsRoot` proves *what* each receipt says, never *which transaction it
-        // belongs to*. An upstream could serve receipt 5's consensus fields — which verify
-        // — while labelling them with transaction 2's hash, and a wallet would read a
-        // correctly-verified receipt for the wrong transaction. The position in this list
-        // is the transaction index, so binding the block's hashes to `transactionsRoot`
-        // and comparing by index closes that.
-        //
-        // `TxBind::Omitted` means the upstream declined the envelopes: the pairing is
-        // unprovable rather than wrong. Leave the label alone there instead of failing an
-        // otherwise verified read — `docs/rpc-matrix.md` records that this is conditional.
-        if let Some(envelopes) = self.bind_tx_envelopes(hdr)? {
-            // Sealed header field, so it is consensus-verified. Parlia's is the constant
-            // zero; reading it keeps the arithmetic right if that ever changes.
-            let base_fee = hdr
-                .base_fee_per_gas
-                .as_deref()
-                .and_then(|h| u128::from_str_radix(h.trim_start_matches("0x"), 16).ok())
-                .unwrap_or(0);
-            for (i, item) in items.iter_mut().enumerate() {
-                let Some(envelope) = envelopes.get(i) else {
-                    return Err((
-                        ERR_PROOF_FAILED,
-                        "proof_verification_failed: more receipts than bound transactions".into(),
-                    ));
-                };
-                if let Some(claimed) = item.tx_hash {
-                    if keccak256(envelope) != claimed {
-                        return Err((
-                            ERR_PROOF_FAILED,
-                            format!(
-                                "proof_verification_failed: receipt {i}: transactionHash does not match transactionsRoot"
-                            ),
-                        ));
-                    }
-                }
-                // `to` is a field of an envelope now bound to the sealed root, so it can
-                // be read rather than believed. A decode failure cannot come from a lying
-                // upstream here — the list already hashed into `transactionsRoot` — so it
-                // would be a bug in this client: leave the echoed value rather than
-                // inventing a recipient.
-                if let Ok(to) = tx_to_address(envelope) {
-                    let Value::Object(map) = &mut item.json else {
-                        continue;
-                    };
-                    map.insert(
-                        "to".into(),
-                        match to {
-                            Some(a) => json!(format!("0x{}", hex::encode(a))),
-                            None => Value::Null,
-                        },
-                    );
-                    // The sender is not a field of the envelope: it is recovered from the
-                    // signature over it. Because the envelope is bound to the sealed root,
-                    // the recovered address is as verified as the bytes it comes from.
-                    // `effectiveGasPrice` is what the sender actually paid per unit of
-                    // gas: the envelope's own price for a legacy tx, and EIP-1559's
-                    // `base + min(tip, cap - base)` otherwise. The base fee comes from the
-                    // sealed header, so no arm of this is taken on an upstream's word.
-                    if let Ok(price) = tx_gas_price(envelope) {
-                        map.insert(
-                            "effectiveGasPrice".into(),
-                            json!(format!("0x{:x}", price.effective(base_fee))),
-                        );
-                    }
-                    if let Some(from) = tx_signing_hash(envelope)
-                        .ok()
-                        .and_then(|(digest, sig)| ecrecover(&digest, &sig).ok())
-                    {
-                        map.insert("from".into(), json!(format!("0x{}", hex::encode(from))));
-                        // A call has no contract address; a creation's is fixed by
-                        // consensus as keccak(rlp([sender, nonce]))[12..].
-                        match to {
-                            Some(_) => {
-                                map.insert("contractAddress".into(), Value::Null);
-                            }
-                            None => {
-                                if let Ok(nonce) = tx_nonce(envelope) {
-                                    let addr = contract_address(&from, nonce);
-                                    map.insert(
-                                        "contractAddress".into(),
-                                        json!(format!("0x{}", hex::encode(addr))),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(ReceiptBind::List(items))
-    }
-
-    fn bound_block_receipts(
-        &self,
-        local: &VerifiedBlock,
-    ) -> Result<(RpcBlockHeader, ReceiptBind), (i64, String)> {
-        let header = self.load_verified_header(local)?;
-        let bind = self.bind_receipts(&header)?;
-        Ok((header, bind))
-    }
-
-    fn get_block_receipts(&self, id: Value, req: &Value) -> Value {
-        let local = match self.local_block_by_number_or_hash(req) {
-            Ok(b) => b,
-            Err(e) => return e,
-        };
-        match self.bound_block_receipts(&local) {
-            Ok((_, ReceiptBind::List(list))) => {
-                rpc_ok(id, Value::Array(list.into_iter().map(|r| r.json).collect()))
-            }
-            Ok((_, ReceiptBind::Empty | ReceiptBind::Omitted)) => rpc_ok(id, json!([])),
-            Err((code, msg)) => rpc_err(id, code, &msg),
-        }
-    }
-
-    fn get_transaction_receipt(&self, id: Value, req: &Value) -> Value {
-        let want = match query_tx_hash(req) {
-            Ok(h) => h,
-            Err(e) => return rpc_err(id, ERR_PARAMS, &e),
-        };
-        let params = req.get("params").cloned().unwrap_or(json!([]));
-        let raw = match self
-            .up
-            .unverified_call("eth_getTransactionReceipt", &params)
-        {
-            Ok(v) => v,
-            Err(e) => return rpc_err(id, -32000, &format!("unverified_upstream: {e}")),
-        };
-        if raw.is_null() {
-            return rpc_ok(id, Value::Null);
-        }
-        let (hash_empty, num_empty, block_hash) = {
-            let Some(map) = raw.as_object() else {
-                return rpc_err(id, ERR_PROOF_FAILED, "receipt is not an object");
-            };
-            let hash_v = map.get("blockHash");
-            let num_v = map.get("blockNumber");
-            (
-                is_empty_block_hash(hash_v),
-                is_nullish_json(num_v),
-                hash_v.and_then(Value::as_str).map(str::to_string),
-            )
-        };
-        if hash_empty && num_empty {
-            return self.passthrough_mined(id, raw, Some(&want));
-        }
-        if hash_empty != num_empty {
-            return rpc_err(id, ERR_NOT_SYNCED, "receipt/tx pending fields inconsistent");
-        }
-        let hash = match block_hash {
-            Some(s) => s,
-            None => return rpc_err(id, ERR_NOT_SYNCED, "receipt/tx blockHash not a string"),
-        };
-        let (_, safe) = match self.refresh() {
-            Ok(v) => v,
-            Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
-        };
-        let local = {
-            let chain = self.chain.lock().expect("chain lock");
-            chain
-                .iter()
-                .find(|b| {
-                    let h = format!("0x{}", hex::encode(b.hash));
-                    hex_eq_loose(&h, &hash)
-                })
-                .cloned()
-        };
-        let Some(local) = local else {
-            return rpc_err(
-                id,
-                ERR_NOT_SYNCED,
-                "receipt/tx blockHash not in local verified chain",
-            );
-        };
-        if local.number > safe.number {
-            return rpc_err(id, ERR_NOT_SYNCED, "receipt/tx is above local Safe");
-        }
-        match self.bound_block_receipts(&local) {
-            Ok((_, ReceiptBind::List(list))) => {
-                match list.into_iter().find(|r| r.tx_hash.as_ref() == Some(&want)) {
-                    Some(r) => rpc_ok(id, r.json),
-                    None => rpc_ok(id, Value::Null),
-                }
-            }
-            Ok((_, ReceiptBind::Empty)) => rpc_ok(id, Value::Null),
-            Ok((_, ReceiptBind::Omitted)) => self.passthrough_mined(id, raw, Some(&want)),
-            Err((code, msg)) => rpc_err(id, code, &msg),
-        }
-    }
-
-    fn passthrough_mined(&self, id: Value, raw: Value, want: Option<&[u8; 32]>) -> Value {
-        if !self.allow_unverified_passthrough {
-            return rpc_err(id, ERR_METHOD, "unverified_passthrough_disabled");
-        }
-        let (_, safe) = match self.refresh() {
-            Ok(v) => v,
-            Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
-        };
-        let chain = self.chain.lock().expect("chain lock");
-        match bind_mined_object(&raw, &safe, &chain, want) {
-            Ok(()) => rpc_ok(id, raw),
-            Err(msg) => rpc_err(id, ERR_NOT_SYNCED, &msg),
-        }
-    }
-
-    fn get_logs(&self, id: Value, req: &Value) -> Value {
-        let filter = match req.get("params").and_then(Value::as_array) {
-            None => None,
-            Some(p) if p.is_empty() => None,
-            Some(p) => match p.first() {
-                Some(Value::Object(m)) => Some(m),
-                Some(Value::Null) => None,
-                _ => return rpc_err(id, ERR_PARAMS, "eth_getLogs filter must be an object"),
-            },
-        };
-        let blocks = match self.resolve_get_logs_blocks(id.clone(), filter) {
-            Ok(b) => b,
-            Err(e) => return e,
-        };
-        let addresses = match parse_log_addresses(filter) {
-            Ok(a) => a,
-            Err(e) => return rpc_err(id, ERR_PARAMS, &e),
-        };
-        let topics = match parse_log_topics(filter) {
-            Ok(t) => t,
-            Err(e) => return rpc_err(id, ERR_PARAMS, &e),
-        };
-        match self.collect_logs(&blocks, &addresses, &topics) {
-            Ok(out) => rpc_ok(id, Value::Array(out)),
-            Err((code, msg)) => rpc_err(id, code, &msg),
-        }
-    }
-
-    /// `eth_newFilter`: validate now, poll later.
-    ///
-    /// The filter object is validated at creation, so a malformed `address` or `topics`
-    /// is an error the caller sees immediately rather than on a poll minutes later. It is
-    /// then stored verbatim and replayed through the same path `eth_getLogs` uses, with
-    /// only the block bounds substituted, so the two cannot drift apart.
-    fn new_filter(&self, id: Value, req: &Value) -> Value {
-        let filter = match req
-            .get("params")
-            .and_then(Value::as_array)
-            .and_then(|p| p.first())
-        {
-            Some(Value::Object(m)) => m.clone(),
-            None | Some(Value::Null) => serde_json::Map::new(),
-            _ => return rpc_err(id, ERR_PARAMS, "eth_newFilter filter must be an object"),
-        };
-        if !is_nullish_json(filter.get("blockHash")) {
-            return rpc_err(
-                id,
-                ERR_PARAMS,
-                "eth_newFilter does not take blockHash: a filter follows a range, so use eth_getLogs for a single block",
-            );
-        }
-        if let Err(e) = parse_log_addresses(Some(&filter)) {
-            return rpc_err(id, ERR_PARAMS, &e);
-        }
-        if let Err(e) = parse_log_topics(Some(&filter)) {
-            return rpc_err(id, ERR_PARAMS, &e);
-        }
-        let (_, safe) = match self.refresh() {
-            Ok(v) => v,
-            Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
-        };
-        let from_s = match wallet_block_tag_str(filter.get("fromBlock")) {
-            Ok(v) => v,
-            Err(e) => return rpc_err(id, ERR_PARAMS, e),
-        };
-        let to_s = match wallet_block_tag_str(filter.get("toBlock")) {
-            Ok(v) => v,
-            Err(e) => return rpc_err(id, ERR_PARAMS, e),
-        };
-        let Some(cursor) = log_filter_block_number(from_s, safe.number, &safe.hash) else {
-            return rpc_err(id, ERR_NOT_SYNCED, WALLET_TAG_ONLY);
-        };
-        // An explicit height closes the filter there; a tag leaves it following the head,
-        // which is what a wallet polling for new events wants.
-        let to_block = match to_s {
-            Some(t) if t.starts_with("0x") || t.starts_with("0X") => {
-                match log_filter_block_number(to_s, safe.number, &safe.hash) {
-                    Some(n) => Some(n),
-                    None => return rpc_err(id, ERR_NOT_SYNCED, WALLET_TAG_ONLY),
-                }
-            }
-            _ => None,
-        };
-        let mut store = self.filters.lock().expect("filter lock");
-        match store.insert(FilterKind::Logs {
-            filter,
-            from_block: cursor,
-            to_block,
-            cursor,
-        }) {
-            Ok(n) => rpc_ok(id, json!(format!("0x{n:x}"))),
-            Err(e) => rpc_err(id, ERR_PARAMS, &e),
-        }
-    }
-
-    /// `eth_newBlockFilter`: hashes of blocks this client verifies from now on.
-    fn new_block_filter(&self, id: Value) -> Value {
-        let (_, safe) = match self.refresh() {
-            Ok(v) => v,
-            Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
-        };
-        let mut store = self.filters.lock().expect("filter lock");
-        // Start after the current head: a new filter reports what happens next, not a
-        // backlog the caller never asked for.
-        match store.insert(FilterKind::Blocks {
-            cursor: safe.number.saturating_add(1),
-        }) {
-            Ok(n) => rpc_ok(id, json!(format!("0x{n:x}"))),
-            Err(e) => rpc_err(id, ERR_PARAMS, &e),
-        }
-    }
-
-    fn uninstall_filter(&self, id: Value, req: &Value) -> Value {
-        let Some(fid) = parse_filter_id(req) else {
-            return rpc_err(id, ERR_PARAMS, FILTER_ID_HEX);
-        };
-        let mut store = self.filters.lock().expect("filter lock");
-        store.sweep();
-        rpc_ok(id, json!(store.map.remove(&fid).is_some()))
-    }
-
-    /// `eth_getFilterChanges`: what happened since the last poll, then advance.
-    ///
-    /// The cursor moves only over blocks this call actually read, so a poll that stops at
-    /// the span cap resumes exactly where it left off: a caller behind a busy chain
-    /// catches up over several calls instead of losing the gap.
-    fn get_filter_changes(&self, id: Value, req: &Value) -> Value {
-        let Some(fid) = parse_filter_id(req) else {
-            return rpc_err(id, ERR_PARAMS, FILTER_ID_HEX);
-        };
-        let (_, safe) = match self.refresh() {
-            Ok(v) => v,
-            Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
-        };
-        let head = safe.number;
-        let snapshot = {
-            let mut store = self.filters.lock().expect("filter lock");
-            store.sweep();
-            let Some(f) = store.map.get_mut(&fid) else {
-                return rpc_err(id, ERR_PARAMS, FILTER_NOT_FOUND);
-            };
-            f.touched = Instant::now();
-            match &f.kind {
-                FilterKind::Blocks { cursor } => Err(*cursor),
-                FilterKind::Logs {
-                    filter,
-                    to_block,
-                    cursor,
-                    ..
-                } => Ok((filter.clone(), *to_block, *cursor)),
-            }
-        };
-
-        let (filter, to_block, cursor) = match snapshot {
-            Err(from) => {
-                if from > head {
-                    return rpc_ok(id, json!([]));
-                }
-                let to = head.min(from.saturating_add(MAX_GET_LOGS_RANGE - 1));
-                let mut hashes: Vec<(u64, String)> = {
-                    let chain = self.chain.lock().expect("chain lock");
-                    chain
-                        .iter()
-                        .filter(|b| b.number >= from && b.number <= to)
-                        .map(|b| (b.number, format!("0x{}", hex::encode(b.hash))))
-                        .collect()
-                };
-                hashes.sort_by_key(|(n, _)| *n);
-                let mut store = self.filters.lock().expect("filter lock");
-                if let Some(f) = store.map.get_mut(&fid) {
-                    if let FilterKind::Blocks { cursor } = &mut f.kind {
-                        *cursor = to.saturating_add(1);
-                    }
-                }
-                return rpc_ok(
-                    id,
-                    Value::Array(hashes.into_iter().map(|(_, h)| json!(h)).collect()),
-                );
-            }
-            Ok(v) => v,
-        };
-
-        let end = to_block.unwrap_or(head).min(head);
-        if cursor > end {
-            return rpc_ok(id, json!([]));
-        }
-        let end = end.min(cursor.saturating_add(MAX_GET_LOGS_RANGE - 1));
-        let logs = match self.logs_for_span(&filter, cursor, end) {
-            Ok(v) => v,
-            Err((code, msg)) => return rpc_err(id, code, &msg),
-        };
-        let mut store = self.filters.lock().expect("filter lock");
-        if let Some(f) = store.map.get_mut(&fid) {
-            if let FilterKind::Logs { cursor: c, .. } = &mut f.kind {
-                *c = end.saturating_add(1);
-            }
-        }
-        rpc_ok(id, Value::Array(logs))
-    }
-
-    /// `eth_getFilterLogs`: everything the filter matches, cursor untouched.
-    fn get_filter_logs(&self, id: Value, req: &Value) -> Value {
-        let Some(fid) = parse_filter_id(req) else {
-            return rpc_err(id, ERR_PARAMS, FILTER_ID_HEX);
-        };
-        let (_, safe) = match self.refresh() {
-            Ok(v) => v,
-            Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
-        };
-        let (filter, to_block, from) = {
-            let mut store = self.filters.lock().expect("filter lock");
-            store.sweep();
-            let Some(f) = store.map.get_mut(&fid) else {
-                return rpc_err(id, ERR_PARAMS, FILTER_NOT_FOUND);
-            };
-            f.touched = Instant::now();
-            match &f.kind {
-                FilterKind::Logs {
-                    filter,
-                    from_block,
-                    to_block,
-                    ..
-                } => (filter.clone(), *to_block, *from_block),
-                FilterKind::Blocks { .. } => {
-                    return rpc_err(id, ERR_PARAMS, "eth_getFilterLogs needs a log filter")
-                }
-            }
-        };
-        let end = to_block.unwrap_or(safe.number).min(safe.number);
-        if from > end {
-            return rpc_ok(id, json!([]));
-        }
-        match self.logs_for_span(&filter, from, end) {
-            Ok(v) => rpc_ok(id, Value::Array(v)),
-            Err((code, msg)) => rpc_err(id, code, &msg),
-        }
-    }
-
-    /// Run a stored filter over an explicit block span, through the `eth_getLogs` path.
-    fn logs_for_span(
-        &self,
-        filter: &serde_json::Map<String, Value>,
-        from: u64,
-        to: u64,
-    ) -> Result<Vec<Value>, (i64, String)> {
-        let span = to.saturating_sub(from).saturating_add(1);
-        if span > MAX_GET_LOGS_RANGE {
-            return Err((
-                ERR_PARAMS,
-                format!(
-                    "filter span is {span} blocks; this client keeps no log index and serves at most {MAX_GET_LOGS_RANGE}"
-                ),
-            ));
-        }
-        let mut f = filter.clone();
-        f.insert("fromBlock".into(), json!(format!("0x{from:x}")));
-        f.insert("toBlock".into(), json!(format!("0x{to:x}")));
-        let addresses = parse_log_addresses(Some(&f)).map_err(|e| (ERR_PARAMS, e))?;
-        let topics = parse_log_topics(Some(&f)).map_err(|e| (ERR_PARAMS, e))?;
-        let blocks = self
-            .resolve_get_logs_blocks(Value::Null, Some(&f))
-            .map_err(|v| {
-                let code = v["error"]["code"].as_i64().unwrap_or(ERR_PARAMS);
-                let msg = v["error"]["message"]
-                    .as_str()
-                    .unwrap_or("filter span unavailable")
-                    .to_string();
-                (code, msg)
-            })?;
-        self.collect_logs(&blocks, &addresses, &topics)
-    }
-
-    /// Matching logs over an ascending run of locally verified blocks.
-    ///
-    /// Shared by `eth_getLogs` and the filter methods so the two can never disagree about
-    /// what a filter matches, how `logIndex` is numbered, or when a block is refusable.
-    fn collect_logs(
-        &self,
-        blocks: &[VerifiedBlock],
-        addresses: &[[u8; 20]],
-        topics: &[Option<Vec<[u8; 32]>>],
-    ) -> Result<Vec<Value>, (i64, String)> {
-        let mut out = Vec::new();
-        for group in blocks.chunks(LOG_FETCH_PARALLEL) {
-            // Each block is an independent upstream round trip, so a span is latency-bound
-            // rather than CPU-bound: 128 blocks served one at a time is over two minutes.
-            // Fetching a few at once is the difference between a usable range query and a
-            // timeout. Results are consumed in block order regardless of completion order.
-            let fetched: Vec<Result<(RpcBlockHeader, ReceiptBind), (i64, String)>> =
-                std::thread::scope(|scope| {
-                    let handles: Vec<_> = group
-                        .iter()
-                        .map(|b| scope.spawn(move || self.bound_block_receipts(b)))
-                        .collect();
-                    handles
-                        .into_iter()
-                        .map(|h| {
-                            h.join().unwrap_or_else(|_| {
-                                Err((
-                                    ERR_INTERNAL,
-                                    "internal_error: receipt fetch thread panicked".to_string(),
-                                ))
-                            })
-                        })
-                        .collect()
-                });
-            for (local, res) in group.iter().zip(fetched) {
-                let (header, bind) = res?;
-                let receipts = match bind {
-                ReceiptBind::List(list) => list,
-                // Proven to have no transactions: it contributes no logs.
-                ReceiptBind::Empty => continue,
-                // The upstream declined the receipts, so this block's logs are unknown.
-                // Answering without them would report "no matching logs here" for a block
-                // nobody checked — a wrong answer rather than a partial one.
-                ReceiptBind::Omitted => {
-                    return Err((
-                        ERR_PROOF_FAILED,
-                        format!(
-                            "proof_verification_failed: upstream served no receipts for block {}, so its logs cannot be proven absent",
-                            local.number
-                        ),
-                    ))
-                }
-            };
-                // Block-wide index, restarting per block exactly as geth reports it.
-                let mut log_index: u64 = 0;
-                for (tx_i, rec) in receipts.iter().enumerate() {
-                    for log in &rec.logs {
-                        if log_matches(log, addresses, topics) {
-                            // Truncating here would hand back a list that looks complete
-                            // and is not: a caller reading 1024 transfers has no way to
-                            // learn a 1025th matched. Everywhere else this client answers
-                            // "I cannot prove that" rather than a plausible number, and a
-                            // silently short log list is the same defect wearing a
-                            // result's clothes. geth refuses the same way.
-                            if out.len() >= MAX_GET_LOGS {
-                                return Err((
-                                    ERR_PARAMS,
-                                    format!(
-                                        "query matched more than {MAX_GET_LOGS} logs; narrow the block range or the address/topic filter"
-                                    ),
-                                ));
-                            }
-                            out.push(rpc_log_json(
-                                log,
-                                &header,
-                                rec.tx_hash,
-                                tx_i as u64,
-                                log_index,
-                            ));
-                        }
-                        log_index = log_index.saturating_add(1);
-                    }
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    /// Blocks an `eth_getLogs` filter selects, ascending, all locally verified.
-    fn resolve_get_logs_blocks(
-        &self,
-        id: Value,
-        filter: Option<&serde_json::Map<String, Value>>,
-    ) -> Result<Vec<VerifiedBlock>, Value> {
-        let block_hash = filter.and_then(|m| m.get("blockHash"));
-        let from_v = filter.and_then(|m| m.get("fromBlock"));
-        let to_v = filter.and_then(|m| m.get("toBlock"));
-        let has_range = !is_nullish_json(from_v) || !is_nullish_json(to_v);
-        if !is_nullish_json(block_hash) {
-            if has_range {
-                return Err(rpc_err(
-                    id,
-                    ERR_PARAMS,
-                    "cannot specify both blockHash and fromBlock/toBlock",
-                ));
-            }
-            let hash = block_hash
-                .and_then(Value::as_str)
-                .ok_or_else(|| rpc_err(id.clone(), ERR_PARAMS, "blockHash must be a string"))?;
-            if decode_hex_fixed::<32>(hash).is_err() {
-                return Err(rpc_err(id, ERR_PARAMS, "blockHash is not 32 bytes"));
-            }
-            let (_, safe) = match self.refresh() {
-                Ok(v) => v,
-                Err(e) => return Err(rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}"))),
-            };
-            let chain = self.chain.lock().expect("chain lock");
-            return wallet_get_block_by_hash(hash, safe.number, &chain)
-                .cloned()
-                .map(|b| vec![b])
-                .ok_or_else(|| {
-                    rpc_err(
-                        id,
-                        ERR_NOT_SYNCED,
-                        "wallet mode only serves verified hashes at or below Safe",
-                    )
-                });
-        }
-        let from_s =
-            wallet_block_tag_str(from_v).map_err(|e| rpc_err(id.clone(), ERR_PARAMS, e))?;
-        let to_s = wallet_block_tag_str(to_v).map_err(|e| rpc_err(id.clone(), ERR_PARAMS, e))?;
-        let (_, safe) = match self.refresh() {
-            Ok(v) => v,
-            Err(e) => return Err(rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}"))),
-        };
-        let from_n = log_filter_block_number(from_s, safe.number, &safe.hash).ok_or_else(|| {
-            rpc_err(
-                id.clone(),
-                ERR_NOT_SYNCED,
-                "wallet mode only serves Safe or below (latest→Safe)",
-            )
-        })?;
-        let to_n = log_filter_block_number(to_s, safe.number, &safe.hash).ok_or_else(|| {
-            rpc_err(
-                id.clone(),
-                ERR_NOT_SYNCED,
-                "wallet mode only serves Safe or below (latest→Safe)",
-            )
-        })?;
-        if to_n < from_n {
-            return Err(rpc_err(
-                id,
-                ERR_PARAMS,
-                "eth_getLogs fromBlock is above toBlock",
-            ));
-        }
-        let span = to_n - from_n + 1;
-        if span > MAX_GET_LOGS_RANGE {
-            return Err(rpc_err(
-                id,
-                ERR_PARAMS,
-                &format!(
-                    "eth_getLogs range is {span} blocks; this client keeps no log index and serves at most {MAX_GET_LOGS_RANGE}"
-                ),
-            ));
-        }
-        if to_n > safe.number {
-            return Err(rpc_err(
-                id,
-                ERR_NOT_SYNCED,
-                "wallet mode only serves Safe or below (latest→Safe)",
-            ));
-        }
-        let chain = self.chain.lock().expect("chain lock");
-        let mut blocks: Vec<VerifiedBlock> = chain
-            .iter()
-            .filter(|b| b.number >= from_n && b.number <= to_n)
-            .cloned()
-            .collect();
-        blocks.sort_by_key(|b| b.number);
-        // Every block in the span must be one this client walked and verified. A gap is
-        // a range this client cannot answer, not a range with fewer logs in it.
-        if blocks.len() as u64 != span {
-            return Err(rpc_err(
-                id,
-                ERR_NOT_SYNCED,
-                "eth_getLogs range reaches outside the locally verified chain",
-            ));
-        }
-        Ok(blocks)
-    }
-
-    fn local_block_by_number_or_hash(&self, req: &Value) -> Result<VerifiedBlock, Value> {
-        let tag = req
-            .get("params")
-            .and_then(Value::as_array)
-            .and_then(|p| p.first())
-            .and_then(Value::as_str);
-        if tag.is_some_and(|s| decode_hex_fixed::<32>(s).is_ok()) {
-            self.local_block_by_hash(req)
-        } else {
-            self.local_block_by_number(req)
-        }
-    }
-
-    fn tx_count_by_number(&self, id: Value, req: &Value) -> Value {
-        match self.local_block_by_number(req) {
-            Ok(local) => self.verified_tx_count(id, &local),
-            Err(e) => e,
-        }
-    }
-
-    fn tx_count_by_hash(&self, id: Value, req: &Value) -> Value {
-        match self.local_block_by_hash(req) {
-            Ok(local) => self.verified_tx_count(id, &local),
-            Err(e) => e,
-        }
-    }
-
-    fn verified_tx_count(&self, id: Value, local: &VerifiedBlock) -> Value {
-        match self.bound_block_txs(local) {
-            Ok(bound) => match bound.txs {
-                TxBind::Empty => rpc_ok(id, json!("0x0")),
-                TxBind::List(v) => rpc_ok(id, json!(format!("0x{:x}", v.len()))),
-                TxBind::Omitted => rpc_err(id, ERR_PROOF_FAILED, TX_ENVELOPES_UNAVAILABLE),
-            },
-            Err((code, msg)) => rpc_err(id, code, &msg),
-        }
-    }
-
-    fn tx_by_block_number_and_index(&self, id: Value, req: &Value) -> Value {
-        let local = match self.local_block_by_number(req) {
-            Ok(b) => b,
-            Err(e) => return e,
-        };
-        let index = match parse_tx_index(req) {
-            Ok(i) => i,
-            Err(e) => return rpc_err(id, ERR_PARAMS, &e),
-        };
-        self.tx_at_index(id, &local, index)
-    }
-
-    fn tx_by_block_hash_and_index(&self, id: Value, req: &Value) -> Value {
-        let local = match self.local_block_by_hash(req) {
-            Ok(b) => b,
-            Err(e) => return e,
-        };
-        let index = match parse_tx_index(req) {
-            Ok(i) => i,
-            Err(e) => return rpc_err(id, ERR_PARAMS, &e),
-        };
-        self.tx_at_index(id, &local, index)
-    }
-
-    fn tx_at_index(&self, id: Value, local: &VerifiedBlock, index: u64) -> Value {
-        let bound = match self.bound_block_txs(local) {
-            Ok(v) => v,
-            Err((code, msg)) => return rpc_err(id, code, &msg),
-        };
-        let hashes = match &bound.txs {
-            TxBind::List(v) => v.as_slice(),
-            TxBind::Empty => &[][..],
-            // Non-empty root, no envelopes: `null` would claim "no tx at this index".
-            TxBind::Omitted => return rpc_err(id, ERR_PROOF_FAILED, TX_ENVELOPES_UNAVAILABLE),
-        };
-        let Ok(i) = usize::try_from(index) else {
-            return rpc_ok(id, Value::Null);
-        };
-        let Some(hash) = hashes.get(i) else {
-            return rpc_ok(id, Value::Null);
-        };
-        rpc_ok(
-            id,
-            json!({
-                "hash": format!("0x{}", hex::encode(hash)),
-                "blockHash": bound.header.hash,
-                "blockNumber": bound.header.number,
-                "transactionIndex": format!("0x{index:x}"),
-            }),
-        )
-    }
-
-    fn unverified_mined(&self, id: Value, req: &Value, method: &str) -> Value {
-        if !self.allow_unverified_passthrough {
-            return rpc_err(id, ERR_METHOD, "unverified_passthrough_disabled");
-        }
-        let want = match query_tx_hash(req) {
-            Ok(h) => h,
-            Err(e) => return rpc_err(id, ERR_PARAMS, &e),
-        };
-        let params = req.get("params").cloned().unwrap_or(json!([]));
-        let raw = match self.up.unverified_call(method, &params) {
-            Ok(v) => v,
-            Err(e) => return rpc_err(id, -32000, &format!("unverified_upstream: {e}")),
-        };
-        if raw.is_null() {
-            return rpc_ok(id, Value::Null);
-        }
-        let (_, safe) = match self.refresh() {
-            Ok(v) => v,
-            Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
-        };
-        let chain = self.chain.lock().expect("chain lock");
-        match bind_mined_object(&raw, &safe, &chain, Some(&want)) {
-            Ok(()) => rpc_ok(id, raw),
-            Err(msg) => rpc_err(id, ERR_NOT_SYNCED, &msg),
-        }
-    }
-
-    fn unverified_qty(&self, id: Value, req: &Value, method: &str) -> Value {
-        if !self.allow_unverified_passthrough {
-            return rpc_err(id, ERR_METHOD, "unverified_passthrough_disabled");
-        }
-        let params = req.get("params").cloned().unwrap_or(json!([]));
-        match self.up.unverified_call(method, &params) {
-            Ok(v) => {
-                if let Err(msg) = bind_fee_result(method, &v) {
-                    return rpc_err(id, ERR_PARAMS, &msg);
-                }
-                if method == "eth_feeHistory" && v.get("oldestBlock").is_some_and(|x| !x.is_null())
-                {
-                    let (_, safe) = match self.refresh() {
-                        Ok(x) => x,
-                        Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
-                    };
-                    let chain = self.chain.lock().expect("chain lock");
-                    if let Err((code, msg)) = bind_fee_oldest_block(&v, &safe, &chain) {
-                        return rpc_err(id, code, &msg);
-                    }
-                }
-                rpc_ok(id, v)
-            }
-            Err(e) => rpc_err(id, -32000, &format!("unverified_upstream: {e}")),
-        }
-    }
-
-    fn get_raw_tx_by_hash(&self, id: Value, req: &Value) -> Value {
-        if !self.allow_unverified_passthrough {
-            return rpc_err(id, ERR_METHOD, "unverified_passthrough_disabled");
-        }
-        let want = match query_tx_hash(req) {
-            Ok(h) => h,
-            Err(e) => return rpc_err(id, ERR_PARAMS, &e),
-        };
-        let params = req.get("params").cloned().unwrap_or(json!([]));
-        let raw = match self
-            .up
-            .unverified_call("eth_getRawTransactionByHash", &params)
-        {
-            Ok(v) => v,
-            Err(e) => return rpc_err(id, -32000, &format!("unverified_upstream: {e}")),
-        };
-        if raw.is_null() {
-            return rpc_ok(id, Value::Null);
-        }
-        let Some(hex) = raw.as_str() else {
-            return rpc_err(id, ERR_PROOF_FAILED, "upstream raw tx is not hex");
-        };
-        let bytes = match decode_hex(hex) {
-            Ok(b) => b,
-            Err(e) => return rpc_err(id, ERR_PROOF_FAILED, &format!("upstream raw tx hex: {e}")),
-        };
-        if bytes.len() > MAX_RAW_TX {
-            return rpc_err(id, ERR_PROOF_FAILED, "upstream raw tx too large");
-        }
-        // Prefer validate_bsc_raw_tx (chainId 56). Some valid mainnet txs fail
-        // that check; still require keccak256(raw) == query hash and the size cap.
-        let got = match validate_bsc_raw_tx(&bytes) {
-            Ok(h) => h,
-            Err(_) => keccak256(&bytes),
-        };
-        if got != want {
-            return rpc_err(id, ERR_PROOF_FAILED, "upstream raw tx hash mismatch");
-        }
-        rpc_ok(id, json!(format!("0x{}", hex::encode(bytes))))
-    }
-
-    fn send_raw(&self, id: Value, req: &Value) -> Value {
-        let params = req.get("params").and_then(Value::as_array);
-        let Some(raw) = params.and_then(|p| p.first()).and_then(Value::as_str) else {
-            return rpc_err(id, ERR_PARAMS, "raw tx required");
-        };
-        let bytes = match decode_hex(raw) {
-            Ok(b) => b,
-            Err(e) => return rpc_err(id, ERR_PARAMS, &format!("invalid hex: {e}")),
-        };
-        let want = match validate_bsc_raw_tx(&bytes) {
-            Ok(h) => h,
-            Err(e) => return rpc_err(id, ERR_PARAMS, &e.to_string()),
-        };
-        match self.up.send_raw_transaction(raw) {
-            Ok(got) => match decode_hex_fixed::<32>(&got) {
-                Ok(got) if got == want => rpc_ok(id, json!(format!("0x{}", hex::encode(want)))),
-                Ok(_) => rpc_err(id, ERR_PROOF_FAILED, "upstream tx hash mismatch"),
-                Err(e) => rpc_err(id, ERR_PROOF_FAILED, &format!("upstream tx hash: {e}")),
-            },
-            Err(e) => rpc_err(id, -32000, &format!("broadcast_failed: {e}")),
-        }
-    }
-
-    /// Wallet-mode exec header: tags → Safe; hex/hash iff local verified and `n ≤ Safe`.
-    /// Proof window is `proof_lag(tip, requested.number) ≤ 112` (fail-closed).
-    fn resolve_wallet_exec_block(
-        &self,
-        id: Value,
-        tag: Option<&str>,
-        tip: u64,
-        safe: &SafeHead,
-    ) -> Result<VerifiedBlock, Value> {
-        let chain = self.chain.lock().expect("chain lock");
-        self.resolve_wallet_exec_block_in(id, tag, tip, safe, &chain)
-    }
-
-    /// As [`Self::resolve_wallet_exec_block`], against a chain the caller already holds.
-    ///
-    /// `eth_call` needs this: resolving the block under one lock acquisition and then
-    /// re-locking to collect the BLOCKHASH window is two instants, and a reorg landing
-    /// between them executes a block from the old chain against ancestor hashes from the
-    /// new one. Every value stays verified, but they stop describing one chain.
-    fn resolve_wallet_exec_block_in(
-        &self,
-        id: Value,
-        tag: Option<&str>,
-        tip: u64,
-        safe: &SafeHead,
-        chain: &[VerifiedBlock],
-    ) -> Result<VerifiedBlock, Value> {
-        let local = wallet_get_block_by_number(tag, safe.number, &safe.hash, chain)
-            .cloned()
-            .or_else(|| tag.and_then(|t| wallet_get_block_by_hash(t, safe.number, chain).cloned()));
-        let Some(local) = local else {
-            return Err(rpc_err(
-                id,
-                ERR_NOT_SYNCED,
-                "wallet mode only serves Safe or below (latest→Safe)",
-            ));
-        };
-        let lag = proof_lag(tip, local.number);
-        if lag > PROVIDER_PROOF_LOOKBACK {
-            return Err(rpc_err(
-                id,
-                ERR_NOT_SYNCED,
-                &format!("proof window exceeded: lag {lag} > {PROVIDER_PROOF_LOOKBACK}"),
-            ));
-        }
-        Ok(local)
-    }
-
-    fn verified_account(
-        &self,
-        id: Value,
-        addr: &str,
-        tip: u64,
-        exec: &VerifiedBlock,
-    ) -> Result<VerifiedAccount, Value> {
-        self.verified_proof(id, addr, tip, exec, &[])
-            .map(|(acc, _)| acc)
-    }
-
-    fn verified_proof(
-        &self,
-        id: Value,
-        addr: &str,
-        tip: u64,
-        exec: &VerifiedBlock,
-        keys: &[String],
-    ) -> Result<(VerifiedAccount, EthAccountProof), Value> {
-        let lag = proof_lag(tip, exec.number);
-        if lag > PROVIDER_PROOF_LOOKBACK {
-            return Err(rpc_err(
-                id,
-                ERR_NOT_SYNCED,
-                &format!("proof window exceeded: lag {lag} > {PROVIDER_PROOF_LOOKBACK}"),
-            ));
-        }
-        let hash = format!("0x{}", hex::encode(exec.hash));
-        let raw = self
-            .up
-            .get_proof_at_safe(addr, keys, &hash, exec.number)
-            .map_err(|e| {
-                self.bump_proof_fail();
-                rpc_err(
-                    id.clone(),
-                    ERR_PROOF_FAILED,
-                    &format!("proof_verification_failed: {e}"),
-                )
-            })?;
-        let proof: EthAccountProof = serde_json::from_value(raw).map_err(|e| {
-            self.bump_proof_fail();
-            rpc_err(
-                id.clone(),
-                ERR_PROOF_FAILED,
-                &format!("proof_verification_failed: {e}"),
-            )
-        })?;
-        let want = decode_hex_fixed::<20>(addr)
-            .map_err(|e| rpc_err(id.clone(), ERR_PARAMS, &format!("bad address: {e}")))?;
-        let acc = verify_eth_get_proof(&exec.state_root, &want, &proof).map_err(|e| {
-            self.bump_proof_fail();
-            rpc_err(
-                id,
-                ERR_PROOF_FAILED,
-                &format!("proof_verification_failed: {e}"),
-            )
-        })?;
-        self.bump_proof_ok();
-        Ok((acc, proof))
-    }
-}
-
-/// Hex in the revert *message* is capped (existing); full bytes go in `error.data`.
-const REVERT_MSG_HEX_CAP: usize = 256;
-/// JSON-RPC `error.data` revert payload cap (bytes, not hex chars).
-const REVERT_DATA_CAP: usize = 32 * 1024;
-
-/// Map a verified-call error to JSON-RPC `(code, message, optional error.data hex)`.
-fn call_error_rpc(e: CallError) -> (i64, String, Option<String>) {
-    match e {
-        CallError::Missing(_) | CallError::Proof(_) | CallError::Budget => (
-            ERR_PROOF_FAILED,
-            format!("proof_verification_failed: {e}"),
-            None,
-        ),
-        CallError::Invalid(msg) => (ERR_PARAMS, msg.to_string(), None),
-        // Fail-closed, not a proof failure: the upstream did nothing wrong, the local
-        // EVM simply cannot reproduce this chain precompile. Same -32001 the other
-        // "cannot answer this verifiably" cases use.
-        CallError::UnsupportedPrecompile(a) => (
-            ERR_PROOF_FAILED,
-            format!("unsupported_precompile: 0x{}", hex::encode(a)),
-            None,
-        ),
-        CallError::Revert(data) => revert_rpc(&data),
-        CallError::Halt(reason) => (ERR_EXECUTION, format!("execution_halt: {reason}"), None),
-    }
-}
-
-fn revert_rpc(data: &[u8]) -> (i64, String, Option<String>) {
-    let truncated = data.len() > REVERT_DATA_CAP;
-    let data_bytes = if truncated {
-        &data[..REVERT_DATA_CAP]
-    } else {
-        data
-    };
-    let data_hex = format!("0x{}", hex::encode(data_bytes));
-    let msg = if truncated {
-        "execution reverted (data truncated)".into()
-    } else if data.is_empty() {
-        "execution reverted".into()
-    } else if data.len() <= REVERT_MSG_HEX_CAP {
-        format!("execution reverted: 0x{}", hex::encode(data))
-    } else {
-        "execution reverted".into()
-    };
-    (ERR_EXECUTION, msg, Some(data_hex))
-}
-
-/// Untrusted Safe proofs/code only — never proxies `eth_call` / `eth_estimateGas`.
-pub(crate) struct UpstreamProve<'a> {
-    pub(crate) up: &'a dyn RpcUpstream,
-}
-
-impl ProveAtSafe for UpstreamProve<'_> {
-    fn get_proof(
-        &self,
-        address: &[u8; 20],
-        slots: &[[u8; 32]],
-        block_hash: &[u8; 32],
-        block_number: u64,
-    ) -> Result<EthAccountProof, CallError> {
-        let addr = format!("0x{}", hex::encode(address));
-        let keys: Vec<String> = slots
-            .iter()
-            .map(|s| format!("0x{}", hex::encode(s)))
-            .collect();
-        let hash = format!("0x{}", hex::encode(block_hash));
-        let raw = self
-            .up
-            .get_proof_at_safe(&addr, &keys, &hash, block_number)
-            .map_err(|e| CallError::Proof(ProofError::Json(e.to_string())))?;
-        serde_json::from_value(raw).map_err(|e| CallError::Proof(e.into()))
-    }
-
-    fn get_code(
-        &self,
-        address: &[u8; 20],
-        block_hash: &[u8; 32],
-        block_number: u64,
-    ) -> Result<Vec<u8>, CallError> {
-        let addr = format!("0x{}", hex::encode(address));
-        let hash = format!("0x{}", hex::encode(block_hash));
-        self.up
-            .get_code(&addr, &hash)
-            .or_else(|_| self.up.get_code(&addr, &format!("0x{block_number:x}")))
-            .map_err(|e| CallError::Proof(ProofError::Json(e.to_string())))
-    }
-}
-
-/// Verified header hashes for BLOCKHASH: `n <= Safe` in the 256-window, cap 256.
-fn historical_hashes_at_safe(chain: &[VerifiedBlock], safe_number: u64) -> Vec<(u64, [u8; 32])> {
-    let mut out: Vec<(u64, [u8; 32])> = Vec::new();
-    for b in chain {
-        if b.number > safe_number {
-            continue;
-        }
-        if b.number.saturating_add(256) < safe_number {
-            continue;
-        }
-        out.push((b.number, b.hash));
-        if out.len() >= 256 {
-            break;
-        }
-    }
-    out
-}
-
-pub(crate) fn call_block_from_verified(
-    local: &VerifiedBlock,
-    chain: &[VerifiedBlock],
-) -> CallBlock {
-    let mut block = CallBlock {
-        number: local.number,
-        hash: local.hash,
-        state_root: local.state_root,
-        timestamp: local.milli_timestamp / 1000,
-        beneficiary: local.miner,
-        gas_limit: nonzero_gas_limit(local.gas_limit),
-        difficulty: [0u8; 32],
-        prevrandao: [0u8; 32],
-        basefee: 0,
-        excess_blob_gas: 0,
-        historical_hashes: historical_hashes_at_safe(chain, local.number),
-    };
-    if let Some(h) = &local.header {
-        if let Ok(ts) = decode_u64(&h.timestamp) {
-            block.timestamp = ts;
-        }
-        if let Ok(gl) = decode_u64(&h.gas_limit) {
-            block.gas_limit = nonzero_gas_limit(gl);
-        }
-        if let Ok(m) = decode_hex_fixed::<20>(&h.miner) {
-            block.beneficiary = m;
-        }
-        if let Ok(mix) = decode_hex_fixed::<32>(&h.mix_hash) {
-            block.prevrandao = mix;
-        }
-        if let Ok(d) = decode_qty_pad32(&h.difficulty) {
-            block.difficulty = d;
-        }
-        if let Some(bf) = &h.base_fee_per_gas {
-            if let Ok(n) = decode_u64(bf) {
-                block.basefee = n;
-            }
-        }
-        if let Some(eb) = &h.excess_blob_gas {
-            if let Ok(n) = decode_u64(eb) {
-                block.excess_blob_gas = n;
-            }
-        }
-    }
-    block
-}
-
-fn nonzero_gas_limit(n: u64) -> u64 {
-    if n == 0 {
-        CALL_GAS_CAP
-    } else {
-        n
-    }
-}
-
-fn parse_eth_call_tx(req: &Value) -> Result<CallTx, String> {
-    let params = req
-        .get("params")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "invalid params".to_string())?;
-    if params.len() > 2 {
-        return Err("state overrides not supported".into());
-    }
-    let tx = params
-        .first()
-        .ok_or_else(|| "tx object required".to_string())?;
-    let Some(map) = tx.as_object() else {
-        return Err("tx object required".into());
-    };
-    for k in ["stateOverride", "blobVersionedHashes", "authorizationList"] {
-        if map.contains_key(k) {
-            return Err(format!("{k} not supported"));
-        }
-    }
-    let to = match map.get("to") {
-        None | Some(Value::Null) => return Err("to address required".into()),
-        Some(Value::String(s)) => require_rpc_address(s)?,
-        Some(_) => return Err("to address required".into()),
-    };
-    let from = match map.get("from") {
-        None | Some(Value::Null) => [0u8; 20],
-        Some(Value::String(s)) => require_rpc_address(s)?,
-        Some(_) => return Err("from is not an address".into()),
-    };
-    let data = parse_call_data(map)?;
-    let value = match map.get("value") {
-        None | Some(Value::Null) => [0u8; 32],
-        Some(Value::String(s)) => decode_qty_pad32(s)?,
-        Some(_) => return Err("value is not hex".into()),
-    };
-    let gas = match map.get("gas") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(s)) => Some(decode_u64(s).map_err(|e| format!("invalid gas: {e}"))?),
-        Some(_) => return Err("gas is not hex".into()),
-    };
-    let access_list = parse_access_list(map)?;
-    Ok(CallTx {
-        from,
-        to,
-        data,
-        value,
-        gas,
-        access_list,
-    })
-}
-
-type CallAccessList = Vec<([u8; 20], Vec<[u8; 32]>)>;
-
-fn parse_access_list(map: &serde_json::Map<String, Value>) -> Result<CallAccessList, String> {
-    match map.get("accessList") {
-        None | Some(Value::Null) => Ok(Vec::new()),
-        Some(Value::Array(items)) => {
-            if items.len() > MAX_CALL_ACCOUNTS {
-                return Err("accessList too large".into());
-            }
-            let mut out = Vec::with_capacity(items.len());
-            let mut total_keys = 0usize;
-            for item in items {
-                let obj = item
-                    .as_object()
-                    .ok_or_else(|| "accessList entry is not an object".to_string())?;
-                let address = match obj.get("address") {
-                    None | Some(Value::Null) => return Err("accessList address required".into()),
-                    Some(Value::String(s)) => require_rpc_address(s)?,
-                    Some(_) => return Err("accessList address is not an address".into()),
-                };
-                let slots = match obj.get("storageKeys") {
-                    None | Some(Value::Null) => Vec::new(),
-                    Some(Value::Array(keys)) => {
-                        if keys.len() > MAX_PROOF_STORAGE_KEYS {
-                            return Err("accessList too large".into());
-                        }
-                        let mut slots = Vec::with_capacity(keys.len());
-                        for k in keys {
-                            let s = k
-                                .as_str()
-                                .ok_or_else(|| "accessList storage key is not hex".to_string())?;
-                            slots
-                                .push(parse_slot(s).map_err(|_| {
-                                    "accessList storage key is not hex".to_string()
-                                })?);
-                        }
-                        slots
-                    }
-                    Some(_) => return Err("accessList storageKeys must be an array".into()),
-                };
-                total_keys = total_keys.saturating_add(slots.len());
-                if total_keys > MAX_PROOF_STORAGE_KEYS {
-                    return Err("accessList too large".into());
-                }
-                out.push((address, slots));
-            }
-            Ok(out)
-        }
-        Some(_) => Err("accessList must be an array".into()),
-    }
-}
-
-fn parse_call_data(map: &serde_json::Map<String, Value>) -> Result<Vec<u8>, String> {
-    let data = match map.get("data") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(s)) => Some(s.as_str()),
-        Some(_) => return Err("data is not hex".into()),
-    };
-    let input = match map.get("input") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(s)) => Some(s.as_str()),
-        Some(_) => return Err("input is not hex".into()),
-    };
-    let hex = match (data, input) {
-        (Some(d), Some(i)) if !d.eq_ignore_ascii_case(i) => {
-            return Err("data/input mismatch".into());
-        }
-        (Some(d), _) | (None, Some(d)) => d,
-        (None, None) => return Ok(Vec::new()),
-    };
-    let bytes = decode_hex(hex).map_err(|e| format!("invalid data: {e}"))?;
-    if bytes.len() > MAX_CALL_DATA {
-        return Err("calldata too large".into());
-    }
-    Ok(bytes)
-}
-
-fn decode_qty_pad32(s: &str) -> Result<[u8; 32], String> {
-    let raw = s.trim_start_matches("0x").trim_start_matches("0X");
-    if raw.is_empty() {
-        return Ok([0u8; 32]);
-    }
-    if !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("value is not hex".into());
-    }
-    if raw.len() > 64 {
-        return Err("value too large".into());
-    }
-    let even = if raw.len() % 2 == 1 {
-        format!("0{raw}")
-    } else {
-        raw.to_string()
-    };
-    let bytes = hex::decode(even).map_err(|e| format!("invalid value: {e}"))?;
-    Ok(pad32(&bytes))
-}
-
-/// EIP-1898 object (and any non-string) block id is invalid, not silent Safe.
-fn wallet_block_id_str(id: Value, raw: Option<&Value>) -> Result<Option<&str>, Value> {
-    wallet_block_tag_str(raw).map_err(|e| rpc_err(id, ERR_PARAMS, e))
-}
-
-/// Wallet-mode `eth_getBlockByNumber`: tag must resolve to a local verified block at or below Safe.
-fn wallet_get_block_by_number<'a>(
-    tag: Option<&str>,
-    safe_number: u64,
-    safe_hash: &str,
-    chain: &'a [VerifiedBlock],
-) -> Option<&'a VerifiedBlock> {
-    match wallet_block_number_allowed(tag, safe_number, safe_hash)? {
-        BlockId::Safe => chain.iter().find(|b| b.number == safe_number),
-        BlockId::Number(n) => chain.iter().find(|b| b.number == n),
-    }
-}
-
-/// Wallet-mode `eth_getBlockByHash`: hash must be in the local verified chain at or below Safe.
-fn wallet_get_block_by_hash<'a>(
-    hash: &str,
-    safe_number: u64,
-    chain: &'a [VerifiedBlock],
-) -> Option<&'a VerifiedBlock> {
-    let want = decode_hex_fixed::<32>(hash).ok()?;
-    chain
-        .iter()
-        .find(|b| b.hash == want && b.number <= safe_number)
-}
-
-fn hex_eq_loose(a: &str, b: &str) -> bool {
-    let a = a.trim_start_matches("0x").trim_start_matches("0X");
-    let b = b.trim_start_matches("0x").trim_start_matches("0X");
-    a.eq_ignore_ascii_case(b)
-}
-
-fn is_nullish_json(v: Option<&Value>) -> bool {
-    match v {
-        None | Some(Value::Null) => true,
-        Some(Value::String(s)) => {
-            let t = s.trim();
-            t.is_empty() || t.eq_ignore_ascii_case("0x")
-        }
-        _ => false,
-    }
-}
-
-/// 32-byte zero hash. `0x0` is a block number, not a hash.
-fn is_zero_block_hash(s: &str) -> bool {
-    let raw = s.trim().trim_start_matches("0x").trim_start_matches("0X");
-    raw.len() == 64 && raw.bytes().all(|b| b == b'0')
-}
-
-fn is_empty_block_hash(v: Option<&Value>) -> bool {
-    match v {
-        None | Some(Value::Null) => true,
-        Some(Value::String(s)) => {
-            let t = s.trim();
-            t.is_empty() || t.eq_ignore_ascii_case("0x") || is_zero_block_hash(t)
-        }
-        _ => false,
-    }
-}
-
-fn bind_optional_hash32(v: Option<&Value>, field: &str) -> Result<(), String> {
-    match v {
-        None | Some(Value::Null) => Ok(()),
-        Some(Value::String(s)) => decode_hex_fixed::<32>(s)
-            .map(|_| ())
-            .map_err(|_| format!("{field} is not a 32-byte hash")),
-        Some(_) => Err(format!("{field} not a string")),
-    }
-}
-
-fn bind_optional_address(v: Option<&Value>, field: &str, allow_null: bool) -> Result<(), String> {
-    match v {
-        None => Ok(()),
-        Some(Value::Null) if allow_null => Ok(()),
-        Some(Value::Null) => Err(format!("{field} must be an address")),
-        Some(Value::String(s)) => decode_hex_fixed::<20>(s)
-            .map(|_| ())
-            .map_err(|_| format!("{field} is not a 20-byte address")),
-        Some(_) => Err(format!("{field} not a string")),
-    }
-}
-
-fn bind_optional_chain_id(v: Option<&Value>) -> Result<(), String> {
-    match v {
-        None | Some(Value::Null) => Ok(()),
-        Some(Value::String(s)) => {
-            let n = decode_u64(s).map_err(|_| "chainId invalid".to_string())?;
-            if n == BSC_MAINNET_CHAIN_ID {
-                Ok(())
-            } else {
-                Err("chainId is not BSC mainnet 56".into())
-            }
-        }
-        Some(Value::Number(n)) if n.as_u64() == Some(BSC_MAINNET_CHAIN_ID) => Ok(()),
-        Some(_) => Err("chainId is not BSC mainnet 56".into()),
-    }
-}
-
-fn require_rpc_address(s: &str) -> Result<[u8; 20], String> {
-    decode_hex_fixed::<20>(s).map_err(|_| "address is not 20 bytes".into())
-}
-
-fn query_tx_hash(req: &Value) -> Result<[u8; 32], String> {
-    let s = req
-        .get("params")
-        .and_then(Value::as_array)
-        .and_then(|p| p.first())
-        .and_then(Value::as_str)
-        .ok_or_else(|| "tx hash required".to_string())?;
-    decode_hex_fixed::<32>(s).map_err(|_| "tx hash is not 32 bytes".into())
-}
-
-/// Receipt `transactionHash` / tx `hash` must equal the requested hash when present.
-fn bind_result_tx_hash(
-    map: &serde_json::Map<String, Value>,
-    want: Option<&[u8; 32]>,
-) -> Result<(), String> {
-    let Some(want) = want else {
-        return Ok(());
-    };
-    let mut present = false;
-    for field in ["hash", "transactionHash"] {
-        match map.get(field) {
-            None | Some(Value::Null) => {}
-            Some(Value::String(s)) => {
-                present = true;
-                let got = decode_hex_fixed::<32>(s)
-                    .map_err(|_| format!("{field} is not a 32-byte hash"))?;
-                if &got != want {
-                    return Err(format!("{field} does not match request"));
-                }
-            }
-            Some(_) => return Err(format!("{field} not a string")),
-        }
-    }
-    if !present {
-        return Err("receipt/tx hash missing".into());
-    }
-    Ok(())
 }
 
 /// Non-empty `transactionsRoot` but the upstream served no raw envelopes: a count or an
@@ -3240,1007 +1478,6 @@ const MAX_GET_LOGS_RANGE: u64 = 128;
 const FILTER_ID_HEX: &str = "filter id must be a hex quantity";
 const FILTER_NOT_FOUND: &str = "filter not found";
 const WALLET_TAG_ONLY: &str = "wallet mode only serves Safe or below (latest→Safe)";
-
-/// Blocks whose receipts are fetched concurrently when serving a log range.
-///
-/// A span is latency-bound: one upstream round trip per block, and nothing to compute in
-/// between. Kept small so a single request cannot open a burst of connections against an
-/// operator's provider.
-const LOG_FETCH_PARALLEL: usize = 4;
-
-const MAX_FILTERS: usize = 64;
-
-/// Idle time after which a filter is forgotten, matching geth's default.
-const FILTER_TTL: Duration = Duration::from_secs(300);
-
-/// What a filter id refers to.
-enum FilterKind {
-    /// A log filter. The original filter object is kept verbatim so a poll re-runs the
-    /// same validated path `eth_getLogs` takes, with only the block bounds replaced — the
-    /// two cannot drift into disagreeing about what the filter matches.
-    Logs {
-        filter: serde_json::Map<String, Value>,
-        /// Lower bound the caller asked for. Fixed: `eth_getFilterLogs` answers the whole
-        /// range every time, so it cannot read the cursor, which has moved on.
-        from_block: u64,
-        /// Upper bound the caller asked for, or `None` for an open-ended filter that
-        /// follows the head.
-        to_block: Option<u64>,
-        /// Next block `eth_getFilterChanges` reports from.
-        cursor: u64,
-    },
-    /// A block filter: hashes of blocks verified since the last poll.
-    Blocks { cursor: u64 },
-}
-
-struct StoredFilter {
-    kind: FilterKind,
-    touched: Instant,
-}
-
-/// Filter ids and their state.
-///
-/// Ids are sequential per process and never reused, so a poll against an id that has
-/// expired is a clean "filter not found" rather than someone else's results.
-#[derive(Default)]
-struct FilterStore {
-    next_id: u64,
-    map: std::collections::HashMap<u64, StoredFilter>,
-}
-
-impl FilterStore {
-    fn sweep(&mut self) {
-        self.map.retain(|_, f| f.touched.elapsed() < FILTER_TTL);
-    }
-
-    fn insert(&mut self, kind: FilterKind) -> Result<u64, String> {
-        self.sweep();
-        if self.map.len() >= MAX_FILTERS {
-            // Drop the least recently polled rather than refuse: a caller that abandoned
-            // a filter should not lock out the one that is still being used.
-            if let Some(oldest) = self
-                .map
-                .iter()
-                .min_by_key(|(_, f)| f.touched)
-                .map(|(id, _)| *id)
-            {
-                self.map.remove(&oldest);
-            }
-        }
-        if self.map.len() >= MAX_FILTERS {
-            return Err("too many filters".into());
-        }
-        self.next_id = self.next_id.saturating_add(1);
-        let id = self.next_id;
-        self.map.insert(
-            id,
-            StoredFilter {
-                kind,
-                touched: Instant::now(),
-            },
-        );
-        Ok(id)
-    }
-}
-
-/// Parse a `0x`-prefixed filter id.
-fn parse_filter_id(req: &Value) -> Option<u64> {
-    let s = req
-        .get("params")
-        .and_then(Value::as_array)
-        .and_then(|p| p.first())
-        .and_then(Value::as_str)?;
-    let hex = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))?;
-    if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    u64::from_str_radix(hex, 16).ok()
-}
-
-fn bind_optional_logs(
-    v: Option<&Value>,
-    want_tx: Option<&[u8; 32]>,
-    receipt_block: Option<&str>,
-) -> Result<(), String> {
-    match v {
-        None | Some(Value::Null) => Ok(()),
-        Some(Value::Array(logs)) => {
-            if logs.len() > MAX_RECEIPT_LOGS {
-                return Err("too many logs".into());
-            }
-            for log in logs {
-                let map = log
-                    .as_object()
-                    .ok_or_else(|| "log is not an object".to_string())?;
-                match map.get("address") {
-                    None | Some(Value::Null) => return Err("log.address missing".into()),
-                    Some(Value::String(s)) => {
-                        decode_hex_fixed::<20>(s).map_err(|_| "log.address is not 20 bytes")?;
-                    }
-                    Some(_) => return Err("log.address not a string".into()),
-                }
-                if let Some(data) = map.get("data") {
-                    match data {
-                        Value::Null => {}
-                        Value::String(s) => {
-                            let bytes = decode_hex(s).map_err(|_| "log.data is not hex")?;
-                            if bytes.len() > MAX_LOG_DATA {
-                                return Err("log.data too large".into());
-                            }
-                        }
-                        _ => return Err("log.data not a hex string".into()),
-                    }
-                }
-                if let Some(topics) = map.get("topics") {
-                    let arr = topics
-                        .as_array()
-                        .ok_or_else(|| "log.topics is not an array".to_string())?;
-                    if arr.len() > MAX_LOG_TOPICS {
-                        return Err("too many log topics".into());
-                    }
-                    for t in arr {
-                        let s = t
-                            .as_str()
-                            .ok_or_else(|| "log topic not a string".to_string())?;
-                        decode_hex_fixed::<32>(s).map_err(|_| "log topic is not 32 bytes")?;
-                    }
-                }
-                if let Some(want) = want_tx {
-                    if let Some(Value::String(s)) = map.get("transactionHash") {
-                        let got = decode_hex_fixed::<32>(s)
-                            .map_err(|_| "log.transactionHash is not a 32-byte hash")?;
-                        if &got != want {
-                            return Err("log.transactionHash does not match request".into());
-                        }
-                    }
-                }
-                if let (Some(rb), Some(Value::String(lb))) = (receipt_block, map.get("blockHash")) {
-                    if !hex_eq_loose(rb, lb) {
-                        return Err("log.blockHash does not match receipt".into());
-                    }
-                }
-            }
-            Ok(())
-        }
-        Some(_) => Err("logs not an array".into()),
-    }
-}
-
-fn bind_optional_qty(v: Option<&Value>, field: &str) -> Result<(), String> {
-    match v {
-        None | Some(Value::Null) => Ok(()),
-        Some(Value::String(s)) => decode_u64(s)
-            .map(|_| ())
-            .map_err(|_| format!("{field} is not a hex quantity")),
-        Some(_) => Err(format!("{field} not a hex quantity")),
-    }
-}
-
-fn bind_optional_hex_cap(v: Option<&Value>, field: &str, max: usize) -> Result<(), String> {
-    match v {
-        None | Some(Value::Null) => Ok(()),
-        Some(Value::String(s)) => {
-            let bytes = decode_hex(s).map_err(|_| format!("{field} is not hex"))?;
-            if bytes.len() > max {
-                return Err(format!("{field} too large"));
-            }
-            Ok(())
-        }
-        Some(_) => Err(format!("{field} not a hex string")),
-    }
-}
-
-fn bind_qty_array(v: Option<&Value>, field: &str) -> Result<(), String> {
-    match v {
-        None | Some(Value::Null) => Ok(()),
-        Some(Value::Array(a)) => {
-            if a.len() > MAX_FEE_HISTORY_ITEMS {
-                return Err(format!("too many {field}"));
-            }
-            for x in a {
-                bind_optional_qty(Some(x), field)?;
-            }
-            Ok(())
-        }
-        Some(_) => Err(format!("{field} is not an array")),
-    }
-}
-
-fn bind_optional_tx_type(v: Option<&Value>) -> Result<(), String> {
-    match v {
-        None | Some(Value::Null) => Ok(()),
-        Some(Value::String(s)) => {
-            let n = decode_u64(s).map_err(|_| "type invalid".to_string())?;
-            if n <= 4 {
-                Ok(())
-            } else {
-                Err("tx type is not 0x0..=0x4".into())
-            }
-        }
-        Some(_) => Err("type not a hex quantity".into()),
-    }
-}
-
-fn bind_optional_status(v: Option<&Value>) -> Result<(), String> {
-    match v {
-        None | Some(Value::Null) => Ok(()),
-        Some(Value::String(s)) => {
-            let n = decode_u64(s).map_err(|_| "status invalid".to_string())?;
-            if n <= 1 {
-                Ok(())
-            } else {
-                Err("status is not 0x0 or 0x1".into())
-            }
-        }
-        Some(_) => Err("status not a hex quantity".into()),
-    }
-}
-
-/// Unverified fee oracles: known methods only; hex qty or `eth_feeHistory` object.
-/// `oldestBlock` if present is a hex qty; local chain bind is `bind_fee_oldest_block`.
-fn bind_fee_result(method: &str, v: &Value) -> Result<(), String> {
-    match method {
-        "eth_gasPrice" | "eth_maxPriorityFeePerGas" | "eth_blobBaseFee" => {
-            let s = v
-                .as_str()
-                .ok_or_else(|| "fee oracle not a hex quantity".to_string())?;
-            decode_u64(s).map_err(|_| "fee oracle invalid quantity".to_string())?;
-            Ok(())
-        }
-        "eth_feeHistory" => {
-            let o = v
-                .as_object()
-                .ok_or_else(|| "feeHistory is not an object".to_string())?;
-            bind_optional_qty(o.get("oldestBlock"), "oldestBlock")?;
-            bind_qty_array(o.get("baseFeePerGas"), "baseFeePerGas")?;
-            bind_qty_array(o.get("baseFeePerBlobGas"), "baseFeePerBlobGas")?;
-            match o.get("gasUsedRatio") {
-                None | Some(Value::Null) => {}
-                Some(Value::Array(a)) => {
-                    if a.len() > MAX_FEE_HISTORY_ITEMS {
-                        return Err("too many gasUsedRatio".into());
-                    }
-                    for x in a {
-                        let ok = match x {
-                            Value::Number(n) => n.as_f64().is_some(),
-                            Value::String(s) => s.parse::<f64>().is_ok(),
-                            _ => false,
-                        };
-                        if !ok {
-                            return Err("gasUsedRatio element is not a number".into());
-                        }
-                    }
-                }
-                Some(_) => return Err("gasUsedRatio is not an array".into()),
-            }
-            match o.get("reward") {
-                None | Some(Value::Null) => {}
-                Some(Value::Array(rows)) => {
-                    if rows.len() > MAX_FEE_HISTORY_ITEMS {
-                        return Err("too many reward".into());
-                    }
-                    for row in rows {
-                        bind_qty_array(Some(row), "reward")?;
-                    }
-                }
-                Some(_) => return Err("reward is not an array".into()),
-            }
-            Ok(())
-        }
-        _ => Err(format!("unknown fee method: {method}")),
-    }
-}
-
-/// `oldestBlock` if present must equal a local `VerifiedBlock.number` ≤ Safe.
-fn bind_fee_oldest_block(
-    v: &Value,
-    safe: &SafeHead,
-    chain: &[VerifiedBlock],
-) -> Result<(), (i64, String)> {
-    let Some(o) = v.as_object() else {
-        return Ok(());
-    };
-    match o.get("oldestBlock") {
-        None | Some(Value::Null) => Ok(()),
-        Some(Value::String(s)) => {
-            let n = decode_u64(s)
-                .map_err(|_| (ERR_PARAMS, "oldestBlock is not a hex quantity".to_string()))?;
-            let Some(local) = chain.iter().find(|b| b.number == n) else {
-                return Err((
-                    ERR_NOT_SYNCED,
-                    "feeHistory oldestBlock not in local verified chain".into(),
-                ));
-            };
-            if local.number > safe.number {
-                return Err((
-                    ERR_NOT_SYNCED,
-                    "feeHistory oldestBlock is above local Safe".into(),
-                ));
-            }
-            Ok(())
-        }
-        Some(_) => Err((ERR_PARAMS, "oldestBlock not a hex quantity".into())),
-    }
-}
-
-/// Header-bind a mined receipt/tx to the local Safe chain. Pending (null hash+number) is ok.
-fn bind_mined_object(
-    obj: &Value,
-    safe: &SafeHead,
-    chain: &[VerifiedBlock],
-    want_tx: Option<&[u8; 32]>,
-) -> Result<(), String> {
-    let Some(map) = obj.as_object() else {
-        return Err("unverified result is not an object".into());
-    };
-    bind_optional_hash32(map.get("transactionHash"), "transactionHash")?;
-    bind_optional_hash32(map.get("hash"), "hash")?;
-    bind_result_tx_hash(map, want_tx)?;
-    bind_optional_chain_id(map.get("chainId"))?;
-    bind_optional_address(map.get("from"), "from", false)?;
-    bind_optional_address(map.get("to"), "to", true)?;
-    bind_optional_address(map.get("contractAddress"), "contractAddress", true)?;
-    bind_optional_status(map.get("status"))?;
-    bind_optional_tx_type(map.get("type"))?;
-    bind_optional_qty(map.get("gasUsed"), "gasUsed")?;
-    bind_optional_qty(map.get("cumulativeGasUsed"), "cumulativeGasUsed")?;
-    bind_optional_hex_cap(map.get("input"), "input", MAX_RAW_TX)?;
-    bind_optional_hex_cap(map.get("data"), "data", MAX_RAW_TX)?;
-    match map.get("logsBloom") {
-        None | Some(Value::Null) => {}
-        Some(Value::String(s)) => {
-            decode_hex_fixed::<256>(s).map_err(|_| "logsBloom is not 256 bytes".to_string())?;
-        }
-        Some(_) => return Err("logsBloom not a hex string".into()),
-    }
-    let receipt_block = map.get("blockHash").and_then(Value::as_str);
-    bind_optional_logs(map.get("logs"), want_tx, receipt_block)?;
-    let hash_v = map.get("blockHash");
-    let num_v = map.get("blockNumber");
-    let hash_empty = is_empty_block_hash(hash_v);
-    let num_empty = is_nullish_json(num_v);
-    if hash_empty && num_empty {
-        return Ok(());
-    }
-    if hash_empty != num_empty {
-        return Err("receipt/tx pending fields inconsistent".into());
-    }
-    let hash = hash_v
-        .and_then(Value::as_str)
-        .ok_or_else(|| "receipt/tx blockHash not a string".to_string())?;
-    let local = chain
-        .iter()
-        .find(|b| {
-            let h = format!("0x{}", hex::encode(b.hash));
-            hex_eq_loose(&h, hash)
-        })
-        .ok_or_else(|| "receipt/tx blockHash not in local verified chain".to_string())?;
-    if local.number > safe.number {
-        return Err("receipt/tx is above local Safe".into());
-    }
-    if let Some(ns) = num_v.and_then(Value::as_str) {
-        let n = decode_u64(ns).map_err(|_| "receipt/tx blockNumber invalid".to_string())?;
-        if n != local.number {
-            return Err("receipt/tx blockNumber does not match local header".into());
-        }
-    }
-    Ok(())
-}
-
-fn header_matches_local(hdr: &RpcBlockHeader, local: &VerifiedBlock) -> Result<(), (i64, String)> {
-    let got_number = decode_u64(&hdr.number)
-        .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))?;
-    if got_number != local.number {
-        return Err((
-            ERR_PROOF_FAILED,
-            "proof_verification_failed: header number mismatch".into(),
-        ));
-    }
-    let got_root = decode_hex_fixed::<32>(&hdr.state_root)
-        .map_err(|e| (ERR_STATE_ROOT, format!("state_root_mismatch: {e}")))?;
-    if got_root != local.state_root {
-        return Err((
-            ERR_STATE_ROOT,
-            "state_root_mismatch: header stateRoot != local verified".into(),
-        ));
-    }
-    let computed = header_hash(hdr)
-        .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))?;
-    if computed != local.hash {
-        return Err((
-            ERR_PROOF_FAILED,
-            "proof_verification_failed: header hash mismatch".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn wants_full_txs(params: Option<&Vec<Value>>) -> bool {
-    params.and_then(|p| p.get(1)).and_then(Value::as_bool) == Some(true)
-}
-
-struct BoundTxs {
-    header: RpcBlockHeader,
-    txs: TxBind,
-}
-
-/// Outcome of binding a block's transaction hashes to the sealed `transactionsRoot`.
-///
-/// `Empty` and `Omitted` both render as `[]` in `eth_getBlock*` (documented: no raw
-/// envelopes → hashes omitted, never a fabricated list), but they are *not* the same
-/// claim and must not collapse for a count or an index lookup. `Empty` proves the
-/// block has no transactions — the sealed root is the empty-trie root. `Omitted`
-/// proves nothing: the root is non-empty, so the block certainly has transactions,
-/// the upstream just declined to serve the envelopes. Answering `0x0` there, or
-/// `null` for index 0, hands a wallet an unverified claim wearing a verified method's
-/// clothes; both fail closed with `-32001` instead.
-enum TxBind {
-    Empty,
-    Omitted,
-    List(Vec<[u8; 32]>),
-}
-
-impl TxBind {
-    /// Hash list for `eth_getBlock*`: nothing to show for `Empty` or `Omitted`.
-    fn hashes(&self) -> &[[u8; 32]] {
-        match self {
-            TxBind::List(v) => v,
-            TxBind::Empty | TxBind::Omitted => &[],
-        }
-    }
-}
-
-enum ReceiptBind {
-    Empty,
-    Omitted,
-    List(Vec<BoundReceipt>),
-}
-
-struct BoundReceipt {
-    json: Value,
-    tx_hash: Option<[u8; 32]>,
-    logs: Vec<ConsensusLog>,
-}
-
-struct ParsedReceipt {
-    consensus: ConsensusReceipt,
-    tx_hash: Option<[u8; 32]>,
-}
-
-/// Overwrite every locally-known field of an upstream receipt with the verified value.
-///
-/// The receipt-level `blockHash` / `blockNumber` / `transactionIndex` were already
-/// overwritten here because an upstream must not get to name the block. The `logs[]`
-/// array was not, and it carries the same fields: only `address` / `topics` / `data`
-/// are bound by `receiptsRoot`, so a receipt that hashes correctly could still ship
-/// `logs[0].blockNumber` / `blockHash` / `transactionHash` / `logIndex` pointing at
-/// some other block or tx, and `eth_getBlockReceipts` (a *verified* method, no flag)
-/// echoed them straight to the wallet. Rebuild each log from the parsed consensus
-/// values plus the local header instead — the same shape `eth_getLogs` emits.
-///
-/// `gasUsed` is **derived**, not echoed. `receiptsRoot` binds `cumulativeGasUsed`, and a
-/// receipt's own gas is the difference between its cumulative total and the previous
-/// receipt's, so the value can be computed from consensus-verified data rather than taken
-/// on an upstream's word. It was previously only checked for being a hex quantity — which
-/// let a verified method hand a wallet any number at all.
-fn decorate_receipt_json(
-    mut v: Value,
-    hdr: &RpcBlockHeader,
-    index: usize,
-    tx_hash: Option<[u8; 32]>,
-    logs: &[ConsensusLog],
-    first_log_index: u64,
-    gas_used: u64,
-) -> Value {
-    if let Value::Object(map) = &mut v {
-        map.insert("blockHash".into(), json!(hdr.hash.clone()));
-        map.insert("blockNumber".into(), json!(hdr.number.clone()));
-        map.insert("transactionIndex".into(), json!(format!("0x{index:x}")));
-        map.insert("gasUsed".into(), json!(format!("0x{gas_used:x}")));
-        if let Some(h) = tx_hash {
-            map.insert(
-                "transactionHash".into(),
-                json!(format!("0x{}", hex::encode(h))),
-            );
-        }
-        let rebuilt: Vec<Value> = logs
-            .iter()
-            .enumerate()
-            .map(|(j, log)| {
-                rpc_log_json(
-                    log,
-                    hdr,
-                    tx_hash,
-                    index as u64,
-                    first_log_index.saturating_add(j as u64),
-                )
-            })
-            .collect();
-        map.insert("logs".into(), Value::Array(rebuilt));
-    }
-    v
-}
-
-fn parse_consensus_receipt_json(v: &Value) -> Result<ParsedReceipt, String> {
-    let map = v
-        .as_object()
-        .ok_or_else(|| "receipt is not an object".to_string())?;
-    let status = match map.get("status") {
-        Some(Value::String(s)) => {
-            let n = decode_u64(s).map_err(|_| "status invalid".to_string())?;
-            if n > 1 {
-                return Err("status is not 0x0 or 0x1".into());
-            }
-            n
-        }
-        _ => return Err("status missing".into()),
-    };
-    let cumulative_gas_used = match map.get("cumulativeGasUsed") {
-        Some(Value::String(s)) => {
-            decode_u64(s).map_err(|_| "cumulativeGasUsed is not a hex quantity".to_string())?
-        }
-        _ => return Err("cumulativeGasUsed missing".into()),
-    };
-    let logs_bloom = match map.get("logsBloom") {
-        Some(Value::String(s)) => {
-            decode_hex_fixed::<256>(s).map_err(|_| "logsBloom is not 256 bytes".to_string())?
-        }
-        _ => return Err("logsBloom missing".into()),
-    };
-    let tx_type = match map.get("type") {
-        None | Some(Value::Null) => 0u8,
-        Some(Value::String(s)) => {
-            let n = decode_u64(s).map_err(|_| "type invalid".to_string())?;
-            if n > 4 {
-                return Err("tx type is not 0x0..=0x4".into());
-            }
-            n as u8
-        }
-        Some(_) => return Err("type not a hex quantity".into()),
-    };
-    let logs = match map.get("logs") {
-        None | Some(Value::Null) => Vec::new(),
-        Some(Value::Array(arr)) => {
-            if arr.len() > MAX_RECEIPT_LOGS {
-                return Err("too many logs".into());
-            }
-            let mut out = Vec::with_capacity(arr.len());
-            for log in arr {
-                out.push(parse_consensus_log_json(log)?);
-            }
-            out
-        }
-        Some(_) => return Err("logs not an array".into()),
-    };
-    let tx_hash = match map.get("transactionHash") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(s)) => Some(
-            decode_hex_fixed::<32>(s)
-                .map_err(|_| "transactionHash is not a 32-byte hash".to_string())?,
-        ),
-        Some(_) => return Err("transactionHash not a string".into()),
-    };
-    // `receiptsRoot` binds status / cumulativeGasUsed / logsBloom / type / logs and
-    // nothing else. `gasUsed` is no longer among the echoed fields — it is recomputed from
-    // the verified cumulative totals in `decorate_receipt_json`; the check below only keeps
-    // a malformed value from reaching that point. The rest are still echoed, so they are at
-    // least *structurally* validated as `docs/rpc-matrix.md` promises: without this an
-    // upstream could hand a wallet `"to": 12345` or a 4-byte `from` through a verified
-    // method. Same checks the passthrough path (`bind_mined_object`) already applies.
-    bind_optional_address(map.get("from"), "from", false)?;
-    bind_optional_address(map.get("to"), "to", true)?;
-    bind_optional_address(map.get("contractAddress"), "contractAddress", true)?;
-    bind_optional_qty(map.get("gasUsed"), "gasUsed")?;
-    bind_optional_qty(map.get("effectiveGasPrice"), "effectiveGasPrice")?;
-    Ok(ParsedReceipt {
-        consensus: ConsensusReceipt {
-            status,
-            cumulative_gas_used,
-            logs_bloom,
-            logs,
-            tx_type,
-        },
-        tx_hash,
-    })
-}
-
-fn parse_consensus_log_json(v: &Value) -> Result<ConsensusLog, String> {
-    let map = v
-        .as_object()
-        .ok_or_else(|| "log is not an object".to_string())?;
-    let address = match map.get("address") {
-        Some(Value::String(s)) => {
-            decode_hex_fixed::<20>(s).map_err(|_| "log.address is not 20 bytes".to_string())?
-        }
-        _ => return Err("log.address missing".into()),
-    };
-    let mut topics = Vec::new();
-    match map.get("topics") {
-        None | Some(Value::Null) => {}
-        Some(Value::Array(arr)) => {
-            if arr.len() > MAX_LOG_TOPICS {
-                return Err("too many log topics".into());
-            }
-            for t in arr {
-                let s = t
-                    .as_str()
-                    .ok_or_else(|| "log topic not a string".to_string())?;
-                topics.push(decode_hex_fixed::<32>(s).map_err(|_| "log topic is not 32 bytes")?);
-            }
-        }
-        Some(_) => return Err("log.topics is not an array".into()),
-    }
-    let data = match map.get("data") {
-        None | Some(Value::Null) => Vec::new(),
-        Some(Value::String(s)) => {
-            let bytes = decode_hex(s).map_err(|_| "log.data is not hex")?;
-            if bytes.len() > MAX_LOG_DATA {
-                return Err("log.data too large".into());
-            }
-            bytes
-        }
-        Some(_) => return Err("log.data not a hex string".into()),
-    };
-    Ok(ConsensusLog {
-        address,
-        topics,
-        data,
-    })
-}
-
-fn parse_log_addresses(
-    filter: Option<&serde_json::Map<String, Value>>,
-) -> Result<Vec<[u8; 20]>, String> {
-    match filter.and_then(|m| m.get("address")) {
-        None | Some(Value::Null) => Ok(Vec::new()),
-        Some(Value::String(s)) => {
-            let a = decode_hex_fixed::<20>(s).map_err(|_| "address is not 20 bytes".to_string())?;
-            Ok(vec![a])
-        }
-        Some(Value::Array(arr)) => {
-            let mut out = Vec::with_capacity(arr.len());
-            for x in arr {
-                let s = x
-                    .as_str()
-                    .ok_or_else(|| "address is not 20 bytes".to_string())?;
-                out.push(decode_hex_fixed::<20>(s).map_err(|_| "address is not 20 bytes")?);
-            }
-            Ok(out)
-        }
-        Some(_) => Err("address must be a 20-byte hex or array".into()),
-    }
-}
-
-fn parse_log_topics(
-    filter: Option<&serde_json::Map<String, Value>>,
-) -> Result<Vec<Option<Vec<[u8; 32]>>>, String> {
-    match filter.and_then(|m| m.get("topics")) {
-        None | Some(Value::Null) => Ok(Vec::new()),
-        Some(Value::Array(arr)) => {
-            if arr.len() > MAX_LOG_TOPICS {
-                return Err("too many topics (max 4)".into());
-            }
-            let mut out = Vec::with_capacity(arr.len());
-            for t in arr {
-                out.push(parse_topic_spec(t)?);
-            }
-            Ok(out)
-        }
-        Some(_) => Err("topics must be an array".into()),
-    }
-}
-
-fn parse_topic_spec(v: &Value) -> Result<Option<Vec<[u8; 32]>>, String> {
-    match v {
-        Value::Null => Ok(None),
-        Value::String(s) => {
-            let t = decode_hex_fixed::<32>(s).map_err(|_| "topic is not 32 bytes".to_string())?;
-            Ok(Some(vec![t]))
-        }
-        Value::Array(arr) => {
-            let mut ors = Vec::with_capacity(arr.len());
-            for x in arr {
-                let s = x
-                    .as_str()
-                    .ok_or_else(|| "topic is not 32 bytes".to_string())?;
-                ors.push(decode_hex_fixed::<32>(s).map_err(|_| "topic is not 32 bytes")?);
-            }
-            Ok(Some(ors))
-        }
-        _ => Err("topic must be null, 32-byte hex, or array of 32-byte hex".into()),
-    }
-}
-
-fn log_matches(
-    log: &ConsensusLog,
-    addresses: &[[u8; 20]],
-    topics: &[Option<Vec<[u8; 32]>>],
-) -> bool {
-    if !addresses.is_empty() && !addresses.iter().any(|a| a == &log.address) {
-        return false;
-    }
-    if topics.len() > log.topics.len() {
-        return false;
-    }
-    for (i, spec) in topics.iter().enumerate() {
-        let Some(ors) = spec else {
-            continue;
-        };
-        if ors.is_empty() {
-            continue;
-        }
-        if !ors.iter().any(|t| t == &log.topics[i]) {
-            return false;
-        }
-    }
-    true
-}
-
-fn rpc_log_json(
-    log: &ConsensusLog,
-    hdr: &RpcBlockHeader,
-    tx_hash: Option<[u8; 32]>,
-    tx_index: u64,
-    log_index: u64,
-) -> Value {
-    let topics: Vec<Value> = log
-        .topics
-        .iter()
-        .map(|t| json!(format!("0x{}", hex::encode(t))))
-        .collect();
-    json!({
-        "address": format!("0x{}", hex::encode(log.address)),
-        "topics": topics,
-        "data": format!("0x{}", hex::encode(&log.data)),
-        "blockNumber": hdr.number,
-        "blockHash": hdr.hash,
-        "transactionHash": tx_hash.map(|h| format!("0x{}", hex::encode(h))),
-        "transactionIndex": format!("0x{tx_index:x}"),
-        "logIndex": format!("0x{log_index:x}"),
-        "removed": false,
-    })
-}
-
-fn log_filter_block_number(tag: Option<&str>, safe_number: u64, safe_hash: &str) -> Option<u64> {
-    match tag {
-        None | Some("") | Some("latest") | Some("safe") | Some("finalized") => Some(safe_number),
-        Some("pending") | Some("earliest") => None,
-        Some(t) if t.eq_ignore_ascii_case(safe_hash) => Some(safe_number),
-        Some(t) if t.starts_with("0x") || t.starts_with("0X") => {
-            if decode_hex_fixed::<32>(t).is_ok() {
-                None
-            } else {
-                decode_u64(t).ok()
-            }
-        }
-        _ => None,
-    }
-}
-
-fn rpc_block_json(hdr: &RpcBlockHeader, tx_hashes: &[[u8; 32]]) -> Value {
-    let mut v = serde_json::to_value(hdr).unwrap_or(Value::Null);
-    if let Value::Object(map) = &mut v {
-        let txs: Vec<Value> = tx_hashes
-            .iter()
-            .map(|h| json!(format!("0x{}", hex::encode(h))))
-            .collect();
-        map.insert("transactions".into(), Value::Array(txs));
-        map.insert("uncles".into(), json!([]));
-        map.retain(|_, val| !val.is_null());
-    }
-    v
-}
-
-fn parse_tx_index(req: &Value) -> Result<u64, String> {
-    let s = req
-        .get("params")
-        .and_then(Value::as_array)
-        .and_then(|p| p.get(1))
-        .and_then(Value::as_str)
-        .ok_or_else(|| "transaction index required".to_string())?;
-    decode_u64(s).map_err(|e| format!("invalid transaction index: {e}"))
-}
-
-fn parse_storage_keys(v: Option<&Value>) -> Result<Vec<String>, String> {
-    match v {
-        None | Some(Value::Null) => Ok(Vec::new()),
-        Some(Value::Array(a)) => {
-            if a.len() > MAX_PROOF_STORAGE_KEYS {
-                return Err("too many storage keys".into());
-            }
-            let mut out = Vec::with_capacity(a.len());
-            for x in a {
-                let s = x
-                    .as_str()
-                    .ok_or_else(|| "storage key is not a hex quantity".to_string())?;
-                let _ = parse_slot(s)?;
-                out.push(s.to_string());
-            }
-            Ok(out)
-        }
-        Some(_) => Err("storage keys must be an array".into()),
-    }
-}
-
-/// Quantity-style storage key: hex, at most 32 bytes, left-padded. Junk / oversize rejected.
-fn parse_slot(s: &str) -> Result<[u8; 32], String> {
-    if s.is_empty() {
-        return Err("storage key is not a hex quantity".into());
-    }
-    let raw = s.trim_start_matches("0x").trim_start_matches("0X");
-    if !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("storage key is not a hex quantity".into());
-    }
-    if raw.len() > 64 {
-        return Err("storage key is not 32 bytes".into());
-    }
-    let even = if raw.len() % 2 == 1 {
-        format!("0{raw}")
-    } else {
-        raw.to_string()
-    };
-    let bytes = hex::decode(even).map_err(|e| format!("bad slot: {e}"))?;
-    if bytes.len() > 32 {
-        return Err("storage key is not 32 bytes".into());
-    }
-    Ok(pad32(&bytes))
-}
-
-enum AccountField {
-    Balance,
-    Nonce,
-}
-
-pub fn serve(node: Arc<Node>, listen: &str) -> Result<()> {
-    let server = Arc::new(Server::http(listen).map_err(|e| anyhow::anyhow!("bind {listen}: {e}"))?);
-    eprintln!("helios-bsc RPC on http://{listen}  (wallet mode: latest→Safe)");
-    let loopback_only = listen_is_loopback(listen);
-    // Keep Safe inside the proof window while idle (~4 Fermi blocks).
-    let poller = Arc::clone(&node);
-    let _ = std::thread::Builder::new()
-        .name("helios-bsc-sync".into())
-        .spawn(move || loop {
-            std::thread::sleep(Duration::from_millis(1800));
-            // Caught for the same reason as a request: an uncaught panic here ends the
-            // thread, and nothing restarts it. The chain would then only advance on a
-            // request that misses the coalescing window, with no log line saying why.
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| poller.poll_sync())) {
-                Ok(Err(e)) => eprintln!("background sync: {e}"),
-                Err(_) => eprintln!("background sync panicked; poller continues"),
-                Ok(Ok(_)) => {}
-            }
-        });
-
-    let mut workers = Vec::with_capacity(RPC_WORKER_THREADS);
-    for i in 0..RPC_WORKER_THREADS {
-        let server = Arc::clone(&server);
-        let node = Arc::clone(&node);
-        workers.push(
-            std::thread::Builder::new()
-                .name(format!("helios-bsc-rpc-{i}"))
-                .spawn(move || {
-                    // `recv` hands each request to exactly one worker, so the listener
-                    // keeps answering while another worker is blocked in a sync.
-                    while let Ok(req) = server.recv() {
-                        serve_one(&node, req, loopback_only);
-                    }
-                })?,
-        );
-    }
-    for w in workers {
-        let _ = w.join();
-    }
-    Ok(())
-}
-
-fn serve_one(node: &Node, mut req: tiny_http::Request, loopback_only: bool) {
-    let host = req
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv("Host"))
-        .map(|h| h.value.as_str().to_string());
-    if let Some(code) = rpc_http_host_reject(host.as_deref(), loopback_only) {
-        let _ = req.respond(Response::from_string("forbidden host").with_status_code(code));
-        return;
-    }
-    // Metrics is the one GET route, and only when explicitly enabled. It sits
-    // after the Host check so DNS-rebinding protection still applies, and it is
-    // never reachable on the default (metrics-off) build.
-    if req.method() == &Method::Get {
-        let path = req.url().split('?').next().unwrap_or("");
-        if node.metrics_enabled() && path == "/metrics" {
-            let body = node.metrics_text();
-            let mut resp = Response::from_string(body);
-            if let Ok(h) = Header::from_bytes(
-                &b"Content-Type"[..],
-                &b"text/plain; version=0.0.4; charset=utf-8"[..],
-            ) {
-                resp.add_header(h);
-            }
-            let _ = req.respond(resp);
-            return;
-        }
-    }
-    if let Some(code) = rpc_http_reject(req.method() == &Method::Post, 0) {
-        if code == 405 {
-            let _ = req.respond(Response::from_string("POST only").with_status_code(405));
-            return;
-        }
-    }
-    let content_type = req
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv("Content-Type"))
-        .map(|h| h.value.as_str().to_string());
-    if let Some(code) = rpc_http_content_type_reject(content_type.as_deref()) {
-        let _ = req.respond(Response::from_string("unsupported media type").with_status_code(code));
-        return;
-    }
-    let mut buf = Vec::new();
-    let mut limited = req.as_reader().take((MAX_RPC_BODY as u64) + 1);
-    limited.read_to_end(&mut buf).ok();
-    if let Some(code) = rpc_http_reject(true, buf.len()) {
-        let _ = req.respond(Response::from_string("payload too large").with_status_code(code));
-        return;
-    }
-    let out = match node.dispatch_caught(&buf) {
-        Ok(v) => v,
-        Err(RequestPanicked) => {
-            // A panic here used to end the worker: `serve_one` is called from
-            // `while let Ok(req) = server.recv()`, so the thread simply left the loop.
-            // Four of those and the listener accepted connections nobody answered, while
-            // the process stayed up and `/metrics` — which reads only atomics — kept
-            // reporting a healthy client. Silent and total.
-            //
-            // Answering `-32603` keeps the worker in its loop. A panic that poisoned a
-            // state lock will then panic again on the next request and be caught again,
-            // so the failure is a visible per-request error instead of a dead server, and
-            // `helios_bsc_request_panics_total` is there to alert on.
-            let mut resp = Response::from_string(
-                rpc_err(Value::Null, ERR_INTERNAL, "internal_error").to_string(),
-            )
-            .with_status_code(500);
-            if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]) {
-                resp = resp.with_header(h);
-            }
-            let _ = req.respond(resp);
-            return;
-        }
-    };
-    if out.is_null() {
-        let _ = req.respond(Response::from_string("").with_status_code(204));
-        return;
-    }
-    let mut resp = Response::from_string(out.to_string());
-    if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]) {
-        resp = resp.with_header(h);
-    }
-    // Never Access-Control-Allow-Origin: * — a page could then call 127.0.0.1:8545.
-    let _ = req.respond(resp);
-}
-
-/// `None` = accept. `Some(status)` = HTTP error (405 POST-only / 413 body cap).
-pub fn rpc_http_reject(is_post: bool, body_len: usize) -> Option<u16> {
-    if !is_post {
-        return Some(405);
-    }
-    if body_len > MAX_RPC_BODY {
-        return Some(413);
-    }
-    None
-}
-
-/// Missing Content-Type is ok (curl). JSON media types ok. `text/html` etc. → 415.
-pub fn rpc_http_content_type_reject(content_type: Option<&str>) -> Option<u16> {
-    let raw = content_type.map(str::trim).filter(|s| !s.is_empty())?;
-    let media = raw.split(';').next().unwrap_or(raw).trim();
-    let m = media.to_ascii_lowercase();
-    if m == "application/json" || m == "application/json-rpc" || m == "application/jsonrequest" {
-        None
-    } else {
-        Some(415)
-    }
-}
 
 #[cfg(test)]
 mod tests {

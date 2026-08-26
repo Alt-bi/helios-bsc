@@ -33,12 +33,16 @@ sha256sum -c SHA256SUMS --ignore-missing
 Or run the published image, no toolchain and no build:
 
 ```bash
-docker run --rm -p 127.0.0.1:8545:8545 ghcr.io/alt-bi/helios-bsc:latest run --upstream https://bsc-rpc.publicnode.com --listen 0.0.0.0:8545 --allow-non-loopback
+docker run --rm -p 127.0.0.1:8545:8545 ghcr.io/alt-bi/helios-bsc:latest run --upstream https://bsc-mainnet.public.blastapi.io --listen 0.0.0.0:8545 --allow-non-loopback
 ```
 
 `linux/amd64` and `linux/arm64`. The bind flags are explained in
 [docs/deploy.md](docs/deploy.md) — in short, `0.0.0.0` is inside the container and
 `-p 127.0.0.1:` is what keeps it off the network.
+
+The image carries a `HEALTHCHECK`, so `docker ps` tells you whether the head is still
+moving rather than only whether the process is alive. The same probe runs standalone:
+`helios-bsc health` exits 0 while it is, 1 when it is not.
 
 From source instead, if you have Rust:
 
@@ -50,11 +54,19 @@ cargo install --locked --git https://github.com/Alt-bi/helios-bsc helios-bsc
 
 ```bash
 helios-bsc write-checkpoint --upstream https://bsc-rpc.publicnode.com --checkpoint-oracle https://bsc-dataseed.bnbchain.org --block latest --out checkpoint.json
-helios-bsc run --upstream https://bsc-rpc.publicnode.com --checkpoint checkpoint.json
+helios-bsc run --upstream https://bsc-mainnet.public.blastapi.io --backup https://bsc-rpc.publicnode.com --checkpoint checkpoint.json
 ```
 
 Then point MetaMask at `http://127.0.0.1:8545`, chainId **56**. Step-by-step, including
 what each line of output means: **[docs/quickstart.md](docs/quickstart.md)**.
+
+**The two URLs are different on purpose.** `--upstream` has to serve `eth_getProof`
+at a *named block*, because this client proves against a header it sealed itself and
+can never ask an upstream what `latest` means. Plenty of public endpoints serve
+proofs only for the tag — including the one above as a checkpoint source — and on
+those every verified read fails. Which hosts do what is measured in
+[docs/proof-provider-matrix.md](docs/proof-provider-matrix.md); `run` also probes
+its upstream at startup and says so plainly if it cannot serve proofs.
 
 ## What you get, and what you do not
 

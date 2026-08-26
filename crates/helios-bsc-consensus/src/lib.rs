@@ -18,9 +18,10 @@ use thiserror::Error;
 
 pub use finality::{newest_safe, proof_lag, within_proof_window, VerifiedBlock};
 pub use seal::{
-    ecrecover, header_hash, milli_timestamp, recover_signer, unix_now, verify_cascading_vs_parent,
-    verify_extra_layout, verify_header_hash, verify_seal_coinbase, verify_timestamp_not_future,
-    verify_unsealed_fields, SealError, MAX_FUTURE_SKEW_SECS,
+    ecrecover, header_hash, milli_timestamp, recover_signer, seal_hash, unix_now,
+    verify_cascading_vs_parent, verify_extra_layout, verify_header_hash, verify_seal_coinbase,
+    verify_timestamp_not_future, verify_unsealed_fields, SealError, EMPTY_UNCLE_HASH,
+    MAX_FUTURE_SKEW_SECS,
 };
 pub use snapshot::{epoch_seed_at, EpochSeed, Snapshot, SnapshotError};
 pub use vote::{
