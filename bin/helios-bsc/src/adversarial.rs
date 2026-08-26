@@ -3406,3 +3406,234 @@ fn a_reorg_below_every_retained_point_is_refused_with_a_reason() {
         "a failed recovery moved the retained state"
     );
 }
+
+// --- the log cap, and who can act on it ---------------------------------------------
+
+/// A chain whose first `blocks` blocks each carry `per_receipt * receipts` matching logs.
+///
+/// More than one receipt per block because `MAX_RECEIPT_LOGS` is 1024 as well, so a single
+/// receipt cannot on its own carry more logs than `eth_getLogs` is willing to return.
+fn node_with_fat_log_blocks(per_receipt: usize, receipts: usize, blocks: usize) -> Node {
+    let mut chain = distinct_sealer_chain(18);
+    let addr = [0x11u8; 20];
+    let raws: Vec<Vec<u8>> = (0..receipts)
+        .map(|i| {
+            encode_consensus_receipt(&ConsensusReceipt {
+                status: 1,
+                cumulative_gas_used: 21_000 * (i as u64 + 1),
+                logs_bloom: [0u8; 256],
+                logs: (0..per_receipt)
+                    .map(|_| ConsensusLog {
+                        address: addr,
+                        topics: Vec::new(),
+                        data: Vec::new(),
+                    })
+                    .collect(),
+                tx_type: 2,
+            })
+            .unwrap()
+        })
+        .collect();
+    let root = format!("0x{}", hex::encode(ordered_trie_root(&raws)));
+    for block in chain.iter_mut().take(blocks + 1).skip(1) {
+        let mut hdr = header_from_verified(block, [0u8; 32]);
+        hdr.receipts_root = root.clone();
+        let h = header_hash(&hdr).unwrap();
+        hdr.hash = format!("0x{}", hex::encode(h));
+        block.hash = h;
+        block.header = Some(hdr);
+    }
+    let logs_json: Vec<Value> = (0..per_receipt)
+        .map(|_| json!({"address": format!("0x{}", hex::encode(addr)), "topics": [], "data": "0x"}))
+        .collect();
+    let mut up = MockUpstream::for_chain(&chain, json!({}));
+    up.receipts = (0..receipts)
+        .map(|i| {
+            json!({
+                "status": "0x1",
+                "cumulativeGasUsed": format!("0x{:x}", 21_000 * (i as u64 + 1)),
+                "logsBloom": format!("0x{}", hex::encode([0u8; 256])),
+                "type": "0x2",
+                "logs": logs_json,
+            })
+        })
+        .collect();
+    Node::from_parts(Box::new(up), 130, chain)
+}
+
+fn new_log_filter(node: &Node, from: &str) -> Value {
+    let v = node.handle(&req("eth_newFilter", json!([{"fromBlock": from}])));
+    v["result"].clone()
+}
+
+/// A poll that hits the log cap narrows its own span instead of wedging the filter.
+///
+/// `eth_getFilterChanges` does not choose its span -- the cursor does -- so refusing it
+/// used to tell the caller to "narrow the block range", which for a filter is not
+/// something they can do, *and* leave the cursor unmoved so every later poll re-read the
+/// same span and failed identically. The filter stayed stuck until someone re-installed
+/// it. The cursor already supports a poll that stops short, so the fix is to use it.
+#[test]
+fn a_filter_poll_over_the_log_cap_narrows_instead_of_wedging() {
+    // 600 per block: one block is inside the cap, two are over it.
+    let node = node_with_fat_log_blocks(300, 2, 3);
+    let id = new_log_filter(&node, "0x1");
+
+    let first = node.handle(&req("eth_getFilterChanges", json!([id])));
+    let got = first["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("poll must answer, not refuse: {first}"));
+    assert_eq!(got.len(), 600, "one block's worth: {}", got.len());
+    assert!(
+        got.iter().all(|l| l["blockNumber"] == json!("0x1")),
+        "the narrowed span must be the oldest blocks, not the newest"
+    );
+
+    // And the cursor moved over exactly what was read, so the caller catches up rather
+    // than losing the blocks the poll could not fit.
+    let second = node.handle(&req("eth_getFilterChanges", json!([id])));
+    let more = second["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("second poll: {second}"));
+    assert_eq!(more.len(), 600, "{second}");
+    assert!(
+        more.iter().all(|l| l["blockNumber"] == json!("0x2")),
+        "the second poll must resume where the first stopped: {second}"
+    );
+}
+
+/// One block over the cap is the only case a caller really has to act on, so it is the
+/// only case that says so -- and it names something a filter's owner can actually change.
+#[test]
+fn a_single_block_over_the_cap_says_what_can_be_changed() {
+    // 1200 matching logs in one block, split across two receipts.
+    let node = node_with_fat_log_blocks(600, 2, 3);
+    let id = new_log_filter(&node, "0x1");
+
+    let v = node.handle(&req("eth_getFilterChanges", json!([id])));
+    assert_eq!(err_code(&v), ERR_PARAMS, "{v}");
+    let msg = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("single block"),
+        "must say why narrowing stopped: {v}"
+    );
+    assert!(
+        msg.contains("address/topic"),
+        "must name the thing the caller can change: {v}"
+    );
+    assert!(
+        !msg.contains("narrow the block range"),
+        "a filter's owner cannot narrow a range the cursor chose: {v}"
+    );
+    assert!(
+        v["result"].is_null(),
+        "a refusal carries no partial list: {v}"
+    );
+}
+
+/// `eth_getFilterLogs` answers the filter's whole range every time and moves no cursor,
+/// so there is no smaller span to fall back to -- but "narrow the block range" is still
+/// the wrong advice, because the range belongs to a filter that already exists.
+#[test]
+fn get_filter_logs_over_the_cap_points_at_a_new_filter() {
+    let node = node_with_fat_log_blocks(300, 2, 3);
+    let id = node.handle(&req(
+        "eth_newFilter",
+        json!([{"fromBlock":"0x1","toBlock":"0x3"}]),
+    ))["result"]
+        .clone();
+
+    let v = node.handle(&req("eth_getFilterLogs", json!([id])));
+    assert_eq!(err_code(&v), ERR_PARAMS, "{v}");
+    let msg = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("install a new filter"), "{v}");
+    assert!(msg.contains("more than"), "the refusal must say why: {v}");
+}
+
+/// `eth_getLogs` keeps the advice it had: there the caller *did* choose the range.
+#[test]
+fn get_logs_over_the_cap_still_says_narrow_the_range() {
+    let node = node_with_fat_log_blocks(300, 2, 3);
+    let v = node.handle(&req(
+        "eth_getLogs",
+        json!([{"fromBlock":"0x1","toBlock":"0x2"}]),
+    ));
+    assert_eq!(err_code(&v), ERR_PARAMS, "{v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("narrow the block range"),
+        "{v}"
+    );
+}
+
+/// `transactionHash` is derived from the envelope, not echoed -- including when the
+/// upstream never sent one.
+///
+/// The envelope list is bound to the sealed `transactionsRoot`, so its keccak *is* the
+/// transaction hash: a computed fact this client already had in hand. It was used only to
+/// check a label the upstream supplied, so an upstream that omitted the field left a
+/// null on a receipt that could have been labelled -- and left the receipt lookup unable
+/// to match it to the hash it was asked for.
+#[test]
+fn transaction_hash_is_derived_when_the_upstream_omits_it() {
+    let mut chain = distinct_sealer_chain(15);
+    let raw_txs: Vec<Vec<u8>> = vec![vec![0x02, 0xaa, 0xbb]];
+    let tx_hash = keccak256(&raw_txs[0]);
+    let log = ConsensusLog {
+        address: [0x11u8; 20],
+        topics: Vec::new(),
+        data: Vec::new(),
+    };
+    let rec = ConsensusReceipt {
+        status: 1,
+        cumulative_gas_used: 21_000,
+        logs_bloom: [0u8; 256],
+        logs: vec![log],
+        tx_type: 2,
+    };
+    let mut hdr = header_from_verified(&chain[0], [0u8; 32]);
+    hdr.receipts_root = format!(
+        "0x{}",
+        hex::encode(ordered_trie_root(
+            &[encode_consensus_receipt(&rec).unwrap()]
+        ))
+    );
+    hdr.transactions_root = format!("0x{}", hex::encode(ordered_trie_root(&raw_txs)));
+    let hash = header_hash(&hdr).unwrap();
+    hdr.hash = format!("0x{}", hex::encode(hash));
+    chain[0].hash = hash;
+    chain[0].header = Some(hdr);
+
+    let mut up = MockUpstream::for_chain(&chain, json!({}));
+    up.raw_txs = raw_txs;
+    // `eth_getTransactionReceipt` asks the upstream only *which block* to look in; the
+    // answer is then verified against the local chain, so an unverified stub is all this
+    // needs and all it is allowed to contribute.
+    up.unverified = json!({
+        "blockHash": format!("0x{}", hex::encode(hash)),
+        "blockNumber": "0x0",
+    });
+    // No `transactionHash` field at all: the case an upstream is free to serve.
+    up.receipts = vec![json!({
+        "status": "0x1",
+        "cumulativeGasUsed": "0x5208",
+        "logsBloom": format!("0x{}", hex::encode([0u8; 256])),
+        "type": "0x2",
+        "logs": [{"address": format!("0x{}", hex::encode([0x11u8; 20])), "topics": [], "data": "0x"}],
+    })];
+    let node = Node::from_parts(Box::new(up), 130, chain);
+
+    let want = format!("0x{}", hex::encode(tx_hash));
+    let v = node.handle(&req("eth_getBlockReceipts", json!(["latest"])));
+    let r = &v["result"][0];
+    assert_eq!(r["transactionHash"], json!(want), "{v}");
+    // The logs repeat the field, and a receipt whose logs disagree with it is worse than
+    // one that says nothing.
+    assert_eq!(r["logs"][0]["transactionHash"], json!(want), "{v}");
+
+    // And the derived label is what makes the receipt findable by hash at all.
+    let one = node.handle(&req("eth_getTransactionReceipt", json!([want])));
+    assert_eq!(one["result"]["transactionHash"], json!(want), "{one}");
+}

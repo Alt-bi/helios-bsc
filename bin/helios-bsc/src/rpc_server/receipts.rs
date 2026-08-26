@@ -316,6 +316,28 @@ pub(crate) fn rpc_log_json(
     })
 }
 
+/// Stamp a derived transaction hash onto a receipt and every log it carries.
+///
+/// `decorate_receipt_json` runs before the envelopes are bound, so at that point the only
+/// candidate hash is the upstream's own label -- absent whenever the upstream omits it.
+/// Once an envelope has hashed into `transactionsRoot` the hash is a computed fact, and
+/// the receipt's `logs[]` repeat the field, so both have to be written or a caller reads
+/// a receipt whose logs disagree with it.
+fn set_transaction_hash(v: &mut Value, hash: [u8; 32]) {
+    let hex = json!(format!("0x{}", hex::encode(hash)));
+    let Value::Object(map) = v else {
+        return;
+    };
+    map.insert("transactionHash".into(), hex.clone());
+    if let Some(Value::Array(logs)) = map.get_mut("logs") {
+        for log in logs {
+            if let Value::Object(log) = log {
+                log.insert("transactionHash".into(), hex.clone());
+            }
+        }
+    }
+}
+
 pub(crate) fn log_filter_block_number(
     tag: Option<&str>,
     safe_number: u64,
@@ -439,8 +461,15 @@ impl Node {
                         "proof_verification_failed: more receipts than bound transactions".into(),
                     ));
                 };
+                // The envelope is bound to the sealed `transactionsRoot`, so its keccak
+                // *is* the transaction hash -- computed, not believed. Check the claim
+                // when there is one, and use the derived value either way: an upstream
+                // that omits `transactionHash` used to leave the field null on a receipt
+                // this client had everything it needed to label, and the receipt lookup
+                // then could not match it to the hash it was asked for.
+                let derived = keccak256(envelope);
                 if let Some(claimed) = item.tx_hash {
-                    if keccak256(envelope) != claimed {
+                    if derived != claimed {
                         return Err((
                             ERR_PROOF_FAILED,
                             format!(
@@ -449,6 +478,8 @@ impl Node {
                         ));
                     }
                 }
+                item.tx_hash = Some(derived);
+                set_transaction_hash(&mut item.json, derived);
                 // `to` is a field of an envelope now bound to the sealed root, so it can
                 // be read rather than believed. A decode failure cannot come from a lying
                 // upstream here — the list already hashed into `transactionsRoot` — so it

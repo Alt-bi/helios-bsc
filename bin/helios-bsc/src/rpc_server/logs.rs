@@ -14,6 +14,32 @@ const LOG_FETCH_PARALLEL: usize = 4;
 
 const MAX_FILTERS: usize = 64;
 
+/// Why a span of logs produced no list.
+///
+/// The cap is its own variant rather than a message, because two of the three callers
+/// have to act on it and only one of them can act on it the same way. `eth_getLogs` and
+/// `eth_getFilterLogs` are handed a span by their caller and can only refuse; a
+/// `eth_getFilterChanges` poll chose the span itself, from a cursor, and refusing there
+/// wedges the filter forever -- the cursor does not advance, so the next poll re-reads
+/// the same span and fails identically until someone re-creates the filter.
+///
+/// Matching on the message text instead would make a control decision out of a string
+/// nothing pins. `is_link_err` did exactly that and silently stopped detecting reorgs;
+/// the compiler enforces this.
+pub(super) enum LogsError {
+    /// More than [`MAX_GET_LOGS`] matched. The count is deliberately not carried: the
+    /// collection stops at the cap, so the only honest statement is "more than".
+    Capped,
+    /// Anything else, already shaped as a JSON-RPC `(code, message)`.
+    Rpc(i64, String),
+}
+
+impl From<(i64, String)> for LogsError {
+    fn from((code, msg): (i64, String)) -> Self {
+        LogsError::Rpc(code, msg)
+    }
+}
+
 /// Idle time after which a filter is forgotten, matching geth's default.
 const FILTER_TTL: Duration = Duration::from_secs(300);
 
@@ -126,7 +152,14 @@ impl Node {
         };
         match self.collect_logs(&blocks, &addresses, &topics) {
             Ok(out) => rpc_ok(id, Value::Array(out)),
-            Err((code, msg)) => rpc_err(id, code, &msg),
+            Err(LogsError::Capped) => rpc_err(
+                id,
+                ERR_PARAMS,
+                &format!(
+                    "query matched more than {MAX_GET_LOGS} logs; narrow the block range or the address/topic filter"
+                ),
+            ),
+            Err(LogsError::Rpc(code, msg)) => rpc_err(id, code, &msg),
         }
     }
 
@@ -288,10 +321,38 @@ impl Node {
         if cursor > end {
             return rpc_ok(id, json!([]));
         }
-        let end = end.min(cursor.saturating_add(MAX_GET_LOGS_RANGE - 1));
-        let logs = match self.logs_for_span(&filter, cursor, end) {
-            Ok(v) => v,
-            Err((code, msg)) => return rpc_err(id, code, &msg),
+        let mut end = end.min(cursor.saturating_add(MAX_GET_LOGS_RANGE - 1));
+        // A poll does not choose its span -- the cursor does -- so refusing it here told
+        // the caller to do something they had no way to do, and left the cursor where it
+        // was: every later poll re-read the same span and failed identically, and the
+        // filter stayed wedged until someone re-installed it.
+        //
+        // Halving is the answer the cursor was built for. The doc on this method already
+        // promises that a poll stopping short resumes where it left off, so reading fewer
+        // blocks is a supported outcome and not a partial one: the caller catches up over
+        // the next polls. Bounded at seven attempts, since the span starts at most
+        // `MAX_GET_LOGS_RANGE` (128) wide and each try halves it.
+        let logs = loop {
+            match self.logs_for_span(&filter, cursor, end) {
+                Ok(v) => break v,
+                Err(LogsError::Rpc(code, msg)) => return rpc_err(id, code, &msg),
+                Err(LogsError::Capped) if end > cursor => {
+                    end = cursor.saturating_add((end - cursor) / 2);
+                }
+                // One block on its own is over the cap. Nothing is left to narrow, and
+                // this is the only case where the caller really does have to change the
+                // filter -- so it is the only case that says so. Skipping the block
+                // instead would drop logs a caller has no way to learn they missed.
+                Err(LogsError::Capped) => {
+                    return rpc_err(
+                        id,
+                        ERR_PARAMS,
+                        &format!(
+                            "block {cursor} alone matches more than {MAX_GET_LOGS} logs; a poll cannot narrow past a single block, so install a filter with a tighter address/topic filter"
+                        ),
+                    )
+                }
+            }
         };
         let mut store = self.filters.lock().expect("filter lock");
         if let Some(f) = store.map.get_mut(&fid) {
@@ -336,7 +397,18 @@ impl Node {
         }
         match self.logs_for_span(&filter, from, end) {
             Ok(v) => rpc_ok(id, Value::Array(v)),
-            Err((code, msg)) => rpc_err(id, code, &msg),
+            // This method answers the filter's whole range every time and never moves a
+            // cursor, so there is no smaller span to fall back to. Naming the two things
+            // that would actually change the outcome beats "narrow the block range",
+            // which the caller cannot do to a filter that already exists.
+            Err(LogsError::Capped) => rpc_err(
+                id,
+                ERR_PARAMS,
+                &format!(
+                    "filter matched more than {MAX_GET_LOGS} logs over its own range; eth_getFilterLogs always answers the whole range, so install a new filter with a narrower fromBlock/toBlock or a tighter address/topic filter"
+                ),
+            ),
+            Err(LogsError::Rpc(code, msg)) => rpc_err(id, code, &msg),
         }
     }
 
@@ -346,10 +418,10 @@ impl Node {
         filter: &serde_json::Map<String, Value>,
         from: u64,
         to: u64,
-    ) -> Result<Vec<Value>, (i64, String)> {
+    ) -> Result<Vec<Value>, LogsError> {
         let span = to.saturating_sub(from).saturating_add(1);
         if span > MAX_GET_LOGS_RANGE {
-            return Err((
+            return Err(LogsError::Rpc(
                 ERR_PARAMS,
                 format!(
                     "filter span is {span} blocks; this client keeps no log index and serves at most {MAX_GET_LOGS_RANGE}"
@@ -359,8 +431,8 @@ impl Node {
         let mut f = filter.clone();
         f.insert("fromBlock".into(), json!(format!("0x{from:x}")));
         f.insert("toBlock".into(), json!(format!("0x{to:x}")));
-        let addresses = parse_log_addresses(Some(&f)).map_err(|e| (ERR_PARAMS, e))?;
-        let topics = parse_log_topics(Some(&f)).map_err(|e| (ERR_PARAMS, e))?;
+        let addresses = parse_log_addresses(Some(&f)).map_err(|e| LogsError::Rpc(ERR_PARAMS, e))?;
+        let topics = parse_log_topics(Some(&f)).map_err(|e| LogsError::Rpc(ERR_PARAMS, e))?;
         let blocks = self
             .resolve_get_logs_blocks(Value::Null, Some(&f))
             .map_err(|v| {
@@ -369,7 +441,7 @@ impl Node {
                     .as_str()
                     .unwrap_or("filter span unavailable")
                     .to_string();
-                (code, msg)
+                LogsError::Rpc(code, msg)
             })?;
         self.collect_logs(&blocks, &addresses, &topics)
     }
@@ -383,7 +455,7 @@ impl Node {
         blocks: &[VerifiedBlock],
         addresses: &[[u8; 20]],
         topics: &[Option<Vec<[u8; 32]>>],
-    ) -> Result<Vec<Value>, (i64, String)> {
+    ) -> Result<Vec<Value>, LogsError> {
         let mut out = Vec::new();
         for group in blocks.chunks(LOG_FETCH_PARALLEL) {
             // Each block is an independent upstream round trip, so a span is latency-bound
@@ -418,7 +490,7 @@ impl Node {
                 // Answering without them would report "no matching logs here" for a block
                 // nobody checked — a wrong answer rather than a partial one.
                 ReceiptBind::Omitted => {
-                    return Err((
+                    return Err(LogsError::Rpc(
                         ERR_PROOF_FAILED,
                         format!(
                             "proof_verification_failed: upstream served no receipts for block {}, so its logs cannot be proven absent",
@@ -439,12 +511,7 @@ impl Node {
                             // silently short log list is the same defect wearing a
                             // result's clothes. geth refuses the same way.
                             if out.len() >= MAX_GET_LOGS {
-                                return Err((
-                                    ERR_PARAMS,
-                                    format!(
-                                        "query matched more than {MAX_GET_LOGS} logs; narrow the block range or the address/topic filter"
-                                    ),
-                                ));
+                                return Err(LogsError::Capped);
                             }
                             out.push(rpc_log_json(
                                 log,
