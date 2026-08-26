@@ -3,6 +3,9 @@
 //! Serves captured fixtures or mutated/synthetic responses so consensus and
 //! execution verification stay fail-closed on lying headers and proofs.
 
+pub mod sealed;
+pub use sealed::{sealed_chain, SealedChain, SEALED_CHAIN_START};
+
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};

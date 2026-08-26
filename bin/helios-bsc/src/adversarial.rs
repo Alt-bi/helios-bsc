@@ -1,7 +1,7 @@
 //! PR 10: lying upstream through `Node::handle` (no network).
 
 use crate::diff::{diff_vs_oracle, soak_list, SOAK_ADDRESSES};
-use crate::rpc_server::FinalityMode;
+use crate::rpc_server::{FinalityMode, ROLLBACK_EVERY, ROLLBACK_KEEP};
 use crate::sync::{
     confirm_checkpoint_with_oracle, walk_from_checkpoint, walk_from_checkpoint_inturn, walk_headers,
 };
@@ -14,7 +14,8 @@ use helios_bsc_execution::{
 };
 use helios_bsc_mock::{
     cycling_sealer_chain, distinct_sealer_chain, header_from_verified, headers_from_chain, n_seal,
-    relink_dummy_chain, MockRpc, Scenario, WBNB_ADDRESS, WRONG_STATE_ROOT,
+    relink_dummy_chain, sealed_chain, MockRpc, Scenario, SealedChain, WBNB_ADDRESS,
+    WRONG_STATE_ROOT,
 };
 use helios_bsc_rpc::{
     ERR_INVALID, ERR_METHOD, ERR_NOT_SYNCED, ERR_PARAMS, ERR_PARSE, ERR_PROOF_FAILED,
@@ -25,6 +26,10 @@ use helios_bsc_types::{
     decode_hex, decode_hex_fixed, decode_u64, keccak256, Checkpoint, RpcBlockHeader, SafeHead,
 };
 use serde_json::{json, Value};
+
+/// `(tip, headers)` a mock upstream currently serves, swappable behind a lock so a test
+/// can reorg the chain under a node that is already running on it.
+type ServedBranch = std::sync::Arc<std::sync::Mutex<Option<(u64, Vec<RpcBlockHeader>)>>>;
 
 struct MockUpstream {
     tip: u64,
@@ -51,6 +56,10 @@ struct MockUpstream {
     /// from inside `resync_locked`, i.e. while the chain and snapshot locks are held,
     /// which is the case that used to take the whole RPC surface down with it.
     panic_in: Option<&'static str>,
+    /// A branch this upstream switches to, so a test can reorg the chain under a node
+    /// that is already running on the old one. Shared with the test, which sets it
+    /// between two `refresh()` calls; `None` serves `headers` / `tip` above.
+    reorg: ServedBranch,
 }
 
 impl MockUpstream {
@@ -75,6 +84,7 @@ impl MockUpstream {
             raw_txs: Vec::new(),
             block_number_calls: std::sync::Arc::default(),
             panic_in: None,
+            reorg: std::sync::Arc::default(),
         })
     }
 
@@ -94,6 +104,23 @@ impl MockUpstream {
             raw_txs: Vec::new(),
             block_number_calls: std::sync::Arc::default(),
             panic_in: None,
+            reorg: std::sync::Arc::default(),
+        }
+    }
+
+    /// Serve a chain with real Parlia seals, i.e. one the snapshot path will accept.
+    fn for_sealed(sc: &SealedChain) -> Self {
+        let mut up = Self::for_chain(&[], json!({}));
+        up.tip = sc.tip();
+        up.headers = sc.headers.clone();
+        up
+    }
+
+    /// What this upstream currently claims the chain is.
+    fn served(&self) -> (u64, Vec<RpcBlockHeader>) {
+        match self.reorg.lock().expect("reorg lock").as_ref() {
+            Some((tip, headers)) => (*tip, headers.clone()),
+            None => (self.tip, self.headers.clone()),
         }
     }
 }
@@ -102,11 +129,12 @@ impl RpcUpstream for MockUpstream {
     fn block_number(&self) -> Result<u64> {
         self.block_number_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(self.tip)
+        Ok(self.served().0)
     }
 
     fn header_by_number(&self, n: u64) -> Result<RpcBlockHeader> {
-        self.headers
+        self.served()
+            .1
             .iter()
             .chain(self.epoch_headers.iter())
             .find(|h| decode_u64(&h.number).ok() == Some(n))
@@ -116,10 +144,10 @@ impl RpcUpstream for MockUpstream {
 
     fn header_by_hash(&self, hash: &str) -> Result<RpcBlockHeader> {
         let mut h = self
-            .headers
-            .iter()
+            .served()
+            .1
+            .into_iter()
             .find(|h| h.hash.eq_ignore_ascii_case(hash))
-            .cloned()
             .ok_or_else(|| anyhow!("header {hash} missing"))?;
         if self.lie_state_root {
             h.state_root = format!("0x{}", hex::encode(WRONG_STATE_ROOT));
@@ -133,14 +161,14 @@ impl RpcUpstream for MockUpstream {
             "injected panic under the chain lock"
         );
         let mut out: Vec<RpcBlockHeader> = self
-            .headers
-            .iter()
+            .served()
+            .1
+            .into_iter()
             .filter(|h| {
                 decode_u64(&h.number)
                     .ok()
                     .is_some_and(|n| n >= from && n <= to)
             })
-            .cloned()
             .collect();
         out.sort_by_key(|h| decode_u64(&h.number).unwrap_or(0));
         Ok(out)
@@ -3135,4 +3163,246 @@ fn the_dispatcher_agrees_with_the_method_policy_table() {
             ),
         }
     }
+}
+
+// --- reorgs on the checkpoint path -------------------------------------------------
+//
+// This surface had no test at all, and that was not an oversight: until `is_link_err`
+// learned to walk `err.chain()` the recovery branch below `append_new_with_snapshot` had
+// never executed, so there was nothing to write a test against. It could not be tested
+// afterwards either, because reaching it needs two *sealed* branches of the same chain and
+// the mock could only mutate the five captured mainnet headers. `helios_bsc_mock::sealed`
+// is what closes that: synthetic headers with real Parlia seals, so both branches pass
+// `verify_seal_coinbase` on their own merits and a reorg here is two honest chains rather
+// than one honest chain and one broken header.
+
+/// What a `MockUpstream` currently serves, so a test can grow the chain the way a run
+/// grows it -- several syncs -- and then swap the branch under a node that is running.
+#[derive(Clone)]
+struct Branch(ServedBranch);
+
+impl Branch {
+    fn serve(&self, sc: &SealedChain, upto: u64) {
+        let headers: Vec<RpcBlockHeader> = sc
+            .headers
+            .iter()
+            .filter(|h| decode_u64(&h.number).unwrap_or(0) <= upto)
+            .cloned()
+            .collect();
+        *self.0.lock().expect("branch lock") = Some((upto, headers));
+    }
+}
+
+/// A node on the checkpoint path, holding only its checkpoint, plus the branch handle.
+fn sealed_node(sc: &SealedChain) -> (Node, Branch) {
+    let up = MockUpstream::for_sealed(sc);
+    let branch = Branch(up.reorg.clone());
+    let node = Node::from_parts_with_snapshot(
+        Box::new(up),
+        130,
+        vec![sc.root_block().expect("root block")],
+        sc.snapshot().expect("snapshot"),
+        "fermi",
+    );
+    (node, branch)
+}
+
+/// Advance a node a few blocks at a time, so rollback points accumulate the way they do
+/// over real uptime rather than all at once.
+///
+/// The step is a literal and deliberately finer than `ROLLBACK_EVERY`: stepping in units
+/// of the constant would make every measurement below move with it, and a test whose
+/// expectation is derived from the thing it checks cannot notice that thing narrowing.
+const WALK_STEP: u64 = 8;
+
+fn walk_in_steps(node: &Node, branch: &Branch, sc: &SealedChain, to: u64) {
+    // The first sync has to bring enough blocks for a Safe head to exist at all -- 15
+    // distinct sealers -- or `resync_locked` fails before any of this is reached.
+    let mut at = sc.checkpoint.number + u64::from(n_seal());
+    while at < to {
+        branch.serve(sc, at);
+        node.poll_sync()
+            .unwrap_or_else(|e| panic!("sync to {at}: {e:#}"));
+        at += WALK_STEP;
+    }
+    branch.serve(sc, to);
+    node.poll_sync()
+        .unwrap_or_else(|e| panic!("sync to {to}: {e:#}"));
+}
+
+fn header_at(sc: &SealedChain, number: u64) -> &RpcBlockHeader {
+    sc.headers
+        .iter()
+        .find(|h| decode_u64(&h.number).ok() == Some(number))
+        .unwrap_or_else(|| panic!("no header {number}"))
+}
+
+/// The whole point: a reorg arrives, and the node ends up on the winning branch, at its
+/// tip, without a restart and without replaying from the checkpoint it booted with.
+///
+/// Before rollback points there was exactly one way out of here -- `walk_from_checkpoint`
+/// from `self.origin` -- and this node has no origin at all, which is the state every node
+/// built from a running snapshot is in. So the old code could only return the error: chain
+/// stuck on an orphaned branch, process up, every later sync failing identically.
+#[test]
+fn a_reorg_leaves_the_node_on_the_winning_branch_at_its_tip() {
+    let sc = sealed_chain(80).expect("sealed chain");
+    let (node, branch) = sealed_node(&sc);
+    walk_in_steps(&node, &branch, &sc, sc.tip());
+    assert_eq!(node.poll_sync().expect("settled").0, sc.tip());
+
+    // A ten-block reorg replaced by a longer branch, the shape of a real one.
+    let fork_at = sc.tip() - 10;
+    let fork = sc.forked_after(fork_at, 18).expect("fork");
+    branch.serve(&fork, fork.tip());
+
+    let (head, safe) = node.poll_sync().expect("recovery must not fail");
+    assert_eq!(head, fork.tip(), "recovery has to reach the new tip");
+
+    // The head alone would be satisfied by a node that kept the orphaned blocks and
+    // appended to them. Check a block *inside* the reorged range: the node's own Safe
+    // head, which is what every verified read is served against.
+    assert!(
+        safe.number > fork_at,
+        "safe head {} is below the fork point {fork_at}, so this proves nothing",
+        safe.number
+    );
+    assert_eq!(
+        safe.hash.to_ascii_lowercase(),
+        header_at(&fork, safe.number).hash.to_ascii_lowercase(),
+        "the node is serving the losing branch at {}",
+        safe.number
+    );
+}
+
+/// The rewind goes back as far as it has to, not as far as the first guess.
+///
+/// The newest retained point is above the fork here, so it is on the losing branch and its
+/// re-walk fails the parent link exactly as the original sync did. That is the loop being
+/// exercised: a candidate is *tried*, not reasoned about, and the next one back is tried
+/// when it fails.
+#[test]
+fn recovery_walks_back_past_rollback_points_that_lost() {
+    let sc = sealed_chain(80).expect("sealed chain");
+    let (node, branch) = sealed_node(&sc);
+    walk_in_steps(&node, &branch, &sc, sc.tip());
+
+    let before = node.rollback_points();
+    let fork_at = sc.tip() - 30;
+    assert!(
+        before.iter().any(|n| *n > fork_at),
+        "test needs at least one retained point above the fork; had {before:?}"
+    );
+
+    let fork = sc.forked_after(fork_at, 40).expect("fork");
+    branch.serve(&fork, fork.tip());
+    assert_eq!(node.poll_sync().expect("recovery").0, fork.tip());
+
+    // Points above the fork describe the branch that lost. Keeping them would offer a
+    // later recovery a starting state this client has already established is not on the
+    // chain -- and it would fail there silently, one candidate at a time.
+    let after = node.rollback_points();
+    assert!(
+        after.iter().all(|n| *n <= fork_at || *n > sc.tip()),
+        "retained a point from the losing branch: {after:?} (fork at {fork_at})"
+    );
+}
+
+/// Two reorgs in a row, the second below the first, so the second recovery has to use a
+/// point that survived the first one's pruning.
+#[test]
+fn a_second_reorg_below_the_first_still_recovers() {
+    let sc = sealed_chain(80).expect("sealed chain");
+    let (node, branch) = sealed_node(&sc);
+    walk_in_steps(&node, &branch, &sc, sc.tip());
+
+    let first = sc.forked_after(sc.tip() - 8, 20).expect("first fork");
+    branch.serve(&first, first.tip());
+    assert_eq!(node.poll_sync().expect("first recovery").0, first.tip());
+
+    let second = sc.forked_after(sc.tip() - 24, 40).expect("second fork");
+    branch.serve(&second, second.tip());
+    let (head, safe) = node.poll_sync().expect("second recovery");
+    assert_eq!(head, second.tip());
+    assert_eq!(
+        safe.hash.to_ascii_lowercase(),
+        header_at(&second, safe.number).hash.to_ascii_lowercase()
+    );
+}
+
+/// How far back the retained points reach, which is how deep a reorg this client can
+/// absorb without a restart.
+///
+/// Written as a literal, not as `ROLLBACK_EVERY * (ROLLBACK_KEEP - 1)`. The derived form
+/// passes just as happily with either constant cut to a quarter, because the expectation
+/// moves with the thing it is checking -- the same defect as a hand-written test count
+/// nothing verifies. 240 blocks is roughly twelve times `max_reorg_depth()`, about three
+/// minutes of chain, and it costs sixteen `Snapshot` clones.
+#[test]
+fn rollback_points_reach_back_at_least_240_blocks() {
+    const REACH: u64 = 240;
+    /// Memory, not reach: whatever the spacing, the store stays a fixed small size.
+    const MAX_POINTS: usize = 32;
+
+    let sc = sealed_chain(REACH + 64).expect("sealed chain");
+    let (node, branch) = sealed_node(&sc);
+    walk_in_steps(&node, &branch, &sc, sc.tip());
+
+    let points = node.rollback_points();
+    assert!(
+        points.windows(2).all(|w| w[1] > w[0]),
+        "points must be oldest first and distinct: {points:?}"
+    );
+    assert!(
+        points.len() <= MAX_POINTS,
+        "{} retained points is unbounded growth: {points:?}",
+        points.len()
+    );
+    let reach = sc.tip() - points.first().copied().expect("at least one point");
+    assert!(
+        reach >= REACH,
+        "reach shrank to {reach} blocks, below the {REACH} this client promises: {points:?}"
+    );
+    // Sanity: the constants and the literal have to agree, or one of them is stale.
+    assert_eq!(
+        ROLLBACK_EVERY * (ROLLBACK_KEEP as u64 - 1),
+        REACH,
+        "ROLLBACK_EVERY/ROLLBACK_KEEP no longer produce the documented {REACH}-block reach"
+    );
+}
+
+/// A reorg deeper than everything retained is refused, and says why.
+///
+/// This node has no origin checkpoint, so there is no fallback replay: the honest answer
+/// is an error. It has to name the two things an operator cannot otherwise know -- that
+/// rollback points were tried, and that this process cannot replay -- because the
+/// alternative is the raw parent-link error, which reads like a broken upstream.
+#[test]
+fn a_reorg_below_every_retained_point_is_refused_with_a_reason() {
+    let span = ROLLBACK_EVERY * (ROLLBACK_KEEP as u64 + 4);
+    let sc = sealed_chain(span).expect("sealed chain");
+    let (node, branch) = sealed_node(&sc);
+    walk_in_steps(&node, &branch, &sc, sc.tip());
+    let oldest = node
+        .rollback_points()
+        .first()
+        .copied()
+        .expect("retained points");
+    assert!(
+        oldest > sc.checkpoint.number,
+        "the seeded checkpoint point must have aged out for this test to mean anything"
+    );
+
+    let fork = sc.forked_after(oldest - 1, span).expect("deep fork");
+    branch.serve(&fork, fork.tip());
+    let err = format!("{:#}", node.poll_sync().expect_err("must refuse"));
+    assert!(err.contains("rollback point"), "{err}");
+    assert!(err.contains("--checkpoint"), "{err}");
+
+    // Fail-closed: a refused recovery must leave the node on what it had verified, not on
+    // half of a branch it could not finish.
+    assert!(
+        node.rollback_points().iter().all(|n| *n <= sc.tip()),
+        "a failed recovery moved the retained state"
+    );
 }

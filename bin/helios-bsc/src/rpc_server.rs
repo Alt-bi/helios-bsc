@@ -87,6 +87,7 @@ use helios_bsc_types::{
     BSC_MAINNET_CHAIN_ID,
 };
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -103,6 +104,18 @@ pub struct Node {
     max_sync: u64,
     chain: Mutex<Vec<VerifiedBlock>>,
     snapshot: Mutex<Option<Snapshot>>,
+    /// Verified states this client can rewind to when the branch it was following turns
+    /// out to have lost.
+    ///
+    /// Oldest first, one every [`ROLLBACK_EVERY`] blocks. A `Snapshot` is a value: cloning
+    /// one captures the sealing set, the `recents` window and the attestation exactly as
+    /// they stood at that block, which is the entire state a re-walk needs. The chain
+    /// prefix does not have to be stored -- it is already in `chain`, and recovery
+    /// truncates rather than refetches.
+    ///
+    /// Taken only inside `resync_locked`, which already holds `chain` and `snapshot`, so
+    /// the lock order is chain -> snapshot -> rollbacks and no other path can invert it.
+    rollbacks: Mutex<VecDeque<Snapshot>>,
     checkpoint_store: Option<PathBuf>,
     fork_id: String,
     origin: Option<Checkpoint>,
@@ -207,6 +220,18 @@ pub struct RequestPanicked;
 /// scrape is worth having. Fixed and small, so this cannot become a thread-spawn amplifier.
 const RPC_WORKER_THREADS: usize = 4;
 
+/// How far apart retained rollback points are, in blocks.
+pub(crate) const ROLLBACK_EVERY: u64 = 16;
+
+/// How many rollback points are retained.
+///
+/// 16 x 16 = 256 blocks, roughly twelve times `max_reorg_depth()` (21) and comfortably
+/// inside the 512-block window `append_new_with_snapshot` keeps -- a point below that is
+/// useless, because the blocks a rewind would keep have already been dropped. Each entry
+/// is one `Snapshot`: a 21-address validator set, an ~87-entry `recents` map and a
+/// bounded ancestor list, so the whole store is tens of kilobytes.
+pub(crate) const ROLLBACK_KEEP: usize = 16;
+
 impl Node {
     pub fn bootstrap(up: Box<dyn RpcUpstream>, lookback: u64) -> Result<Self> {
         let tip = up.block_number()?;
@@ -221,6 +246,7 @@ impl Node {
             max_sync: lookback,
             chain: Mutex::new(chain),
             snapshot: Mutex::new(None),
+            rollbacks: Mutex::new(VecDeque::new()),
             checkpoint_store: None,
             fork_id: "fermi".into(),
             origin: None,
@@ -307,6 +333,9 @@ impl Node {
             lookback,
             max_sync,
             chain: Mutex::new(chain),
+            // Seeded with the state the walk ended on: recovery has somewhere to rewind
+            // to from the first sync, rather than only after `ROLLBACK_EVERY` blocks.
+            rollbacks: Mutex::new(VecDeque::from([snapshot.clone()])),
             snapshot: Mutex::new(Some(snapshot)),
             checkpoint_store: None,
             fork_id,
@@ -341,6 +370,7 @@ impl Node {
             max_sync: lookback,
             chain: Mutex::new(chain),
             snapshot: Mutex::new(None),
+            rollbacks: Mutex::new(VecDeque::new()),
             checkpoint_store: None,
             fork_id: "fermi".into(),
             origin: None,
@@ -378,6 +408,9 @@ impl Node {
             lookback,
             max_sync: lookback,
             chain: Mutex::new(chain),
+            // Seeded with the state the walk ended on: recovery has somewhere to rewind
+            // to from the first sync, rather than only after `ROLLBACK_EVERY` blocks.
+            rollbacks: Mutex::new(VecDeque::from([snapshot.clone()])),
             snapshot: Mutex::new(Some(snapshot)),
             checkpoint_store: None,
             fork_id: fork_id.into(),
@@ -951,29 +984,12 @@ impl Node {
             match append_new_with_snapshot(self.up.as_ref(), chain, tip, snapshot.as_mut()) {
                 Ok(()) => {}
                 Err(e) if is_link_err(&e) => {
-                    let Some(cp) = self.origin.clone() else {
-                        return Err(e);
-                    };
-                    let cp_number = cp.number;
-                    // `{e:#}` rather than `{e}`: the cause is what says *why* this is a
-                    // reorg, and plain Display prints only the outermost context -- the
-                    // same property that stopped `is_link_err` seeing it at all.
-                    eprintln!("reorg/link break ({e:#}); replay from checkpoint {cp_number}");
-                    let (c, s) = walk_from_checkpoint(self.up.as_ref(), cp, tip, self.max_sync)
-                        .map_err(|replay| {
-                            // The origin checkpoint is fixed at bootstrap and never moves,
-                            // so once the chain has run more than `max_sync` past it this
-                            // replay can no longer reach the tip -- and no later attempt
-                            // will either. Every sync from here fails identically while
-                            // the process stays up, which is a restart, and the operator
-                            // has to be told that rather than left reading a repeat.
-                            let behind = tip.saturating_sub(cp_number);
-                            anyhow::anyhow!("reorg recovery failed: {replay:#}. The replay starts at the checkpoint this process booted from ({cp_number}), now {behind} blocks behind the tip; nothing recovers that in place. Write a fresh checkpoint and restart.")
-                        })?;
-                    *chain = c;
-                    *snapshot = Some(s);
+                    self.recover_from_link_break(chain, snapshot, tip, e)?
                 }
                 Err(e) => return Err(e),
+            }
+            if let Some(s) = snapshot.as_ref() {
+                self.record_rollback(s, chain.first().map(|b| b.number).unwrap_or(0));
             }
             let new_last = chain.last().map(|b| b.number).unwrap_or(0);
             grew = new_last > last;
@@ -1005,6 +1021,157 @@ impl Node {
         let conf_safe = safe_of(chain)?;
         let head = self.read_head(chain, snapshot.as_ref(), &conf_safe);
         Ok((head, conf_safe, verified_this, grew))
+    }
+
+    /// Rewind to the newest verified state the canonical chain still contains, and walk
+    /// forward from there.
+    ///
+    /// Recovery used to have exactly one starting point: the checkpoint this process
+    /// booted from, fixed at bootstrap and never moved. That works for the first
+    /// `max_sync` blocks of uptime -- about two hours at the default -- and after that
+    /// `walk_from_checkpoint` refuses the lag outright and no later attempt can do better,
+    /// because the thing it starts from only ever gets further away. A reorg past that
+    /// point left the process up, on an orphaned branch, answering `-32003` until someone
+    /// restarted it: exactly the failure a month-long run is meant to survive.
+    ///
+    /// So the client keeps its own rollback points as it goes. Each candidate is *tried*
+    /// rather than reasoned about: the chain is truncated to the point, the retained
+    /// snapshot is restored, and the walk forward re-runs the same parent-link, cascading
+    /// and seal checks as any other sync. A point that was itself on the losing branch
+    /// fails that walk at its first header, and the next one back is tried. Nothing is
+    /// committed until a walk succeeds, so a failed recovery leaves the node exactly as it
+    /// was -- the same discipline as `append_new_with_snapshot`, and for the same reason.
+    fn recover_from_link_break(
+        &self,
+        chain: &mut Vec<VerifiedBlock>,
+        snapshot: &mut Option<Snapshot>,
+        tip: u64,
+        err: anyhow::Error,
+    ) -> Result<()> {
+        // `{err:#}` rather than `{err}`: the cause is what says *why* this is a reorg, and
+        // plain Display prints only the outermost context -- the same property that
+        // stopped `is_link_err` seeing it at all.
+        eprintln!("reorg/link break ({err:#})");
+        let points: Vec<Snapshot> = {
+            let rb = self.rollbacks.lock().expect("rollback lock");
+            rb.iter().rev().cloned().collect()
+        };
+        let head = chain.last().map(|b| b.number).unwrap_or(0);
+        let floor = chain.first().map(|b| b.number).unwrap_or(0);
+        let mut tried = 0usize;
+        for point in points {
+            // Below the chain's own window there is nothing to rewind to: `KEEP` has
+            // already dropped the blocks a truncation would have kept.
+            if point.number < floor || point.number > tip {
+                continue;
+            }
+            let mut candidate: Vec<VerifiedBlock> = chain
+                .iter()
+                .take_while(|b| b.number <= point.number)
+                .cloned()
+                .collect();
+            // A snapshot describes the state *after* its own block, so the prefix has to
+            // end exactly there, or the walk would check the next header against the
+            // wrong parent.
+            if candidate.last().map(|b| b.number) != Some(point.number) {
+                continue;
+            }
+            let mut restored = point.clone();
+            tried += 1;
+            match append_new_with_snapshot(
+                self.up.as_ref(),
+                &mut candidate,
+                tip,
+                Some(&mut restored),
+            ) {
+                Ok(()) => {
+                    eprintln!(
+                        "reorg recovered: rewound {} block(s) to {} and re-walked to {tip}",
+                        head.saturating_sub(point.number),
+                        point.number
+                    );
+                    *chain = candidate;
+                    *snapshot = Some(restored);
+                    // Every point above the fork describes the branch that lost. Keeping
+                    // them would offer a later recovery a starting state this client has
+                    // just established is not on the chain.
+                    let mut rb = self.rollbacks.lock().expect("rollback lock");
+                    while rb.back().is_some_and(|s| s.number > point.number) {
+                        rb.pop_back();
+                    }
+                    return Ok(());
+                }
+                // This point was on the losing branch as well: go further back.
+                Err(again) if is_link_err(&again) => continue,
+                // Not a fork. A transport or seal failure would meet every older point the
+                // same way, so stop here and leave the node untouched.
+                Err(other) => return Err(other),
+            }
+        }
+        let span = ROLLBACK_EVERY.saturating_mul(ROLLBACK_KEEP as u64);
+        let Some(cp) = self.origin.clone() else {
+            return Err(err.context(format!(
+                "reorg recovery: {tried} rollback point(s) tried and none was on the canonical chain, and this process booted without a --checkpoint to replay from"
+            )));
+        };
+        let cp_number = cp.number;
+        eprintln!("no usable rollback point ({tried} tried); replay from checkpoint {cp_number}");
+        let (c, s) =
+            walk_from_checkpoint(self.up.as_ref(), cp, tip, self.max_sync).map_err(|replay| {
+                // Reached only when the reorg is deeper than everything retained, which on
+                // this chain means something considerably worse than a reorg. The origin
+                // checkpoint does not move, so once uptime has carried the chain more than
+                // `max_sync` past it this replay cannot reach the tip and no later attempt
+                // will either: every sync from here fails identically while the process
+                // stays up. That is a restart, and the operator has to be told so rather
+                // than left reading the same line repeat.
+                let behind = tip.saturating_sub(cp_number);
+                anyhow::anyhow!("reorg recovery failed: {replay:#}. {tried} rollback point(s) covering up to {span} blocks were tried first and none was on the canonical chain. The fallback replays from the checkpoint this process booted from ({cp_number}), now {behind} blocks behind the tip; nothing recovers that in place. Write a fresh checkpoint and restart.")
+            })?;
+        *chain = c;
+        *snapshot = Some(s);
+        // The replay established a different chain; nothing retained describes it.
+        self.rollbacks.lock().expect("rollback lock").clear();
+        Ok(())
+    }
+
+    /// Block numbers of the retained rollback points, oldest first.
+    ///
+    /// `pub(crate)` for the reorg tests. How deep a reorg this client can absorb without a
+    /// restart is decided entirely by the retention arithmetic below, and a test that only
+    /// watched a recovery succeed would not notice that arithmetic quietly narrowing.
+    #[cfg(test)]
+    pub(crate) fn rollback_points(&self) -> Vec<u64> {
+        self.rollbacks
+            .lock()
+            .expect("rollback lock")
+            .iter()
+            .map(|s| s.number)
+            .collect()
+    }
+
+    /// Retain the current verified state as a rollback point, every [`ROLLBACK_EVERY`]
+    /// blocks.
+    ///
+    /// `chain_floor` is the oldest block the chain still holds. Points below it are
+    /// dropped rather than kept as dead weight: recovery truncates the live chain to a
+    /// point, and it cannot truncate to a block that has already been aged out.
+    fn record_rollback(&self, snapshot: &Snapshot, chain_floor: u64) {
+        let mut rb = self.rollbacks.lock().expect("rollback lock");
+        while rb.front().is_some_and(|s| s.number < chain_floor) {
+            rb.pop_front();
+        }
+        let due = match rb.back() {
+            Some(newest) => snapshot.number >= newest.number.saturating_add(ROLLBACK_EVERY),
+            None => true,
+        };
+        if !due {
+            return;
+        }
+        rb.push_back(snapshot.clone());
+        while rb.len() > ROLLBACK_KEEP {
+            rb.pop_front();
+        }
     }
 
     /// JSON-RPC 2.0 envelope: single object, batch array, or parse error.
