@@ -49,10 +49,20 @@ warns; with one, a checkpoint they disagree on is never written.
 
 A checkpoint goes stale in 24 h. Write a new one when you restart after a long gap.
 
+**The next command uses a different `--upstream`, and that is not a typo.**
+Writing a checkpoint needs headers, which almost any endpoint serves. Running needs
+`eth_getProof` **at a named block**, and that is where public providers divide: many
+answer only for the tag `latest`. This client can never use that tag — proving
+against `latest` would mean asking the upstream which block it is, which is the one
+thing it exists not to do — so on a tag-only provider every verified read fails, at
+any lag, under any finality setting. `bsc-rpc.publicnode.com` is one of those; it is
+an excellent checkpoint oracle and data-plane backup, and cannot be the proof
+upstream. See [proof-provider-matrix.md](proof-provider-matrix.md).
+
 ## 3. Run it
 
 ```bash
-helios-bsc run --upstream https://bsc-rpc.publicnode.com --checkpoint checkpoint.json
+helios-bsc run --upstream https://bsc-mainnet.public.blastapi.io --backup https://bsc-rpc.publicnode.com --checkpoint checkpoint.json
 ```
 
 ```

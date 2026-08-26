@@ -47,7 +47,9 @@ pub(crate) use receipts::*;
 pub(crate) use state::*;
 pub(crate) use validate::*;
 
-use crate::bind::{listen_is_loopback, rpc_http_host_reject};
+use crate::bind::{
+    listen_is_loopback, proof_refused_warning, rpc_http_host_reject, tag_only_upstream_warning,
+};
 use crate::sync::{
     accept_lookback_resync, append_new, append_new_with_snapshot, is_link_err, safe_of,
     walk_from_checkpoint, walk_headers, write_checkpoint_file,
@@ -461,6 +463,62 @@ impl Node {
             .expect("snapshot lock")
             .as_ref()
             .is_some_and(Snapshot::fast_finality_available)
+    }
+
+    /// One `eth_getProof` at the read head, to find out at startup what an operator
+    /// currently finds out on their first `eth_getBalance`.
+    ///
+    /// Providers split into those that serve `eth_getProof` at a **named block** and
+    /// those that only serve it for the tag `latest` — `docs/proof-provider-matrix.md`
+    /// measures which. This client can never use the tag: the whole point is to prove
+    /// against a header it sealed itself, and `latest` on the upstream is whatever that
+    /// upstream says it is. So a tag-only provider cannot serve this client at all, at
+    /// any lag, under any finality rule.
+    ///
+    /// Without this probe that surfaces as `proof_verification_failed` on the first
+    /// balance read, wrapped in two retries and a backup attempt, with the real cause —
+    /// `-32602 distance to target block exceeds maximum proof window` — somewhere in the
+    /// middle of the string. It reads like a fault in this client. It is a provider that
+    /// was never going to work.
+    ///
+    /// A warning, not a refusal: a provider having a bad minute at startup must not stop
+    /// a client that would serve fine once it recovers.
+    pub fn proof_capability_warning(&self) -> Option<String> {
+        // The published view is empty until the first `refresh`, and at startup that has
+        // not happened yet -- reading it and giving up is how this probe spent its first
+        // live run printing nothing at all. Sync first if there is nothing published.
+        let published = self
+            .finality
+            .lock()
+            .expect("finality lock")
+            .read_head
+            .clone();
+        let head = match published {
+            Some(h) => h,
+            None => match self.poll_sync() {
+                Ok((_, safe)) => safe,
+                // No head means nothing to prove against, and the operator already has a
+                // louder error than this one.
+                Err(_) => return None,
+            },
+        };
+        // Address zero: every node has it, it needs no fixture, and a verified exclusion
+        // is as good an answer as any. This asks whether the provider will answer at a
+        // named block at all, not what the answer is.
+        let zero = "0x0000000000000000000000000000000000000000";
+        let err = match self.up.get_proof(zero, &format!("0x{:x}", head.number)) {
+            Ok(_) => return None,
+            Err(e) => e.to_string(),
+        };
+        let lag = proof_lag(self.last_tip.load(Ordering::Relaxed), head.number);
+        let at = format!("its own verified head {} (lag {lag})", head.number);
+        // If the tag works where the number does not, the provider is tag-only and no
+        // amount of waiting, retrying or shortening the lag will help. Say that outright
+        // rather than leaving the operator to tune a knob that cannot reach.
+        if self.up.get_proof(zero, "latest").is_ok() {
+            return Some(tag_only_upstream_warning(&at, &err));
+        }
+        Some(proof_refused_warning(&at, &err))
     }
 
     pub fn metrics_enabled(&self) -> bool {

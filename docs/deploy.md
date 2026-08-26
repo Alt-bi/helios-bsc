@@ -8,8 +8,12 @@ Released tags are pushed to the GitHub Container Registry for `linux/amd64` and
 `linux/arm64`, so nothing is built locally:
 
 ```bash
-docker run --rm -p 127.0.0.1:8545:8545 ghcr.io/alt-bi/helios-bsc:latest run --upstream https://bsc-rpc.publicnode.com --listen 0.0.0.0:8545 --allow-non-loopback
+docker run --rm -p 127.0.0.1:8545:8545 ghcr.io/alt-bi/helios-bsc:latest run --upstream https://bsc-mainnet.public.blastapi.io --listen 0.0.0.0:8545 --allow-non-loopback
 ```
+
+The upstream must serve `eth_getProof` at a *named block*, not only for the tag
+`latest` — see [proof-provider-matrix.md](proof-provider-matrix.md), and the startup
+probe that tells you when it does not.
 
 `--listen 0.0.0.0` is what the process binds **inside** the container, where Docker NAT is
 not loopback. `-p 127.0.0.1:8545:8545` is what makes that safe: the port reaches the host
