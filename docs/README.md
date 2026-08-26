@@ -30,7 +30,6 @@ Organised by what you came here to do.
 | [hardfork-table.md](hardfork-table.md) | Fork schedule and Parlia constants, pinned to a `bnb-chain/bsc` commit |
 | [proof-provider-matrix.md](proof-provider-matrix.md) | Which RPC providers can actually serve `eth_getProof`, measured |
 | [../fixtures/mainnet/README.md](../fixtures/mainnet/README.md) | The pinned mainnet headers and signed envelopes the test suite runs against, and how to capture more |
-
 | [engineering-log.md](engineering-log.md) | How each non-obvious item was found, closed and checked — the maintainer's record |
 
 Also: [STATUS.md](../STATUS.md) for where the project is today, and
