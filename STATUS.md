@@ -14,7 +14,7 @@ in CI against live mainnet.
 
 | | |
 |---|---|
-| Verified reads | balances, nonces, code, storage, `eth_call`, `eth_estimateGas`, headers, receipts, logs and log filters over ranges up to 128 blocks |
+| Verified reads | balances, nonces, code, storage, `eth_call`, `eth_estimateGas`, headers, receipts, logs and log filters over ranges up to 128 blocks (≤1024 matches, else refused) |
 | Read head | BLS-finalized, ~2 blocks behind the tip (falls back to ~110 without vote keys) |
 | History | ~112 blocks; not an archive node |
 | Tests | 427, plus an adversarial in-process lying upstream |

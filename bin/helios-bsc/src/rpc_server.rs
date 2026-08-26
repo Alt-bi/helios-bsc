@@ -2298,7 +2298,21 @@ impl Node {
                 let mut log_index: u64 = 0;
                 for (tx_i, rec) in receipts.iter().enumerate() {
                     for log in &rec.logs {
-                        if log_matches(log, addresses, topics) && out.len() < MAX_GET_LOGS {
+                        if log_matches(log, addresses, topics) {
+                            // Truncating here would hand back a list that looks complete
+                            // and is not: a caller reading 1024 transfers has no way to
+                            // learn a 1025th matched. Everywhere else this client answers
+                            // "I cannot prove that" rather than a plausible number, and a
+                            // silently short log list is the same defect wearing a
+                            // result's clothes. geth refuses the same way.
+                            if out.len() >= MAX_GET_LOGS {
+                                return Err((
+                                    ERR_PARAMS,
+                                    format!(
+                                        "query matched more than {MAX_GET_LOGS} logs; narrow the block range or the address/topic filter"
+                                    ),
+                                ));
+                            }
                             out.push(rpc_log_json(
                                 log,
                                 &header,
@@ -2310,9 +2324,6 @@ impl Node {
                         log_index = log_index.saturating_add(1);
                     }
                 }
-            }
-            if out.len() >= MAX_GET_LOGS {
-                break;
             }
         }
         Ok(out)
