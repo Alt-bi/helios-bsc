@@ -40,6 +40,10 @@ docker run --rm -p 127.0.0.1:8545:8545 ghcr.io/alt-bi/helios-bsc:latest run --up
 [docs/deploy.md](docs/deploy.md) — in short, `0.0.0.0` is inside the container and
 `-p 127.0.0.1:` is what keeps it off the network.
 
+The image carries a `HEALTHCHECK`, so `docker ps` tells you whether the head is still
+moving rather than only whether the process is alive. The same probe runs standalone:
+`helios-bsc health` exits 0 while it is, 1 when it is not.
+
 From source instead, if you have Rust:
 
 ```bash
