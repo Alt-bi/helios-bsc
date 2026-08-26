@@ -2531,6 +2531,82 @@ fn get_logs_serves_a_range_inside_the_verified_window() {
     assert_eq!(none["result"], json!([]), "{none}");
 }
 
+/// More matches than the cap is a refusal, never a short list that looks complete.
+///
+/// A caller reading 1024 transfers has no way to learn that a 1025th matched. Silently
+/// truncating is the same defect this client refuses everywhere else -- answering with a
+/// plausible number instead of saying it cannot answer -- and geth refuses the same way.
+#[test]
+fn more_logs_than_the_cap_is_refused_not_truncated() {
+    let mut chain = distinct_sealer_chain(18);
+    let addr = [0x11u8; 20];
+    // Two blocks of 600 matching logs each: 1200 > MAX_GET_LOGS.
+    let per_block = 600;
+    let rec = ConsensusReceipt {
+        status: 1,
+        cumulative_gas_used: 21_000,
+        logs_bloom: [0u8; 256],
+        logs: (0..per_block)
+            .map(|_| ConsensusLog {
+                address: addr,
+                topics: Vec::new(),
+                data: Vec::new(),
+            })
+            .collect(),
+        tx_type: 2,
+    };
+    let root = format!(
+        "0x{}",
+        hex::encode(ordered_trie_root(
+            &[encode_consensus_receipt(&rec).unwrap()]
+        ))
+    );
+    for block in chain.iter_mut().take(3).skip(1) {
+        let mut hdr = header_from_verified(block, [0u8; 32]);
+        hdr.receipts_root = root.clone();
+        let h = header_hash(&hdr).unwrap();
+        hdr.hash = format!("0x{}", hex::encode(h));
+        block.hash = h;
+        block.header = Some(hdr);
+    }
+    let logs_json: Vec<Value> = (0..per_block)
+        .map(|_| json!({"address": format!("0x{}", hex::encode(addr)), "topics": [], "data": "0x"}))
+        .collect();
+    let mut up = MockUpstream::for_chain(&chain, json!({}));
+    up.receipts = vec![json!({
+        "status": "0x1",
+        "cumulativeGasUsed": "0x5208",
+        "logsBloom": format!("0x{}", hex::encode([0u8; 256])),
+        "type": "0x2",
+        "logs": logs_json,
+    })];
+    let node = Node::from_parts(Box::new(up), 130, chain);
+
+    // One block is inside the cap and answers normally.
+    let one = node.handle(&req(
+        "eth_getLogs",
+        json!([{"fromBlock":"0x1","toBlock":"0x1"}]),
+    ));
+    assert_eq!(
+        one["result"].as_array().map(Vec::len),
+        Some(per_block),
+        "{one}"
+    );
+
+    // Two blocks exceed it, and that must be an error rather than the first 1024.
+    let two = node.handle(&req(
+        "eth_getLogs",
+        json!([{"fromBlock":"0x1","toBlock":"0x2"}]),
+    ));
+    assert_eq!(err_code(&two), ERR_PARAMS, "{two}");
+    let msg = two["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("more than"), "the refusal must say why: {two}");
+    assert!(
+        two["result"].is_null(),
+        "a refusal must not also carry a partial list: {two}"
+    );
+}
+
 /// The span cap, the inverted range and reaching outside the verified chain.
 #[test]
 fn get_logs_range_limits() {
