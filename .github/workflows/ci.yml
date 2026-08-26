@@ -200,3 +200,9 @@ jobs:
         # checker or one-row diff catches that. This does, and it found a second one in
         # docs/README.md the moment it was written.
         run: python3 scripts/check_markdown_tables.py
+      - name: The audit scope figure still matches the code
+        # The size of the trust surface is quoted where a reader cannot check it against
+        # the code, and it had drifted about 20% before anyone noticed -- a figure nobody
+        # re-measures is a figure that quietly becomes false. The band is 5% so this
+        # reports real drift rather than firing on ordinary growth.
+        run: python3 scripts/audit_scope.py --check 13600
