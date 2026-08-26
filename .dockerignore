@@ -1,4 +1,10 @@
+# Only the root target was listed. Git worktrees under .claude carry their own,
+# and one of them measured 8.8 GB -- all of it sent to the daemon as build
+# context on `docker build .` from the main checkout. Match every target, and
+# exclude the agent/tooling state outright the way .gitignore already does.
 /target
+**/target
+.claude
 .git
 .github
 .env
