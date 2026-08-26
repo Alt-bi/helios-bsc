@@ -957,22 +957,137 @@ fn get_block_prefers_stored_header_over_lying_refetch() {
 }
 
 #[test]
-fn filters_and_subscribe_unsupported() {
+fn subscribe_and_pending_filters_stay_unsupported() {
     let (chain, rpc) = safe_chain_with_fixture_root();
     let node = node_from_chain(chain, rpc.proof_json());
+    // Pub/sub needs a WebSocket transport this server does not have, and a
+    // pending-transaction filter would have to report unmined state, which cannot be
+    // proven from a sealed header.
     for m in [
-        "eth_newFilter",
-        "eth_newBlockFilter",
         "eth_subscribe",
-        "eth_getFilterChanges",
-        "eth_newPendingTransactionFilter",
-        "eth_uninstallFilter",
-        "eth_getFilterLogs",
         "eth_unsubscribe",
+        "eth_newPendingTransactionFilter",
     ] {
         let v = node.handle(&req(m, json!([])));
         assert_eq!(err_code(&v), ERR_METHOD, "{m}: {v}");
     }
+}
+
+/// A log filter polls the same verified source `eth_getLogs` reads, and its cursor only
+/// advances over blocks that were actually read.
+#[test]
+fn log_filter_polls_and_advances() {
+    let mut chain = distinct_sealer_chain(18);
+    let addr = [0x11u8; 20];
+    let topic = [0x22u8; 32];
+    let rec = ConsensusReceipt {
+        status: 1,
+        cumulative_gas_used: 21_000,
+        logs_bloom: [0u8; 256],
+        logs: vec![ConsensusLog {
+            address: addr,
+            topics: vec![topic],
+            data: vec![0xAB],
+        }],
+        tx_type: 2,
+    };
+    let root = format!(
+        "0x{}",
+        hex::encode(ordered_trie_root(
+            &[encode_consensus_receipt(&rec).unwrap()]
+        ))
+    );
+    for block in chain.iter_mut().take(4) {
+        let mut hdr = header_from_verified(block, [0u8; 32]);
+        hdr.receipts_root = root.clone();
+        let h = header_hash(&hdr).unwrap();
+        hdr.hash = format!("0x{}", hex::encode(h));
+        block.hash = h;
+        block.header = Some(hdr);
+    }
+    let mut up = MockUpstream::for_chain(&chain, json!({}));
+    up.receipts = vec![json!({
+        "status": "0x1",
+        "cumulativeGasUsed": "0x5208",
+        "logsBloom": format!("0x{}", hex::encode([0u8; 256])),
+        "type": "0x2",
+        "logs": [{
+            "address": format!("0x{}", hex::encode(addr)),
+            "topics": [format!("0x{}", hex::encode(topic))],
+            "data": "0xab",
+        }],
+    })];
+    let node = Node::from_parts(Box::new(up), 130, chain);
+
+    let made = node.handle(&req(
+        "eth_newFilter",
+        json!([{"fromBlock":"0x0","address":format!("0x{}", hex::encode(addr))}]),
+    ));
+    let fid = made["result"].as_str().unwrap_or_else(|| panic!("{made}"));
+
+    // Safe is block 3, so the open-ended filter drains blocks 0..=3 on the first poll.
+    let first = node.handle(&req("eth_getFilterChanges", json!([fid])));
+    let logs = first["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{first}"));
+    assert_eq!(logs.len(), 4, "one log per block up to Safe: {first}");
+
+    // Nothing new since: the cursor moved past what it read.
+    let second = node.handle(&req("eth_getFilterChanges", json!([fid])));
+    assert_eq!(second["result"], json!([]), "{second}");
+
+    // getFilterLogs re-reads the whole span and does not disturb the cursor.
+    let all = node.handle(&req("eth_getFilterLogs", json!([fid])));
+    assert_eq!(all["result"].as_array().map(Vec::len), Some(4), "{all}");
+    let after = node.handle(&req("eth_getFilterChanges", json!([fid])));
+    assert_eq!(after["result"], json!([]), "{after}");
+
+    // Uninstall is idempotent in the sense that the second answer is false, not an error.
+    let gone = node.handle(&req("eth_uninstallFilter", json!([fid])));
+    assert_eq!(gone["result"], json!(true), "{gone}");
+    let again = node.handle(&req("eth_uninstallFilter", json!([fid])));
+    assert_eq!(again["result"], json!(false), "{again}");
+    let dead = node.handle(&req("eth_getFilterChanges", json!([fid])));
+    assert_eq!(err_code(&dead), ERR_PARAMS, "{dead}");
+}
+
+/// A malformed filter fails when it is created, not on a poll minutes later.
+#[test]
+fn a_bad_filter_is_refused_at_creation() {
+    let chain = distinct_sealer_chain(18);
+    let node = node_from_chain(chain, json!({}));
+    for bad in [
+        json!([{"address": "0x1234"}]),
+        json!([{"topics": "not-an-array"}]),
+        json!([{"blockHash": format!("0x{}", "11".repeat(32))}]),
+        json!(["not-an-object"]),
+    ] {
+        let v = node.handle(&req("eth_newFilter", bad.clone()));
+        assert_eq!(err_code(&v), ERR_PARAMS, "{bad}: {v}");
+    }
+    // An unknown id is a clean refusal, never someone else's results.
+    let v = node.handle(&req("eth_getFilterChanges", json!(["0xdead"])));
+    assert_eq!(err_code(&v), ERR_PARAMS, "{v}");
+    let bad_id = node.handle(&req("eth_getFilterChanges", json!(["zzz"])));
+    assert_eq!(err_code(&bad_id), ERR_PARAMS, "{bad_id}");
+}
+
+/// A block filter reports what is verified after it was created, not the backlog.
+#[test]
+fn block_filter_starts_empty_and_reports_new_heads() {
+    let chain = distinct_sealer_chain(18);
+    let node = node_from_chain(chain, json!({}));
+    let made = node.handle(&req("eth_newBlockFilter", json!([])));
+    let fid = made["result"].as_str().unwrap_or_else(|| panic!("{made}"));
+    let first = node.handle(&req("eth_getFilterChanges", json!([fid])));
+    assert_eq!(
+        first["result"],
+        json!([]),
+        "a fresh block filter has no backlog: {first}"
+    );
+    // eth_getFilterLogs is for log filters only.
+    let wrong = node.handle(&req("eth_getFilterLogs", json!([fid])));
+    assert_eq!(err_code(&wrong), ERR_PARAMS, "{wrong}");
 }
 
 #[test]

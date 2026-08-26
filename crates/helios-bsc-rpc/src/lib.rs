@@ -91,12 +91,16 @@ pub fn method_policy(method: &str) -> MethodPolicy {
         | "eth_feeHistory"
         | "eth_blobBaseFee" => MethodPolicy::Unverified,
         "helios_bsc_syncStatus" | "helios_bsc_getVerificationStatus" => MethodPolicy::Verified,
+        // Poll-based filters are served from `receiptsRoot`-bound receipts, the same
+        // source as `eth_getLogs`. Pending-transaction filters are not: there is no
+        // mempool here and nothing unmined can be proven.
         "eth_newFilter"
         | "eth_newBlockFilter"
-        | "eth_newPendingTransactionFilter"
         | "eth_uninstallFilter"
         | "eth_getFilterChanges"
-        | "eth_getFilterLogs"
+        | "eth_getFilterLogs" => MethodPolicy::Verified,
+        // `eth_subscribe` needs a WebSocket transport; this server is HTTP POST only.
+        "eth_newPendingTransactionFilter"
         | "eth_subscribe"
         | "eth_unsubscribe"
         | "eth_sendTransaction"
@@ -195,12 +199,20 @@ mod tests {
         assert_eq!(method_policy("eth_call"), MethodPolicy::Verified);
         assert_eq!(method_policy("eth_estimateGas"), MethodPolicy::Verified);
         assert!(!unverified_passthrough_ok("eth_estimateGas"));
-        assert_eq!(method_policy("eth_newFilter"), MethodPolicy::Unsupported);
-        assert_eq!(method_policy("eth_subscribe"), MethodPolicy::Unsupported);
+        // Filters are served from receiptsRoot-bound receipts, the same source as
+        // eth_getLogs. Pending-transaction filters and eth_subscribe are not.
+        assert_eq!(method_policy("eth_newFilter"), MethodPolicy::Verified);
         assert_eq!(
             method_policy("eth_getFilterChanges"),
+            MethodPolicy::Verified
+        );
+        assert_eq!(method_policy("eth_getFilterLogs"), MethodPolicy::Verified);
+        assert_eq!(method_policy("eth_uninstallFilter"), MethodPolicy::Verified);
+        assert_eq!(
+            method_policy("eth_newPendingTransactionFilter"),
             MethodPolicy::Unsupported
         );
+        assert_eq!(method_policy("eth_subscribe"), MethodPolicy::Unsupported);
         assert!(!unverified_passthrough_ok("eth_getLogs"));
         assert!(!unverified_passthrough_ok("eth_getBlockReceipts"));
         assert!(!unverified_passthrough_ok("eth_subscribe"));
