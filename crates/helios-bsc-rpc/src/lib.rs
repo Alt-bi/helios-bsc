@@ -10,8 +10,8 @@ pub use wire::{
     jsonrpc_id_ok, jsonrpc_is_v2, jsonrpc_params_len, jsonrpc_params_ok, rpc_err, rpc_err_data,
     rpc_ok, wallet_block_number_allowed, wallet_block_tag_str, wallet_tag_is_safe, BlockId,
     ERR_EXECUTION, ERR_INTERNAL, ERR_INVALID, ERR_METHOD, ERR_NOT_SYNCED, ERR_PARAMS, ERR_PARSE,
-    ERR_PROOF_FAILED, ERR_STATE_ROOT, MAX_PROOF_STORAGE_KEYS, MAX_RPC_BATCH, MAX_RPC_ID,
-    MAX_RPC_METHOD, MAX_RPC_PARAMS,
+    ERR_PROOF_FAILED, ERR_STATE_ROOT, ERR_UPSTREAM, MAX_PROOF_STORAGE_KEYS, MAX_RPC_BATCH,
+    MAX_RPC_ID, MAX_RPC_METHOD, MAX_RPC_PARAMS,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

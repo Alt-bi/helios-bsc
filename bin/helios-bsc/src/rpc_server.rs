@@ -30,7 +30,8 @@ use helios_bsc_rpc::{
     jsonrpc_id_ok, jsonrpc_is_v2, jsonrpc_params_len, jsonrpc_params_ok, rpc_err, rpc_err_data,
     rpc_ok, wallet_block_number_allowed, wallet_block_tag_str, BlockId, ERR_EXECUTION,
     ERR_INTERNAL, ERR_INVALID, ERR_METHOD, ERR_NOT_SYNCED, ERR_PARAMS, ERR_PARSE, ERR_PROOF_FAILED,
-    ERR_STATE_ROOT, MAX_PROOF_STORAGE_KEYS, MAX_RPC_BATCH, MAX_RPC_METHOD, MAX_RPC_PARAMS,
+    ERR_STATE_ROOT, ERR_UPSTREAM, MAX_PROOF_STORAGE_KEYS, MAX_RPC_BATCH, MAX_RPC_METHOD,
+    MAX_RPC_PARAMS,
 };
 use helios_bsc_types::{
     decode_hex, decode_hex_fixed, decode_u64, keccak256, Checkpoint, RpcBlockHeader, SafeHead,
@@ -1638,7 +1639,7 @@ impl Node {
         let raws = self
             .up
             .block_raw_transactions(&hdr.hash)
-            .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))?;
+            .map_err(|e| (ERR_UPSTREAM, format!("unverified_upstream: {e}")))?;
         // No envelopes: omit hashes (do not invent, do not fail the header read).
         // Distinct from `Empty` — see [`TxBind`].
         if raws.is_empty() {
@@ -1671,7 +1672,7 @@ impl Node {
         let raws = self
             .up
             .block_raw_transactions(&hdr.hash)
-            .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))?;
+            .map_err(|e| (ERR_UPSTREAM, format!("unverified_upstream: {e}")))?;
         if raws.is_empty() {
             return Ok(None);
         }
@@ -1698,10 +1699,14 @@ impl Node {
         if root == EMPTY_TRIE_ROOT {
             return Ok(ReceiptBind::Empty);
         }
+        // A provider that cannot serve receipts at all is a capability gap in the data
+        // plane, not a lie about them. `-32001` claims verification failed and sends an
+        // operator hunting a mismatch that never happened; `-32000` is the documented
+        // transport code and names the provider. The read still fails either way.
         let jsons = self
             .up
             .block_receipts_json(&hdr.hash)
-            .map_err(|e| (ERR_PROOF_FAILED, format!("proof_verification_failed: {e}")))?;
+            .map_err(|e| (ERR_UPSTREAM, format!("unverified_upstream: {e}")))?;
         if jsons.is_empty() {
             return Ok(ReceiptBind::Omitted);
         }

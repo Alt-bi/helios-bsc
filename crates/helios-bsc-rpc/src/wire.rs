@@ -5,6 +5,11 @@ use serde_json::{json, Value};
 pub const ERR_PARSE: i64 = -32700;
 pub const ERR_INVALID: i64 = -32600;
 pub const ERR_PROOF_FAILED: i64 = -32001;
+/// Transport failure reaching the upstream: unreachable, refused, rate-limited, or a
+/// method it will not serve. Deliberately **not** `-32001`: nothing was found to be
+/// wrong with an answer, there was no answer. Saying "proof verification failed" sends
+/// an operator hunting a mismatch that never happened, when the fix is the provider.
+pub const ERR_UPSTREAM: i64 = -32000;
 pub const ERR_STATE_ROOT: i64 = -32002;
 pub const ERR_NOT_SYNCED: i64 = -32003;
 pub const ERR_METHOD: i64 = -32601;

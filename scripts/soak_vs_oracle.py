@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Soak: local verified eth_getBalance vs an independent oracle RPC.
+"""Soak: the local verified JSON-RPC surface vs an independent oracle RPC.
+
+Compares balances at the Safe head, then everything derived from that block:
+every receipt field this client computes rather than echoes (`from`, `to`,
+`gasUsed`, `transactionHash`, `contractAddress`, `effectiveGasPrice`), every log,
+and a filter round trip that must agree with `eth_getLogs` over the same block.
 
 Operator script (not a CI gate). Needs a running `helios-bsc run` and a public
 oracle that can serve historical balances. Oracle must be independent of the
@@ -146,17 +151,43 @@ def fetch_sync_status(local_url: str) -> tuple[int, str, dict]:
     return safe_num, str(safe_hash), result
 
 
-def fetch_local_balance(local_url: str, addr: str) -> str:
-    result = local_rpc(local_url, "eth_getBalance", [addr, "latest"])
+def current_head(local_url: str) -> int:
+    """The height this client is serving right now.
+
+    Both sides of a comparison have to name the same block, and neither `latest` nor a
+    height sampled once per round can guarantee that any more.
+
+    `latest` used to be safe: the confirmation-depth head moved about once a minute, so
+    it could not drift inside a round. Since 2026-08-25 it follows the BLS-finalized head,
+    two blocks behind a chain producing one every 0.45 s, so by the eleventh address
+    `latest` is several blocks past the height the oracle was asked about -- every address
+    whose balance changes each block then reports a mismatch that is really a race here.
+
+    Pinning one height for the whole round trades that for the opposite failure: a round
+    slow enough (a provider at ~2 s per proof) leaves the pinned block more than 112
+    blocks back, outside the proof window, and the run aborts.
+
+    So the height is re-read per address and both sides are asked about that one. The
+    client coalesces `eth_blockNumber` within a block interval, so this is nearly free.
+    """
+    n = local_rpc(local_url, "eth_blockNumber", [])
+    try:
+        return parse_block_number(n)
+    except ValueError as e:
+        raise LocalRpcError(f"eth_blockNumber: {e}") from e
+
+
+def fetch_local_balance(local_url: str, addr: str, at: int) -> str:
+    result = local_rpc(local_url, "eth_getBalance", [addr, hex(at)])
     try:
         return parse_qty(result)
     except ValueError as e:
         raise LocalRpcError(f"eth_getBalance({addr}): {e}") from e
 
 
-def fetch_oracle_balance(oracle_url: str, addr: str, safe_num: int, safe_hash: str) -> tuple[str, str]:
+def fetch_oracle_balance(oracle_url: str, addr: str, at: int, safe_hash: str) -> tuple[str, str]:
     """Balance at the local Safe height. Prefer number hex, then hash."""
-    number_hex = hex(safe_num)
+    number_hex = hex(at)
     last_reason = "oracle cannot serve historical balance"
     for param in (number_hex, safe_hash):
         try:
@@ -191,6 +222,174 @@ def fetch_oracle_balance(oracle_url: str, addr: str, safe_num: int, safe_hash: s
     raise OracleSkip(f"{last_reason} (block exists; no historical state)")
 
 
+# Receipt fields this client derives rather than echoes. `receiptsRoot` binds only
+# status / cumulativeGasUsed / logsBloom / type / logs, so each of these comes from
+# somewhere else that is itself verified: gasUsed from the cumulative chain, and the
+# rest from envelopes bound to `transactionsRoot`. Nothing here would fail loudly if a
+# derivation were subtly wrong -- it would return a plausible wrong value -- which is
+# exactly why the soak has to compare them against a chain that computed them
+# independently.
+DERIVED_RECEIPT_FIELDS = (
+    "from",
+    "to",
+    "gasUsed",
+    "transactionHash",
+    "contractAddress",
+    "effectiveGasPrice",
+)
+
+
+def _norm(field: str, value: object) -> object:
+    """Compare hex quantities numerically and addresses case-insensitively."""
+    if value is None:
+        return None
+    if field in ("gasUsed", "effectiveGasPrice"):
+        return int(str(value), 16)
+    return str(value).lower()
+
+
+def oracle_call(oracle_url: str, method: str, params: list, timeout: float = 60.0) -> object:
+    """Oracle result, or `OracleSkip` for anything the oracle will not serve.
+
+    Public providers refuse ranged `eth_getLogs` with `limit exceeded` and prune
+    historical receipts. Neither is evidence of a mismatch, so both are skips -- the
+    same rule the balance path already follows.
+    """
+    try:
+        resp = rpc(oracle_url, method, params, timeout=timeout)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as e:
+        raise OracleSkip(f"{method}: {e}") from e
+    if "error" in resp:
+        raise OracleSkip(f"{method}: {rpc_error_text(resp['error'])}")
+    result = resp.get("result")
+    if result is None:
+        raise OracleSkip(f"{method}: null result")
+    return result
+
+
+def check_receipts(local_url: str, oracle_url: str, block_hex: str) -> tuple[int, int, list[str]]:
+    """Compare every derived receipt field at one block. (checked, mismatched, notes)."""
+    local = local_rpc(local_url, "eth_getBlockReceipts", [block_hex])
+    if not isinstance(local, list):
+        raise LocalRpcError("eth_getBlockReceipts: result is not an array")
+    remote = oracle_call(oracle_url, "eth_getBlockReceipts", [block_hex])
+    if not isinstance(remote, list):
+        raise OracleSkip("eth_getBlockReceipts: oracle result is not an array")
+    if len(local) != len(remote):
+        return 0, 1, [f"receipt count {len(local)} vs oracle {len(remote)}"]
+    checked = mismatched = 0
+    notes: list[str] = []
+    for i, (a, b) in enumerate(zip(local, remote)):
+        for field in DERIVED_RECEIPT_FIELDS:
+            checked += 1
+            if _norm(field, a.get(field)) != _norm(field, b.get(field)):
+                mismatched += 1
+                if len(notes) < 5:
+                    notes.append(f"receipt {i}.{field}: {a.get(field)!r} vs {b.get(field)!r}")
+    return checked, mismatched, notes
+
+
+def check_logs(local_url: str, oracle_url: str, block_hex: str) -> tuple[int, int, list[str]]:
+    """Compare every log at one block, ours against the oracle's own index."""
+    flt = {"fromBlock": block_hex, "toBlock": block_hex}
+    local = local_rpc(local_url, "eth_getLogs", [flt])
+    if not isinstance(local, list):
+        raise LocalRpcError("eth_getLogs: result is not an array")
+    remote = oracle_call(oracle_url, "eth_getLogs", [flt])
+    if not isinstance(remote, list):
+        raise OracleSkip("eth_getLogs: oracle result is not an array")
+
+    def key(log: dict) -> tuple:
+        return (parse_block_number(log.get("blockNumber")), int(str(log.get("logIndex")), 16))
+
+    if len(local) != len(remote):
+        return 0, 1, [f"log count {len(local)} vs oracle {len(remote)}"]
+    checked = mismatched = 0
+    notes: list[str] = []
+    for a, b in zip(sorted(local, key=key), sorted(remote, key=key)):
+        for field in ("address", "transactionHash", "logIndex", "data"):
+            checked += 1
+            if _norm(field, a.get(field)) != _norm(field, b.get(field)):
+                mismatched += 1
+                if len(notes) < 5:
+                    notes.append(f"log {field}: {a.get(field)!r} vs {b.get(field)!r}")
+        checked += 1
+        if [t.lower() for t in a.get("topics", [])] != [t.lower() for t in b.get("topics", [])]:
+            mismatched += 1
+            if len(notes) < 5:
+                notes.append("log topics differ")
+    return checked, mismatched, notes
+
+
+def check_filter(local_url: str, block_hex: str) -> tuple[int, int, list[str]]:
+    """A filter over one block must return exactly what `eth_getLogs` returns for it.
+
+    Self-consistency rather than a diff against the oracle: the point is that the filter
+    path and the getLogs path cannot drift, since a wallet may use either.
+    """
+    direct = local_rpc(local_url, "eth_getLogs", [{"fromBlock": block_hex, "toBlock": block_hex}])
+    fid = local_rpc(local_url, "eth_newFilter", [{"fromBlock": block_hex, "toBlock": block_hex}])
+    if not isinstance(fid, str):
+        raise LocalRpcError("eth_newFilter: id is not a string")
+    try:
+        polled = local_rpc(local_url, "eth_getFilterChanges", [fid])
+        again = local_rpc(local_url, "eth_getFilterChanges", [fid])
+        whole = local_rpc(local_url, "eth_getFilterLogs", [fid])
+    finally:
+        local_rpc(local_url, "eth_uninstallFilter", [fid])
+    notes: list[str] = []
+    checked = mismatched = 0
+    for label, got in (("getFilterChanges", polled), ("getFilterLogs", whole)):
+        checked += 1
+        if not isinstance(got, list) or len(got) != len(direct):
+            mismatched += 1
+            n = len(got) if isinstance(got, list) else "?"
+            notes.append(f"{label} returned {n}, eth_getLogs returned {len(direct)}")
+    # A closed filter has nothing left after the first poll drained its range.
+    checked += 1
+    if again:
+        mismatched += 1
+        notes.append(f"second poll returned {len(again)}, expected none")
+    return checked, mismatched, notes
+
+
+def check_block_surface(
+    local_url: str, oracle_url: str, safe_num: int
+) -> tuple[int, int, int]:
+    """Receipts, logs and filters at the Safe head. (checked, mismatched, skipped)."""
+    block_hex = hex(safe_num)
+    checked = mismatched = skipped = 0
+    for label, fn in (
+        ("receipts", lambda: check_receipts(local_url, oracle_url, block_hex)),
+        ("logs", lambda: check_logs(local_url, oracle_url, block_hex)),
+        ("filter", lambda: check_filter(local_url, block_hex)),
+    ):
+        try:
+            c, m, notes = fn()
+        except OracleSkip as e:
+            skipped += 1
+            print(f"  {label:<8}  SKIP  {e}", flush=True)
+            continue
+        except LocalRpcError as e:
+            # A provider that will not serve `eth_getBlockReceipts` at all (BlastAPI
+            # answers 401 without a key) leaves this surface untestable. That is a
+            # capability gap in the data plane, not a verification failure, so it is a
+            # skip -- the same rule the balance path applies to the oracle. A real
+            # verification failure still arrives as a mismatch below.
+            if "unverified_upstream" in str(e):
+                skipped += 1
+                print(f"  {label:<8}  SKIP  {e}", flush=True)
+                continue
+            raise
+        checked += c
+        mismatched += m
+        verdict = "OK" if m == 0 else "MISMATCH"
+        print(f"  {label:<8}  {c} checks  {verdict}", flush=True)
+        for n in notes:
+            print(f"      {n}", flush=True)
+    return checked, mismatched, skipped
+
+
 def run_round(
     local_url: str,
     oracle_url: str,
@@ -211,9 +410,12 @@ def run_round(
     compared = match = mismatch = skip = 0
     name_w = max(len(n) for n, _ in ADDRESSES)
     for name, addr in ADDRESSES:
-        local_qty = fetch_local_balance(local_url, addr)
+        # Re-read the head per address so both sides name the same block even as the
+        # chain advances underneath a slow round.
+        at = current_head(local_url)
+        local_qty = fetch_local_balance(local_url, addr, at)
         try:
-            oracle_qty, used = fetch_oracle_balance(oracle_url, addr, safe_num, safe_hash)
+            oracle_qty, used = fetch_oracle_balance(oracle_url, addr, at, safe_hash)
         except OracleSkip as e:
             skip += 1
             print(f"  {name:<{name_w}}  SKIP  {e}", flush=True)
@@ -231,6 +433,17 @@ def run_round(
                 f"  {name:<{name_w}}  local={local_qty}  oracle={oracle_qty}  MISMATCH  @{used}",
                 flush=True,
             )
+
+    # Balances exercise the account trie. Everything derived from a block -- receipts,
+    # logs, filters -- is a separate surface with its own ways of being quietly wrong,
+    # and until this was added no soak had ever touched it.
+    b_checked, b_mismatch, b_skip = check_block_surface(
+        local_url, oracle_url, current_head(local_url)
+    )
+    compared += b_checked
+    match += b_checked - b_mismatch
+    mismatch += b_mismatch
+    skip += b_skip
     return compared, match, mismatch, skip
 
 
