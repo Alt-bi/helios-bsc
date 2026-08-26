@@ -99,16 +99,17 @@ The fields worth reading:
 
 **Verified** — `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`,
 `eth_getStorageAt`, `eth_getProof`, `eth_call`, `eth_estimateGas`, `eth_getBlockBy*`,
-`eth_getBlockReceipts`, single-block `eth_getLogs`. Each is checked against a state root
+`eth_getBlockReceipts`, `eth_getLogs` over ranges up to 128 blocks. Each is checked against a state root
 this client walked to from your checkpoint.
 
 **Not verified** — `eth_sendRawTransaction` goes straight through, because broadcasting
 is not something a proof can cover. Fee oracles (`eth_gasPrice`, `eth_feeHistory`) are
 off by default and unverifiable when enabled.
 
-**Refused** — log *ranges*, filters, `eth_subscribe`, `debug_*`, `trace_*`, `txpool_*`,
-and anything needing keys. Ranged logs need an index this client deliberately does not
-keep. They return `-32601` rather than an unverified answer.
+**Refused** — filters, `eth_subscribe`, `debug_*`, `trace_*`, `txpool_*`, and anything
+needing keys: they return `-32601` rather than an unverified answer. `eth_getLogs` spans
+wider than **128 blocks** are `-32602` — there is no log index here, so every block in a
+range costs an upstream fetch and a `receiptsRoot` check.
 
 **History** — reads reach back about 112 blocks. This is not an archive node.
 

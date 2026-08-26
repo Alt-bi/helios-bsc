@@ -10,7 +10,7 @@ use anyhow::{anyhow, Result};
 use helios_bsc_consensus::{ecrecover, header_hash, newest_safe, Snapshot, VerifiedBlock};
 use helios_bsc_execution::{
     encode_consensus_receipt, encode_data32, encode_qty, ordered_trie_root, tx_signing_hash,
-    ConsensusReceipt, EMPTY_TRIE_ROOT, MAX_CALL_ACCOUNTS, MAX_RAW_TX, TX_GAS,
+    ConsensusLog, ConsensusReceipt, EMPTY_TRIE_ROOT, MAX_CALL_ACCOUNTS, MAX_RAW_TX, TX_GAS,
 };
 use helios_bsc_mock::{
     cycling_sealer_chain, distinct_sealer_chain, header_from_verified, headers_from_chain, n_seal,
@@ -2349,15 +2349,107 @@ fn get_logs_latest_empty_on_dummy() {
     assert_eq!(omitted["result"], json!([]), "{omitted}");
 }
 
+/// A range inside the verified window is served, block by block, in order.
+///
+/// There is no log index here, so each block costs one upstream fetch and one
+/// `receiptsRoot` verification. That is why the span is capped rather than unbounded, and
+/// why every log still comes from receipts bound to a sealed header — a range is many
+/// single-block answers concatenated, not a call to the upstream's own `eth_getLogs`.
 #[test]
-fn get_logs_multi_block_range_invalid() {
-    let chain = distinct_sealer_chain(15);
-    let node = node_from_chain(chain, json!({}));
+fn get_logs_serves_a_range_inside_the_verified_window() {
+    // Safe is tip - 15, so blocks 0..=3 are readable.
+    let mut chain = distinct_sealer_chain(18);
+    let addr = [0x11u8; 20];
+    let topic = [0x22u8; 32];
+    let rec = ConsensusReceipt {
+        status: 1,
+        cumulative_gas_used: 21_000,
+        logs_bloom: [0u8; 256],
+        logs: vec![ConsensusLog {
+            address: addr,
+            topics: vec![topic],
+            data: vec![0xAB],
+        }],
+        tx_type: 2,
+    };
+    let raw = encode_consensus_receipt(&rec).unwrap();
+    let root = format!("0x{}", hex::encode(ordered_trie_root(&[raw])));
+    for block in chain.iter_mut().take(4).skip(1) {
+        let mut hdr = header_from_verified(block, [0u8; 32]);
+        hdr.receipts_root = root.clone();
+        let h = header_hash(&hdr).unwrap();
+        hdr.hash = format!("0x{}", hex::encode(h));
+        block.hash = h;
+        block.header = Some(hdr);
+    }
+    let mut up = MockUpstream::for_chain(&chain, json!({}));
+    up.receipts = vec![json!({
+        "status": "0x1",
+        "cumulativeGasUsed": "0x5208",
+        "logsBloom": format!("0x{}", hex::encode([0u8; 256])),
+        "type": "0x2",
+        "logs": [{
+            "address": format!("0x{}", hex::encode(addr)),
+            "topics": [format!("0x{}", hex::encode(topic))],
+            "data": "0xab",
+        }],
+    })];
+    let node = Node::from_parts(Box::new(up), 130, chain);
+
     let v = node.handle(&req(
         "eth_getLogs",
-        json!([{"fromBlock":"0x0","toBlock":"0x1"}]),
+        json!([{"fromBlock":"0x1","toBlock":"0x3"}]),
     ));
-    assert_eq!(err_code(&v), ERR_PARAMS, "{v}");
+    let logs = v["result"].as_array().unwrap_or_else(|| panic!("{v}"));
+    assert_eq!(logs.len(), 3, "one log per block in the span: {v}");
+    let seen: Vec<&str> = logs
+        .iter()
+        .map(|l| l["blockNumber"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(seen, vec!["0x1", "0x2", "0x3"], "ascending by block: {v}");
+
+    // A filter that matches nothing still walks the same blocks and finds none.
+    let none = node.handle(&req(
+        "eth_getLogs",
+        json!([{"fromBlock":"0x1","toBlock":"0x3","address":"0x0000000000000000000000000000000000000099"}]),
+    ));
+    assert_eq!(none["result"], json!([]), "{none}");
+}
+
+/// The span cap, the inverted range and reaching outside the verified chain.
+#[test]
+fn get_logs_range_limits() {
+    let chain = distinct_sealer_chain(18);
+    let node = node_from_chain(chain, json!({}));
+
+    // Wider than MAX_GET_LOGS_RANGE: refused for the reason, not silently truncated.
+    let wide = node.handle(&req(
+        "eth_getLogs",
+        json!([{"fromBlock":"0x0","toBlock":"0x100"}]),
+    ));
+    assert_eq!(err_code(&wide), ERR_PARAMS, "{wide}");
+    assert!(
+        wide["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no log index"),
+        "the refusal must say why: {wide}"
+    );
+
+    // fromBlock above toBlock is a malformed filter, not an empty result.
+    let inverted = node.handle(&req(
+        "eth_getLogs",
+        json!([{"fromBlock":"0x3","toBlock":"0x1"}]),
+    ));
+    assert_eq!(err_code(&inverted), ERR_PARAMS, "{inverted}");
+
+    // Inside the cap but above Safe: not a range with fewer logs, a range this client
+    // cannot answer.
+    let above = node.handle(&req(
+        "eth_getLogs",
+        json!([{"fromBlock":"0x1","toBlock":"0x9"}]),
+    ));
+    assert_eq!(err_code(&above), ERR_NOT_SYNCED, "{above}");
 }
 
 #[test]

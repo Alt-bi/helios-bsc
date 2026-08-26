@@ -50,9 +50,9 @@ what each line of output means: **[docs/quickstart.md](docs/quickstart.md)**.
 
 | | |
 |---|---|
-| **Verified** | Balances, nonces, code, storage, `eth_call`, `eth_estimateGas`, headers, receipts, single-block logs — each checked against a state root this client walked to from your checkpoint |
+| **Verified** | Balances, nonces, code, storage, `eth_call`, `eth_estimateGas`, headers, receipts, logs over ranges up to 128 blocks — each checked against a state root this client walked to from your checkpoint |
 | **Passed through** | `eth_sendRawTransaction` (broadcasting is not something a proof can cover), and opt-in fee oracles |
-| **Refused** | Log *ranges*, filters, `eth_subscribe`, `debug_*`, `trace_*`, anything needing keys — `-32601`, never an unverified guess |
+| **Refused** | Filters, `eth_subscribe`, `debug_*`, `trace_*`, anything needing keys — `-32601`, never an unverified guess. Log ranges wider than 128 blocks are `-32602` |
 | **History** | ~112 blocks. This is not an archive node |
 | **Audited** | No. See the [threat model](docs/threat-model.md) for what is and is not claimed |
 
