@@ -11,6 +11,7 @@ Organised by what you came here to do.
 | [deploy.md](deploy.md) | Docker, and the rules for binding anywhere but loopback |
 | [slo.md](slo.md) | What "working" looks like — lag targets, Prometheus metrics, what to alert on |
 | [runbooks/proof-fail-storm.md](runbooks/proof-fail-storm.md) | When proofs start failing: what to check, in order, and what not to do |
+| [runbooks/long-soak.md](runbooks/long-soak.md) | Running a soak for days or a month: outage tolerance, the two limits that end a run, and how to read the result |
 
 ## I want to know what to trust
 

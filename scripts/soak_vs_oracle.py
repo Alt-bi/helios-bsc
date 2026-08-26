@@ -464,10 +464,25 @@ def main() -> int:
     ap.add_argument("--interval", type=float, default=30.0, help="seconds between rounds")
     ap.add_argument("--rounds", type=int, default=4, help="number of rounds (default 4)")
     ap.add_argument("--once", action="store_true", help="single pass (overrides --rounds)")
+    ap.add_argument(
+        "--max-local-outage",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help=(
+            "keep going while the local client is unreachable, for up to this long "
+            "in one stretch (default 0: stop at the first local error, which is what "
+            "a short CI run wants). Only transport failures are tolerated -- a "
+            "verification mismatch still ends the run immediately."
+        ),
+    )
     args = ap.parse_args()
 
     if args.interval < 0:
         print("error: --interval must be >= 0", file=sys.stderr)
+        return 1
+    if args.max_local_outage < 0:
+        print("error: --max-local-outage must be >= 0", file=sys.stderr)
         return 1
     rounds = 1 if args.once else args.rounds
     if rounds < 1:
@@ -484,18 +499,61 @@ def main() -> int:
 
     tot_cmp = tot_ok = tot_bad = tot_skip = 0
     local_err: str | None = None
+    # An outage is the client being unreachable, not the client being wrong. Over a long
+    # run it will restart at least once -- a reboot, a container restart, a checkpoint
+    # refresh -- and a month-long soak that stops on the first blip reports whatever
+    # happened in its first three days. A 45-minute CI run wants the opposite, so the
+    # default (0) keeps the old behaviour exactly and only an explicit flag relaxes it.
+    #
+    # Tolerated outages are never silent: they are counted, the longest is recorded, and
+    # both appear in the summary. A run that limped must not be mistaken for a clean one.
+    outages = 0
+    outage_rounds = 0
+    longest_outage = 0.0
+    outage_started: float | None = None
     try:
         for i in range(1, rounds + 1):
             try:
                 c, ok, bad, sk = run_round(args.local, args.oracle, i, rounds)
             except LocalRpcError as e:
-                local_err = str(e)
-                print(f"  LOCAL_ERROR  {e}", flush=True)
-                break
+                now = time.monotonic()
+                if args.max_local_outage <= 0:
+                    local_err = str(e)
+                    print(f"  LOCAL_ERROR  {e}", flush=True)
+                    break
+                if outage_started is None:
+                    outage_started = now
+                    outages += 1
+                waited = now - outage_started
+                longest_outage = max(longest_outage, waited)
+                if waited > args.max_local_outage:
+                    local_err = (
+                        f"local client unreachable for {waited:.0f}s "
+                        f"(limit {args.max_local_outage:.0f}s): {e}"
+                    )
+                    print(f"  LOCAL_ERROR  {local_err}", flush=True)
+                    break
+                outage_rounds += 1
+                print(
+                    f"  LOCAL_DOWN   {e}  (waiting, {waited:.0f}s of "
+                    f"{args.max_local_outage:.0f}s)",
+                    flush=True,
+                )
+                if args.interval > 0:
+                    time.sleep(args.interval)
+                continue
+            if outage_started is not None:
+                back = time.monotonic() - outage_started
+                print(f"  LOCAL_BACK   recovered after {back:.0f}s", flush=True)
+                outage_started = None
             tot_cmp += c
             tot_ok += ok
             tot_bad += bad
             tot_skip += sk
+            # A verification failure is not an outage and is never waited out.
+            if bad:
+                local_err = None
+                break
             if i < rounds and args.interval > 0:
                 time.sleep(args.interval)
     except KeyboardInterrupt:
@@ -505,6 +563,12 @@ def main() -> int:
     print(
         f"# SUMMARY  compared={tot_cmp}  match={tot_ok}  mismatch={tot_bad}"
         f"  skip={tot_skip}"
+        + (
+            f"  outages={outages}  outage_rounds={outage_rounds}"
+            f"  longest_outage={longest_outage:.0f}s"
+            if outages
+            else ""
+        )
         + (f"  local_err={local_err}" if local_err else ""),
         flush=True,
     )
