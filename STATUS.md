@@ -26,7 +26,7 @@ round: `compared=3462 match=3462 mismatch=0 skip=0`.
 | Verified reads | balances, nonces, code, storage, `eth_call`, `eth_estimateGas`, headers, receipts, logs and log filters over ranges up to 128 blocks (≤1024 matches, else refused) |
 | Read head | BLS-finalized, ~2 blocks behind the tip (falls back to ~110 without vote keys) |
 | History | ~112 blocks; not an archive node |
-| Tests | 427, plus an adversarial in-process lying upstream |
+| Tests | 443, plus an adversarial in-process lying upstream |
 | Chain | BSC mainnet, `chainId` 56, pinned to `bnb-chain/bsc` v1.7.8 |
 
 Start at [docs/quickstart.md](docs/quickstart.md); what is verified is in
@@ -51,7 +51,7 @@ Start at [docs/quickstart.md](docs/quickstart.md); what is verified is in
 | Code / storage / broadcast (PR 11) | **Done** — `eth_getCode` (keccak vs proof `codeHash`; WBNB bytecode fixture + lying code reject), `eth_getStorageAt` (storage trie… [→ detail](docs/engineering-log.md#code-storage-broadcast-pr-11) |
 | Header-verified `eth_getBlock*` | **Done** — `eth_getBlockByNumber` / `ByHash` at or below Safe; hydrated txs → `-32601`; uncle RPCs `0x0`/`null` (Parlia); `eth_coinbase` zeros. Sealed header stored at ingest — serve/persist without re-fetch; lying re-fetch ignored. |
 | Verified state at `n ≤ Safe` | **Done** — `eth_getBalance` / nonce / code / storage / proof / `eth_call` / `estimateGas` at a local verified header with `n ≤ Safe` (same rule as `eth_getBlockB… [→ detail](docs/engineering-log.md#verified-state-at-n-safe) |
-| Filters / subscribe | **Done** — `eth_newFilter` / `eth_subscribe` / filter RPCs stay `-32601` (no log index). |
+| Filters / subscribe | **Superseded 2026-08-25.** This row recorded the state when there was no log index: everything filter-shaped answered `-32601`. Poll-based log and block filters are now served from `receiptsRoot`-bound receipts — see the `eth_getLogs` and filter rows under *What is next*. `eth_subscribe` and pending-transaction filters stay `-32601`, and for reasons that do not expire. |
 | Parent-linked header walk | **Done** — consecutive numbers + `parentHash` vs previous **computed** hash (including append stitch)… [→ detail](docs/engineering-log.md#parent-linked-header-walk) |
 | Adversarial mock (PR 10) | **Done** — `helios-bsc-mock` + `RpcUpstream` trait; `Node::handle` fail-closed on lying seals/proofs/parent/`stateRoot`; 14-sealer ≠ Safe. Unproven `eth_call` SLOAD/account is fail-closed (`-32001`), not zero. |
 | Constrained `eth_call` (MVP-2 slice 1) | **Done** — local verified header `n ≤ Safe` (`latest`→Safe); `to` + optional `data`; iterative `eth_getProof` at the requested hash/number; **revm 42**… [→ detail](docs/engineering-log.md#constrained-eth_call-mvp-2-slice-1) |
@@ -107,7 +107,7 @@ Start at [docs/quickstart.md](docs/quickstart.md); what is verified is in
 
 ## What is next
 
-The MVP-1 and MVP-2 gates are closed and v0.1.0 has shipped. What is open:
+The MVP-1 and MVP-2 gates are closed and v0.2.0 has shipped. What is open:
 
 1. **No audit.** Nothing here has been reviewed by a third party. This is the single
    largest gap between the current state and anything anyone should hold funds behind.
