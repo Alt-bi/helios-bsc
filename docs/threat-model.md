@@ -36,9 +36,25 @@ Wallet RPC treats the upstream as an **untrusted data plane**. Integrity comes f
 | Primary RPC down / rate-limit | Optional `--backup` retries the same call on a second URL. Backup is **not** a trust oracle; results still fail-closed on seal/MPT |
 | Bind on LAN | Default `127.0.0.1:8545`. Non-loopback refused unless `--allow-non-loopback` (no in-process auth) |
 | DNS rebinding to loopback | Loopback bind requires HTTP `Host` in `127/8` / `localhost` / `::1` (403 otherwise). No `Access-Control-Allow-Origin`. **Applies to loopback binds only** — a non-loopback bind has no Host check |
+| Resource exhaustion on an exposed port | **Not defended in-process, by the same decision as authentication.** `tiny_http` spawns a task per accepted connection from a pool with no cap, and no socket read timeout is set, so connections that open and then stall are held open and cost a thread each. The four dispatch workers are not what starves — a stalled connection never becomes a parsed request — so the client keeps answering until threads or memory run out. On loopback the attacker is already on the machine and has better options; on a non-loopback bind the reverse proxy this model already requires is what caps connections. Losing availability is not the same as answering wrongly: nothing here can make a read verify that should not |
 | **Container published to the world** | Inside a container the process must bind `0.0.0.0` (Docker NAT is not loopback), so the image's `CMD` carries `--allow-non-loopback` and both guards above are inactive by construction. What protects the operator is the publish argument: `-p 127.0.0.1:8545:8545`, never `-p 8545:8545`. There is nothing the process can do about this beyond saying so loudly, which it does — and `release.yml` runs the image's default entrypoint on every release to prove the warning still appears |
 
 Fast Finality BLS **is** verified (row above), and since 2026-08-25 it is what `latest` / `safe` / `finalized` resolve to by default — measured **2 blocks** behind the tip on live mainnet, an observed norm over 120 consecutive headers, not a proven bound. The fast head is used **only** when it is newer than confirmation depth **and** names a block this client verified itself; otherwise reads fall back to the confirmation-depth Safe head, and `run --finality confirmation-depth` pins that older rule outright. So the head is final under at least one complete rule either way, and the default can never move reads backwards or onto a block taken on an upstream's word. The startup line names the rule actually in force; `helios_bsc_syncStatus.safeSource` reports it at runtime.
+
+### What "fail-closed" does and does not cover
+
+Every claim above is about **integrity**: no answer leaves this process unless a Parlia
+seal and, where state is involved, an MPT proof against a verified `stateRoot` say it may.
+None of them is about **availability**. A client that is wedged, throttled, starved of
+threads or simply switched off returns errors, and an error is the correct answer to a
+question it cannot verify — see the fail-closed rows above, most of which *are* refusals.
+
+That distinction is why the resource-exhaustion row is not treated as a defect to fix
+in-process. An operator who cares about staying up puts the same reverse proxy in front
+that the next section says is required anyway, and monitors
+`helios_bsc_request_panics_total` and `syncStatus.safeLagBlocks` — see
+[slo.md](slo.md). What none of that changes is the guarantee: a served value was proven,
+or it was not served.
 
 ### Why there is no RPC authentication
 

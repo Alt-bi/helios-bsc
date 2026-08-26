@@ -1,0 +1,65 @@
+name: advisories
+
+# Weekly RUSTSEC check against the committed lockfile.
+#
+# Dependabot (see dependabot.yml) opens version bumps and GitHub raises alerts in the
+# security tab, but neither of those fails a build, and neither is visible in a repository
+# somebody is deciding whether to trust. This is: a scheduled job whose red/green anyone
+# can read, run against `Cargo.lock` -- the file that actually says what ships.
+#
+# Weekly rather than per-PR because `cargo install cargo-audit` costs minutes and the
+# advisory database changes on its own schedule, not on ours. A vulnerability disclosed
+# on a Tuesday is found by the following run, not by whoever happens to push next.
+#
+# Fails the job rather than opening an issue: a failed scheduled run mails the repository
+# owner, and `contents: read` means this workflow can never write to what it watches.
+
+on:
+  schedule:
+    - cron: "23 5 * * 2"
+  workflow_dispatch:
+  push:
+    # Also on any change to what is resolved -- that is the moment a new advisory can
+    # enter the tree, and the only moment where the answer is attributable to a commit.
+    paths:
+      - "Cargo.lock"
+      - "**/Cargo.toml"
+      - ".github/workflows/advisories.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      # Third-party actions run arbitrary code in this job. A tag or a branch is a name
+      # its owner can move; a commit SHA is not.
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Install cargo-audit
+        # `--locked` so the tool that checks our lockfile is itself built from a lockfile.
+        run: cargo install cargo-audit --locked
+
+      - name: Audit the lockfile
+        # Vulnerabilities fail the job; unmaintained and yanked crates are printed and do
+        # not. That split is deliberate. A tree this size always has a transitive crate
+        # somebody stopped maintaining, and there is usually nothing to do about it
+        # -- folding those into a red build produces a job that is red most weeks, which
+        # is a job people stop reading. The same reasoning as `--min-unique` in the soak.
+        #
+        # `cargo audit` exits non-zero on a vulnerability on its own; the second line
+        # surfaces the rest as visible warnings without gating on them.
+        run: |
+          set -euo pipefail
+          cargo audit
+          cargo audit --deny unmaintained --deny yanked > extra.txt 2>&1 || true
+          cat extra.txt
+          if grep -qiE "unmaintained|yanked" extra.txt; then
+            echo "::warning::unmaintained or yanked crates in Cargo.lock -- see the log above"
+          fi
