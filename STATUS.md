@@ -1,14 +1,23 @@
 # helios-bsc status
 
-**Updated:** 2026-08-25 · **Released:** [v0.1.0](https://github.com/Alt-bi/helios-bsc/releases/tag/v0.1.0) (5 platforms, `SHA256SUMS`)
+**Updated:** 2026-08-26 · **Released:** [v0.2.0](https://github.com/Alt-bi/helios-bsc/releases/tag/v0.2.0) (5 platforms, `SHA256SUMS`)
 
 ## Where the project is
 
 A trust-minimized Parlia light client serving verified JSON-RPC on `127.0.0.1:8545`.
 MVP-1 and MVP-2 are in tree. The ≥24 h differential soak passed **2026-08-24** (24.06 h,
 exit 0) and 4 h followed on the shipped build (2871 compared, 0 mismatch). Block tags have
-served the BEP-126 BLS-finalized head by default since **2026-08-25**. A nightly soak runs
-in CI against live mainnet.
+served the BEP-126 BLS-finalized head by default since **2026-08-25**.
+
+Since **v0.2.0** nothing on a receipt is echoed from the upstream: `gasUsed` is derived
+from the verified cumulative chain, and `transactionHash`, `to`, `from`, `contractAddress`
+and `effectiveGasPrice` come from envelopes bound to `transactionsRoot`. `eth_getLogs`
+serves ranges up to 128 blocks and poll-based filters are supported, both built from
+`receiptsRoot`-bound receipts rather than an upstream's own index.
+
+The nightly soak covers all of it — balances, every derived receipt field, every log at
+the head, and a filter round trip — against a third independent host. A representative
+round: `compared=3462 match=3462 mismatch=0 skip=0`.
 
 **Not audited.** No third party has reviewed the consensus or proof code.
 

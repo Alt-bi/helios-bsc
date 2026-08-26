@@ -441,7 +441,10 @@ fn print_info() -> Result<()> {
     let fork = mainnet_current_fork();
     let live = params_at(0, now_unix());
     println!("helios-bsc {}", env!("CARGO_PKG_VERSION"));
-    println!("status:       Demo Slice (probe-safe + local RPC)");
+    // Was still announcing "Demo Slice" three milestones later. `info` is the first
+    // thing a new operator runs, so a stale line here is the first thing they read.
+    println!("status:       MVP-2 — verified wallet reads, eth_call, receipts, logs, filters");
+    println!("audited:      no");
     println!("chain_id:     56 (BSC mainnet)");
     println!(
         "upstream_pin: bnb-chain/bsc {} ({})",
