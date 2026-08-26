@@ -79,23 +79,48 @@ jobs:
         # capabilities, writes nothing outside the checkpoint volume, and never becomes
         # another user -- which is exactly why a future edit could drop one without
         # noticing anything break. Assert them, or they are decoration.
+        #
+        # The second half is the assertions asserting themselves. A check that cannot
+        # fail is worse than none, and "jq -e on a missing key exits non-zero" is a claim
+        # about jq, not about this repository -- so the same four queries are run against
+        # a copy of the config with the hardening stripped out, and every one of them has
+        # to fail. If a query is ever mistyped into something vacuously true, that half
+        # goes red even while the real config is fine.
         env:
           HELIOS_BSC_UPSTREAM: http://127.0.0.1:1
         run: |
           set -euo pipefail
           cp .env.example .env
           docker compose config --format json > compose.json
+
+          READ_ONLY='.services["helios-bsc"].read_only == true'
+          CAP_DROP='.services["helios-bsc"].cap_drop == ["ALL"]'
+          NO_NEW_PRIV='.services["helios-bsc"].security_opt | index("no-new-privileges:true")'
+          TMPFS='.services["helios-bsc"].tmpfs | length > 0'
+
           check() {
             if ! jq -e "$1" compose.json > /dev/null; then
               echo "::error::compose lost $2"
               exit 1
             fi
           }
-          check '.services["helios-bsc"].read_only == true' 'read_only'
-          check '.services["helios-bsc"].cap_drop == ["ALL"]' 'cap_drop: [ALL]'
-          check '.services["helios-bsc"].security_opt | index("no-new-privileges:true")' 'no-new-privileges'
-          check '.services["helios-bsc"].tmpfs | length > 0' 'the tmpfs a read-only root needs for tmp+rename'
+          check "${READ_ONLY}" 'read_only'
+          check "${CAP_DROP}" 'cap_drop: [ALL]'
+          check "${NO_NEW_PRIV}" 'no-new-privileges'
+          check "${TMPFS}" 'the tmpfs a read-only root needs for tmp+rename'
           echo "compose hardening intact"
+
+          jq 'del(.services["helios-bsc"].read_only,
+                  .services["helios-bsc"].cap_drop,
+                  .services["helios-bsc"].security_opt,
+                  .services["helios-bsc"].tmpfs)' compose.json > stripped.json
+          for q in "${READ_ONLY}" "${CAP_DROP}" "${NO_NEW_PRIV}" "${TMPFS}"; do
+            if jq -e "${q}" stripped.json > /dev/null 2>&1; then
+              echo "::error::this check passes on a config with the hardening removed, so it checks nothing: ${q}"
+              exit 1
+            fi
+          done
+          echo "and each of those four checks fails when the setting is removed"
 
       - name: the Dockerfile must declare a healthcheck
         # A grep, not an inspection: building the image here would add minutes to every
