@@ -10,7 +10,38 @@ services:
     environment:
       HELIOS_BSC_UPSTREAM: ${HELIOS_BSC_UPSTREAM:?set HELIOS_BSC_UPSTREAM in .env}
     ports:
+      # The single line standing between this and an open, unauthenticated endpoint.
+      # `8545:8545` publishes on every interface; the `127.0.0.1:` prefix is the guard.
       - "127.0.0.1:8545:8545"
+
+    # --- container hardening -------------------------------------------------------
+    # docs/threat-model.md names the container as the one path where both in-process
+    # guards are inactive by construction: the process must bind 0.0.0.0 inside, so the
+    # loopback Host check does not apply and `--allow-non-loopback` is pre-satisfied.
+    # These four lines are what is left to say about it, and none of them costs anything
+    # here because this process does not need what they take away.
+    #
+    # No new privileges: nothing in the image is setuid and nothing needs to become
+    # anything. Blocks the escalation step of most container escapes outright.
+    security_opt:
+      - no-new-privileges:true
+    # No capabilities at all. A light client makes outbound HTTPS and binds a high port
+    # as an unprivileged user; every capability in the default set is dead weight, and
+    # dead weight in a container is attack surface that nobody is watching.
+    cap_drop:
+      - ALL
+    # Read-only root filesystem. The process writes exactly one thing -- the checkpoint
+    # store -- and only when `--checkpoint` or `--checkpoint-store` names a path, which
+    # is the mounted volume below. With no volume it writes nothing at all, so there is
+    # no case where this has to be relaxed for normal operation.
+    read_only: true
+    # Somewhere to put a temporary file. `tmp+rename` is how the checkpoint is persisted,
+    # and a read-only root leaves no other writable directory. Small and in memory:
+    # nothing here is meant to survive the container.
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    # --------------------------------------------------------------------------------
+
     # Uncomment for a sealing-set checkpoint (read-write so last-verified can persist):
     # volumes:
     #   - ./checkpoint.json:/data/checkpoint.json
@@ -22,4 +53,10 @@ services:
     #   - --checkpoint
     #   - /data/checkpoint.json
     #   - --require-checkpoint
+
+    # Restarts a container that exits. It does *not* restart one the HEALTHCHECK marks
+    # unhealthy, and that is the behaviour we want -- see the HEALTHCHECK comment in the
+    # Dockerfile and docs/runbooks/long-soak.md. A client refusing to start because its
+    # checkpoint went stale will loop here; `docker compose ps` shows `Restarting`, and
+    # the soak is what notices out loud.
     restart: unless-stopped

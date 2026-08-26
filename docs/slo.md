@@ -13,6 +13,8 @@ These are **operator freshness bounds**, not protocol constants. Confirmation-de
 
 `helios-bsc doctor` labels `checkpoint.json` `slo=ok|warn|fail` from age only (never prints keys or the sealing-set list). `helios_bsc_syncStatus.safeLagWithinBound` is `true` when `lag ≤ 120`. Serving continues if lag is higher but 15 sealers exist — that is a valid out-of-turn stretch, not a protocol failure.
 
+**These bounds are not the health probe's threshold, on purpose.** `helios-bsc health` — what the container's `HEALTHCHECK` runs — fails at **300 s** of Safe lag, not at the 120-block (~54 s) in-turn bound above. Gating a liveness probe on an SLO whose own row says a longer stretch is valid would make the probe red during correct operation, and a probe that is normally red is one people switch off. A head that has actually stopped does not hover near the bound: at 450 ms blocks the lag grows by 8000 blocks an hour and never returns, so the wide threshold gives up nothing in detection. Use `--max-lag-seconds` if you want it tighter. See [deploy.md](deploy.md#is-it-actually-working).
+
 **Which head these bounds describe.** Since 2026-08-25 `latest` resolves to the
 BLS-finalized head (~2 blocks, ~1 s) by default. The Safe bounds in the table above
 describe the **confirmation-depth** head — what `--finality confirmation-depth` pins, and

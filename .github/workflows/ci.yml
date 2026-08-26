@@ -72,5 +72,47 @@ jobs:
             | map(select((.published | tostring) == "8545" or (.target | tostring) == "8545"))
             | length > 0 and all(.host_ip == "127.0.0.1")
           '
+      - name: compose must keep the container hardening
+        # docs/threat-model.md calls the container the one path where both in-process
+        # guards are inactive by construction, so what is left is the runtime the
+        # operator gets handed. Each of these four is free here -- this process needs no
+        # capabilities, writes nothing outside the checkpoint volume, and never becomes
+        # another user -- which is exactly why a future edit could drop one without
+        # noticing anything break. Assert them, or they are decoration.
+        env:
+          HELIOS_BSC_UPSTREAM: http://127.0.0.1:1
+        run: |
+          set -euo pipefail
+          cp .env.example .env
+          docker compose config --format json > compose.json
+          check() {
+            if ! jq -e "$1" compose.json > /dev/null; then
+              echo "::error::compose lost $2"
+              exit 1
+            fi
+          }
+          check '.services["helios-bsc"].read_only == true' 'read_only'
+          check '.services["helios-bsc"].cap_drop == ["ALL"]' 'cap_drop: [ALL]'
+          check '.services["helios-bsc"].security_opt | index("no-new-privileges:true")' 'no-new-privileges'
+          check '.services["helios-bsc"].tmpfs | length > 0' 'the tmpfs a read-only root needs for tmp+rename'
+          echo "compose hardening intact"
+
+      - name: the Dockerfile must declare a healthcheck
+        # A grep, not an inspection: building the image here would add minutes to every
+        # PR, and the image *is* built and its healthcheck *is* inspected on every
+        # release -- see the "the published image is healthy-by-construction" step in
+        # release.yml. This catches the edit that deletes the line.
+        run: |
+          set -euo pipefail
+          grep -q '^HEALTHCHECK ' Dockerfile || {
+            echo "::error::Dockerfile has no HEALTHCHECK -- a container can then be up, answering, and stalled, with nothing saying so"
+            exit 1
+          }
+          grep -q '"health"' Dockerfile || {
+            echo "::error::HEALTHCHECK no longer calls the health subcommand"
+            exit 1
+          }
+          echo "Dockerfile declares a healthcheck that runs the health subcommand"
+
       - name: Dockerfile syntax check
         run: docker build --check .
