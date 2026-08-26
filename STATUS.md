@@ -105,13 +105,12 @@ The MVP-1 and MVP-2 gates are closed and v0.1.0 has shipped. What is open:
 2. **Log ranges and filters.** `eth_getLogs` serves a single block; a range, `eth_newFilter`
    and `eth_subscribe` stay `-32601`. Ranges need an index this client deliberately does not
    keep, so this is a design question, not a missing function.
-3. **Three receipt fields are still echoed.** `from` needs ECDSA recovery over a
-   per-type signing hash and `contractAddress` derives from it; `effectiveGasPrice`
-   needs the fee fields of the envelope. They are structurally validated and labelled as
-   such in [docs/rpc-matrix.md](docs/rpc-matrix.md), not verified. `gasUsed`,
-   `transactionHash` and `to` were closed on 2026-08-25 — the first derived from the
-   verified cumulative chain, the other two read from envelopes bound to
-   `transactionsRoot`.
+3. **Receipt fields — closed 2026-08-25.** Nothing on a receipt is echoed from the
+   upstream any more. `gasUsed` is derived from the verified cumulative chain;
+   `transactionHash` is bound to `transactionsRoot`; and `to`, `from`, `contractAddress`
+   and `effectiveGasPrice` come from the bound envelope, `from` by recovering the
+   signature over it. This needs the upstream to serve raw envelopes — where it does
+   not, the values are unprovable rather than wrong and the echoed ones stand.
 4. **The soak needs an oracle serving `parlia_`.** With `--finality fast` the run
    cross-checks its justified/finalized pair against geth's own answer and fails closed if
    that check never produced a verdict. Most public BSC endpoints answer `-32601`;
