@@ -39,7 +39,7 @@ jobs:
   soak:
     runs-on: ubuntu-latest
     # The soak itself is capped at 45 min; the rest is build and checkout headroom.
-    timeout-minutes: 75
+    timeout-minutes: 90
     env:
       # Proof upstream. At the BLS-finalized head the required window is ~2 blocks rather
       # than ~112, which this free keyless endpoint clears.
@@ -86,6 +86,81 @@ jobs:
             --sealing-set-from-epoch "$(printf '0x%x' "$epoch")" \
             --out checkpoint.json
 
+      - name: Soak the block surface through the local RPC
+        # Does not fail the job on its own. A flaky data plane here would otherwise
+        # cancel the 45-minute soak below, trading the larger signal for the smaller
+        # one. A real disagreement still fails the job -- the check step after this
+        # one turns MISMATCH into an error.
+        continue-on-error: true
+        # The long soak below covers the account trie: balances, nonces, storage,
+        # eth_call. Everything derived from a block -- receipts, logs, filters -- is a
+        # separate surface, and it needs the real server because that is where the
+        # derivation lives. So this starts `run` and drives it over HTTP.
+        #
+        # Deliberately before the 45-minute soak, not after: the checkpoint is written
+        # one step earlier, and by the end of that soak it would be three quarters of an
+        # hour and ~6000 blocks stale, so bootstrap alone could outlast the readiness
+        # probe. `--no-checkpoint-store` keeps this run from rewriting the file the soak
+        # is about to use.
+        #
+        # Provider split, measured 2026-08-25 (docs/proof-provider-matrix.md): no free
+        # keyless host serves both eth_getProof and eth_getBlockReceipts. BlastAPI serves
+        # proofs and answers 401 for receipts; publicnode is the reverse. `--backup` is
+        # transport failover and covers exactly that -- it changes who is asked, never
+        # what is checked, since receipts still bind to the sealed receiptsRoot.
+        #
+        # The comparison oracle is the third host, so nothing is compared against the
+        # process that served it. dataseed refuses eth_getLogs outright, so the log check
+        # reports SKIP there; receipts and the filter round trip still run.
+        run: |
+          set -euo pipefail
+          ./target/release/helios-bsc run \
+            --upstream "$UPSTREAM" \
+            --backup "$ORACLE" \
+            --checkpoint checkpoint.json \
+            --no-checkpoint-store \
+            --listen 127.0.0.1:8545 > rpc.log 2>&1 &
+          echo $! > rpc.pid
+          # Wait for a head rather than sleeping a fixed amount: bootstrap time depends on
+          # how far the checkpoint is behind, which varies run to run.
+          for _ in $(seq 1 60); do
+            if curl -sS -m 5 -H 'Content-Type: application/json' \
+                 -d '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
+                 http://127.0.0.1:8545 2>/dev/null | grep -q '"result"'; then
+              break
+            fi
+            sleep 5
+          done
+          HELIOS_BSC_LOCAL=http://127.0.0.1:8545 \
+          HELIOS_BSC_ORACLE="$CHECKPOINT_ORACLE" \
+            python3 scripts/soak_vs_oracle.py --rounds 4 --interval 45 2>&1 | tee surface.log
+
+      - name: Stop the local RPC
+        if: always()
+        run: |
+          if [ -f rpc.pid ]; then kill "$(cat rpc.pid)" 2>/dev/null || true; fi
+
+      - name: Check the block surface was actually exercised
+        if: always()
+        # A detector that quietly stops detecting is worse than none. The script exits 1
+        # on a mismatch on its own; this only catches the case where every check skipped,
+        # which means the run proved nothing about receipts. A warning rather than a
+        # failure, for the same reason --min-unique is low above: a red build that is
+        # usually a throttled provider gets ignored.
+        run: |
+          if grep -q "MISMATCH" surface.log 2>/dev/null; then
+            echo "::error::RECEIPT/LOG MISMATCH — a field this client derives disagreed with an independent chain."
+            grep -B2 -A4 "MISMATCH" surface.log | head -40
+            exit 1
+          fi
+          if grep -qE "^  receipts  [0-9]+ checks  OK" surface.log 2>/dev/null; then
+            echo "receipt surface exercised:"
+            grep -E "^  (receipts|logs|filter) " surface.log | tail -12
+          else
+            echo "::warning::The receipt surface never ran a check, so this run proves nothing about receipts. Read surface.log and rpc.log; suspect the data plane, not the client."
+            tail -20 rpc.log 2>/dev/null || true
+          fi
+
       - name: Soak vs an independent oracle
         # `--finality fast` is what `run` now serves by default, so it is what needs
         # watching. `--require-multisource-checkpoint` makes this exercise the strict
@@ -125,9 +200,12 @@ jobs:
             grep -E "snapshot [0-9]+|cascading|wait window" soak.log | tail -20
           elif grep -qE "parlia_\* finality cross-check never ran" soak.log 2>/dev/null; then
             echo "::warning::The oracle stopped serving parlia_*. Not a client fault; pick another oracle."
+          elif grep -q "MISMATCH" surface.log 2>/dev/null; then
+            echo "::error::RECEIPT/LOG MISMATCH — a derived field disagreed with an independent chain. Read surface.log."
+            grep -B2 -A4 "MISMATCH" surface.log | head -40
           else
             echo "::warning::No mismatch and no wedge — most likely provider throttling. Check the SKIP lines."
-            grep -E "SKIP" soak.log | tail -20
+            grep -E "SKIP" soak.log surface.log 2>/dev/null | tail -20
           fi
 
       - name: Upload log and state
@@ -137,6 +215,8 @@ jobs:
           name: soak-${{ github.run_id }}
           path: |
             soak.log
+            surface.log
+            rpc.log
             soak-state.json
             checkpoint.json
           retention-days: 30
