@@ -35,8 +35,20 @@ Wallet RPC treats the upstream as an **untrusted data plane**. Integrity comes f
 | Proof window too shallow | Fail-closed if Safe lag > 112; soak skips that round, does not invent a balance |
 | Primary RPC down / rate-limit | Optional `--backup` retries the same call on a second URL. Backup is **not** a trust oracle; results still fail-closed on seal/MPT |
 | Bind on LAN | Default `127.0.0.1:8545`. Non-loopback refused unless `--allow-non-loopback` (no in-process auth) |
-| DNS rebinding to loopback | Loopback bind requires HTTP `Host` in `127/8` / `localhost` / `::1` (403 otherwise). No `Access-Control-Allow-Origin` |
+| DNS rebinding to loopback | Loopback bind requires HTTP `Host` in `127/8` / `localhost` / `::1` (403 otherwise). No `Access-Control-Allow-Origin`. **Applies to loopback binds only** — a non-loopback bind has no Host check |
+| **Container published to the world** | Inside a container the process must bind `0.0.0.0` (Docker NAT is not loopback), so the image's `CMD` carries `--allow-non-loopback` and both guards above are inactive by construction. What protects the operator is the publish argument: `-p 127.0.0.1:8545:8545`, never `-p 8545:8545`. There is nothing the process can do about this beyond saying so loudly, which it does — and `release.yml` runs the image's default entrypoint on every release to prove the warning still appears |
 
 Fast Finality BLS **is** verified (row above), and since 2026-08-25 it is what `latest` / `safe` / `finalized` resolve to by default — measured **2 blocks** behind the tip on live mainnet, an observed norm over 120 consecutive headers, not a proven bound. The fast head is used **only** when it is newer than confirmation depth **and** names a block this client verified itself; otherwise reads fall back to the confirmation-depth Safe head, and `run --finality confirmation-depth` pins that older rule outright. So the head is final under at least one complete rule either way, and the default can never move reads backwards or onto a block taken on an upstream's word. The startup line names the rule actually in force; `helios_bsc_syncStatus.safeSource` reports it at runtime.
+
+### Why there is no RPC authentication
+
+This is a decision, not an omission. The client is meant to run on the machine that uses
+it, reached at `127.0.0.1` by a wallet on the same host — the model geth and reth use for
+`eth_*`. Remote access belongs behind a reverse proxy, which terminates TLS,
+authenticates and rate-limits better than this process could, and does it without adding
+a credential store and its key handling to the trust surface being argued about here.
+
+The cost of that decision is the container row above: the one path where both built-in
+guards are inactive and correctness rests on the operator's `-p` argument.
 
 What we **do not** claim: that this has been **audited** — it has not; that the 2-block finalized lag is a bound rather than an observation; or privacy against the upstream seeing which addresses you query.

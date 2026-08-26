@@ -212,6 +212,36 @@ jobs:
           echo "refused as expected:"
           cat out.txt
 
+      - name: The default entrypoint must warn that it is reachable
+        # The step above proves the *binary* refuses a non-loopback bind without the flag.
+        # It does not describe how this image is actually run: the Dockerfile `CMD` already
+        # carries `--allow-non-loopback`, because Docker NAT is not loopback and a
+        # published port cannot reach a process bound to 127.0.0.1. So for image users the
+        # guard is pre-satisfied, the loopback Host check is inactive too, and the only
+        # thing standing between them and an open unauthenticated RPC is the `127.0.0.1:`
+        # prefix on their own `-p` argument.
+        #
+        # Nothing can stop `-p 8545:8545` from here. What this asserts is that when it
+        # happens, the operator is told, in the log they will actually read.
+        #
+        # No arguments: this runs the published `CMD`, which is what a careless
+        # `docker run` gets. The unreachable upstream makes it exit on its own after the
+        # bind policy has had its say, so there is no container to wait on or clean up.
+        # The grepped phrases are pinned by a unit test in `bin/helios-bsc/src/bind.rs`,
+        # so a reword breaks there first instead of leaving this check passing on nothing.
+        run: |
+          set -euo pipefail
+          docker run --rm -e HELIOS_BSC_UPSTREAM=http://127.0.0.1:1 \
+            "${IMAGE}:${VERSION}-${{ matrix.arch }}" >warn.txt 2>&1 || true
+          cat warn.txt
+          for phrase in "no authentication in this process" "-p 127.0.0.1:8545:8545" "broadcast raw transactions"; do
+            if ! grep -qF -- "$phrase" warn.txt; then
+              echo "::error::the default entrypoint no longer warns: missing '$phrase'"
+              exit 1
+            fi
+          done
+          echo "the open-port warning survives the default entrypoint"
+
       - name: Push
         run: docker push "${IMAGE}:${VERSION}-${{ matrix.arch }}"
 

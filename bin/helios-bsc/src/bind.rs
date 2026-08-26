@@ -47,15 +47,41 @@ pub fn rpc_http_host_reject(host: Option<&str>, loopback_only: bool) -> Option<u
     }
 }
 
+/// What an operator sees when the process is reachable off the machine.
+///
+/// This used to be one line, which is the wrong size for what it says. In a container it
+/// is worse than that: the published image's `CMD` already carries
+/// `--allow-non-loopback`, because Docker NAT is not loopback and the process cannot be
+/// reached through a published port without binding `0.0.0.0`. So for anyone running the
+/// image, the flag is not a decision they made — it is pre-satisfied, and the only thing
+/// between them and an open port is the `127.0.0.1:` prefix in their own `-p` argument.
+///
+/// The text is a function, not an inline literal, so the unit test below pins the phrases
+/// that `release.yml` greps for. If someone rewords this, the test fails here rather than
+/// the CI check silently passing on a warning that no longer says anything.
+pub fn non_loopback_warning(listen: &str) -> String {
+    format!(
+        "\n\
+         !!! helios-bsc is listening on {listen}, which is not loopback.\n\
+         !!!\n\
+         !!! There is no authentication in this process. Anyone who can reach this port\n\
+         !!! can read through it, broadcast raw transactions, and spend your upstream RPC\n\
+         !!! quota. The loopback Host check that blocks DNS rebinding is also inactive in\n\
+         !!! this mode, because it only applies to loopback binds.\n\
+         !!!\n\
+         !!! Put a firewall and a reverse proxy in front of it, terminating TLS and\n\
+         !!! authenticating. Under Docker, publish as -p 127.0.0.1:8545:8545 and never\n\
+         !!! as -p 8545:8545.\n"
+    )
+}
+
 /// Non-loopback binds need `--allow-non-loopback` (no RPC auth in this binary).
 pub fn assert_listen_policy(listen: &str, allow_non_loopback: bool) -> Result<()> {
     if listen_is_loopback(listen) {
         return Ok(());
     }
     if allow_non_loopback {
-        eprintln!(
-            "warning: binding {listen} (non-loopback). No RPC auth in-process; use firewall + reverse proxy."
-        );
+        eprintln!("{}", non_loopback_warning(listen));
         return Ok(());
     }
     bail!("refusing non-loopback bind {listen}; pass --allow-non-loopback (no built-in auth)");
@@ -96,6 +122,39 @@ mod tests {
         assert!(assert_listen_policy("127.0.0.1:8545", false).is_ok());
         assert!(assert_listen_policy("0.0.0.0:8545", false).is_err());
         assert!(assert_listen_policy("0.0.0.0:8545", true).is_ok());
+    }
+
+    /// `release.yml` greps the running image's output for these phrases, to prove the
+    /// warning still reaches an operator who published the port to the world. A CI grep
+    /// against text nobody pins is a check that quietly stops checking, so the phrases
+    /// live here and this test is what breaks first if they are reworded.
+    #[test]
+    fn the_non_loopback_warning_says_what_is_at_risk() {
+        let w = non_loopback_warning("0.0.0.0:8545");
+
+        // The address, so it is obvious which bind is meant.
+        assert!(w.contains("0.0.0.0:8545"), "{w}");
+        // Grepped by CI. Keep these two in step with the workflow.
+        assert!(w.contains("no authentication in this process"), "{w}");
+        assert!(w.contains("-p 127.0.0.1:8545:8545"), "{w}");
+        // The concrete consequences, not just an adjective.
+        assert!(w.contains("broadcast raw transactions"), "{w}");
+        assert!(w.contains("DNS rebinding"), "{w}");
+        // Loud enough to survive a log stream: several lines, each marked.
+        assert!(
+            w.lines().filter(|l| l.starts_with("!!!")).count() >= 8,
+            "warning should be a block, not a line: {w}"
+        );
+    }
+
+    /// A loopback bind is the safe default and must stay quiet — a warning printed on the
+    /// ordinary path is a warning people learn to scroll past.
+    #[test]
+    fn loopback_binds_produce_no_warning() {
+        for listen in ["127.0.0.1:8545", "localhost:8545", "[::1]:8545"] {
+            assert!(listen_is_loopback(listen), "{listen}");
+            assert!(assert_listen_policy(listen, false).is_ok(), "{listen}");
+        }
     }
 
     #[test]
