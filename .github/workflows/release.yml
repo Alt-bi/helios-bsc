@@ -110,6 +110,145 @@ jobs:
             *.zip
           if-no-files-found: error
 
+  # ---------------------------------------------------------------- container
+  #
+  # Downloading a binary is one wall lower than building from source; `docker run` is
+  # one lower still, and it is how anyone evaluating this on a server will try it.
+  #
+  # Built per architecture on a native runner rather than emulated. A cross-built arm64
+  # image under QEMU compiles `blst` and `secp256k1` through an emulator, which turns a
+  # few minutes into the better part of an hour. GitHub gives public repositories arm64
+  # runners, so each arch builds where it runs and a manifest list joins them. arm64
+  # matters here beyond tidiness: the cheapest VPS instances are arm, and this client is
+  # meant to run on the cheapest thing that will hold it.
+  #
+  # `docker` CLI only, no third-party actions, for the reason at the top of this file:
+  # nothing that could rewrite what ships gets to run in the release path.
+  image:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            os: ubuntu-latest
+          - arch: arm64
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      # Only these two jobs get it, and only to push this repository's own image.
+      packages: write
+    outputs:
+      # Both matrix legs compute the same pair. Exporting them means the manifest job
+      # joins exactly what was pushed rather than re-deriving it and drifting -- and it
+      # could not re-derive `edge-<sha>` anyway, since that needs a checkout it lacks.
+      image: ${{ steps.names.outputs.image }}
+      version: ${{ steps.names.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve image name and tag
+        id: names
+        # ghcr rejects uppercase in a repository path and this owner has one ("Alt-bi"),
+        # so the name is lowercased rather than interpolated raw.
+        run: |
+          set -euo pipefail
+          image="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="edge-$(git rev-parse --short HEAD)"
+          fi
+          {
+            echo "IMAGE=$image"
+            echo "VERSION=$version"
+          } >> "$GITHUB_ENV"
+          {
+            echo "image=$image"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+          echo "building $image:$version-${{ matrix.arch }}"
+
+      - name: Log in to ghcr.io
+        run: echo '${{ github.token }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          docker build \
+            --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            --label "org.opencontainers.image.version=${VERSION}" \
+            --label "org.opencontainers.image.licenses=MIT OR Apache-2.0" \
+            --label "org.opencontainers.image.description=Trust-minimized Parlia light client for BNB Smart Chain - local verified JSON-RPC" \
+            -t "${IMAGE}:${VERSION}-${{ matrix.arch }}" \
+            .
+
+      - name: Smoke-test the image
+        # Same rule as the binaries above: an image that cannot start is not a release.
+        # `info` reads the fork table and build metadata and needs no network.
+        run: docker run --rm "${IMAGE}:${VERSION}-${{ matrix.arch }}" info
+
+      - name: The image must still refuse a non-loopback bind
+        # The entrypoint binds 0.0.0.0 *inside* the container, which is only safe because
+        # compose publishes on 127.0.0.1 and the binary demands --allow-non-loopback.
+        # There is no RPC auth in this process, so if that flag ever became implied, an
+        # image published straight onto a host port would answer the whole network.
+        # `assert_listen_policy` runs before any checkpoint or upstream work, so this
+        # fails fast and for the stated reason rather than on a connection error.
+        run: |
+          set -euo pipefail
+          if docker run --rm "${IMAGE}:${VERSION}-${{ matrix.arch }}" \
+               run --listen 0.0.0.0:8545 --upstream http://127.0.0.1:1 >out.txt 2>&1; then
+            echo "::error::non-loopback bind was accepted without --allow-non-loopback"
+            cat out.txt
+            exit 1
+          fi
+          if ! grep -qi "loopback" out.txt; then
+            echo "::error::it refused, but not for the loopback reason -- check what changed"
+            cat out.txt
+            exit 1
+          fi
+          echo "refused as expected:"
+          cat out.txt
+
+      - name: Push
+        run: docker push "${IMAGE}:${VERSION}-${{ matrix.arch }}"
+
+  # One tag that resolves to the right architecture, assembled from the per-arch images
+  # above. `docker manifest` ships with the CLI, so this needs no buildx builder.
+  manifest:
+    needs: image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Log in to ghcr.io
+        run: echo '${{ github.token }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+
+      - name: Create and push the manifest list
+        env:
+          IMAGE: ${{ needs.image.outputs.image }}
+          VERSION: ${{ needs.image.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker manifest create "${IMAGE}:${VERSION}" \
+            "${IMAGE}:${VERSION}-amd64" \
+            "${IMAGE}:${VERSION}-arm64"
+          docker manifest push "${IMAGE}:${VERSION}"
+
+          # `latest` means the newest release, so it moves only on a tag -- never on a
+          # manual run from a branch.
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            docker manifest create "${IMAGE}:latest" \
+              "${IMAGE}:${VERSION}-amd64" \
+              "${IMAGE}:${VERSION}-arm64"
+            docker manifest push "${IMAGE}:latest"
+          fi
+
+          echo "published ${IMAGE}:${VERSION}"
+
   release:
     needs: build
     runs-on: ubuntu-latest

@@ -30,6 +30,16 @@ verify the checksum:
 sha256sum -c SHA256SUMS --ignore-missing
 ```
 
+Or run the published image, no toolchain and no build:
+
+```bash
+docker run --rm -p 127.0.0.1:8545:8545 ghcr.io/alt-bi/helios-bsc:latest run --upstream https://bsc-rpc.publicnode.com --listen 0.0.0.0:8545 --allow-non-loopback
+```
+
+`linux/amd64` and `linux/arm64`. The bind flags are explained in
+[docs/deploy.md](docs/deploy.md) — in short, `0.0.0.0` is inside the container and
+`-p 127.0.0.1:` is what keeps it off the network.
+
 From source instead, if you have Rust:
 
 ```bash
