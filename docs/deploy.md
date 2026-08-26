@@ -2,6 +2,26 @@
 
 The binary has **no RPC auth**. The host must publish loopback only.
 
+## From the published image
+
+Released tags are pushed to the GitHub Container Registry for `linux/amd64` and
+`linux/arm64`, so nothing is built locally:
+
+```bash
+docker run --rm -p 127.0.0.1:8545:8545 ghcr.io/alt-bi/helios-bsc:latest run --upstream https://bsc-rpc.publicnode.com --listen 0.0.0.0:8545 --allow-non-loopback
+```
+
+`--listen 0.0.0.0` is what the process binds **inside** the container, where Docker NAT is
+not loopback. `-p 127.0.0.1:8545:8545` is what makes that safe: the port reaches the host
+on loopback only. Publish it as `-p 8545:8545` and the process answers every interface
+with no authentication in front of it.
+
+`:latest` follows the newest release. Pin `ghcr.io/alt-bi/helios-bsc:0.2.0` for anything
+you want to stay put. Images are built from source at the tag with `--locked`, on a native
+runner per architecture.
+
+## From source, with compose
+
 ```bash
 cp .env.example .env   # set HELIOS_BSC_UPSTREAM; do not commit .env
 docker compose up --build -d

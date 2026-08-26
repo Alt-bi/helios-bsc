@@ -9,5 +9,10 @@ last-verified.json
 **/*.pdb
 **/__pycache__
 *.pyc
+# Grant drafts: contact details, budgets and an unlisted demo video. `docs/grant`
+# was listed; `helios-bsc-grant` was not, so the build context carried ~80 MB of
+# private material into every `docker build`. Neither belongs in an image layer
+# or in a context sent to a daemon.
 docs/grant
+helios-bsc-grant
 scripts/__pycache__
