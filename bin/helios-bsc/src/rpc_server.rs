@@ -96,6 +96,8 @@ pub struct Node {
     allow_unverified_passthrough: bool,
     backup_transport: bool,
     metrics_enabled: bool,
+    /// Poll-based log and block filters. See [`FilterStore`].
+    filters: Mutex<FilterStore>,
 }
 
 /// Sentinel for an unpublished `last_tip` / `last_safe` / finality gauge.
@@ -190,6 +192,7 @@ impl Node {
             finality_mode: FinalityMode::default(),
             persist_lock: Mutex::new(()),
             metrics_enabled: false,
+            filters: Mutex::new(FilterStore::default()),
         })
     }
 
@@ -275,6 +278,7 @@ impl Node {
             finality_mode: FinalityMode::default(),
             persist_lock: Mutex::new(()),
             metrics_enabled: false,
+            filters: Mutex::new(FilterStore::default()),
         })
     }
 
@@ -307,6 +311,7 @@ impl Node {
             finality_mode: FinalityMode::default(),
             persist_lock: Mutex::new(()),
             metrics_enabled: false,
+            filters: Mutex::new(FilterStore::default()),
         }
     }
 
@@ -344,6 +349,7 @@ impl Node {
             finality_mode: FinalityMode::default(),
             persist_lock: Mutex::new(()),
             metrics_enabled: false,
+            filters: Mutex::new(FilterStore::default()),
         }
     }
 
@@ -1024,6 +1030,11 @@ impl Node {
             "eth_sendRawTransaction" => self.send_raw(id, req),
             "eth_getBlockReceipts" => self.get_block_receipts(id, req),
             "eth_getLogs" => self.get_logs(id, req),
+            "eth_newFilter" => self.new_filter(id, req),
+            "eth_newBlockFilter" => self.new_block_filter(id),
+            "eth_uninstallFilter" => self.uninstall_filter(id, req),
+            "eth_getFilterChanges" => self.get_filter_changes(id, req),
+            "eth_getFilterLogs" => self.get_filter_logs(id, req),
             "eth_getTransactionReceipt" => self.get_transaction_receipt(id, req),
             "eth_getTransactionByHash" => self.unverified_mined(id, req, method),
             "eth_getRawTransactionByHash" => self.get_raw_tx_by_hash(id, req),
@@ -1975,13 +1986,293 @@ impl Node {
             Ok(t) => t,
             Err(e) => return rpc_err(id, ERR_PARAMS, &e),
         };
-        let mut out = Vec::new();
-        for local in &blocks {
-            let (header, bind) = match self.bound_block_receipts(local) {
-                Ok(v) => v,
-                Err((code, msg)) => return rpc_err(id, code, &msg),
+        match self.collect_logs(&blocks, &addresses, &topics) {
+            Ok(out) => rpc_ok(id, Value::Array(out)),
+            Err((code, msg)) => rpc_err(id, code, &msg),
+        }
+    }
+
+    /// `eth_newFilter`: validate now, poll later.
+    ///
+    /// The filter object is validated at creation, so a malformed `address` or `topics`
+    /// is an error the caller sees immediately rather than on a poll minutes later. It is
+    /// then stored verbatim and replayed through the same path `eth_getLogs` uses, with
+    /// only the block bounds substituted, so the two cannot drift apart.
+    fn new_filter(&self, id: Value, req: &Value) -> Value {
+        let filter = match req
+            .get("params")
+            .and_then(Value::as_array)
+            .and_then(|p| p.first())
+        {
+            Some(Value::Object(m)) => m.clone(),
+            None | Some(Value::Null) => serde_json::Map::new(),
+            _ => return rpc_err(id, ERR_PARAMS, "eth_newFilter filter must be an object"),
+        };
+        if !is_nullish_json(filter.get("blockHash")) {
+            return rpc_err(
+                id,
+                ERR_PARAMS,
+                "eth_newFilter does not take blockHash: a filter follows a range, so use eth_getLogs for a single block",
+            );
+        }
+        if let Err(e) = parse_log_addresses(Some(&filter)) {
+            return rpc_err(id, ERR_PARAMS, &e);
+        }
+        if let Err(e) = parse_log_topics(Some(&filter)) {
+            return rpc_err(id, ERR_PARAMS, &e);
+        }
+        let (_, safe) = match self.refresh() {
+            Ok(v) => v,
+            Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
+        };
+        let from_s = match wallet_block_tag_str(filter.get("fromBlock")) {
+            Ok(v) => v,
+            Err(e) => return rpc_err(id, ERR_PARAMS, e),
+        };
+        let to_s = match wallet_block_tag_str(filter.get("toBlock")) {
+            Ok(v) => v,
+            Err(e) => return rpc_err(id, ERR_PARAMS, e),
+        };
+        let Some(cursor) = log_filter_block_number(from_s, safe.number, &safe.hash) else {
+            return rpc_err(id, ERR_NOT_SYNCED, WALLET_TAG_ONLY);
+        };
+        // An explicit height closes the filter there; a tag leaves it following the head,
+        // which is what a wallet polling for new events wants.
+        let to_block = match to_s {
+            Some(t) if t.starts_with("0x") || t.starts_with("0X") => {
+                match log_filter_block_number(to_s, safe.number, &safe.hash) {
+                    Some(n) => Some(n),
+                    None => return rpc_err(id, ERR_NOT_SYNCED, WALLET_TAG_ONLY),
+                }
+            }
+            _ => None,
+        };
+        let mut store = self.filters.lock().expect("filter lock");
+        match store.insert(FilterKind::Logs {
+            filter,
+            from_block: cursor,
+            to_block,
+            cursor,
+        }) {
+            Ok(n) => rpc_ok(id, json!(format!("0x{n:x}"))),
+            Err(e) => rpc_err(id, ERR_PARAMS, &e),
+        }
+    }
+
+    /// `eth_newBlockFilter`: hashes of blocks this client verifies from now on.
+    fn new_block_filter(&self, id: Value) -> Value {
+        let (_, safe) = match self.refresh() {
+            Ok(v) => v,
+            Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
+        };
+        let mut store = self.filters.lock().expect("filter lock");
+        // Start after the current head: a new filter reports what happens next, not a
+        // backlog the caller never asked for.
+        match store.insert(FilterKind::Blocks {
+            cursor: safe.number.saturating_add(1),
+        }) {
+            Ok(n) => rpc_ok(id, json!(format!("0x{n:x}"))),
+            Err(e) => rpc_err(id, ERR_PARAMS, &e),
+        }
+    }
+
+    fn uninstall_filter(&self, id: Value, req: &Value) -> Value {
+        let Some(fid) = parse_filter_id(req) else {
+            return rpc_err(id, ERR_PARAMS, FILTER_ID_HEX);
+        };
+        let mut store = self.filters.lock().expect("filter lock");
+        store.sweep();
+        rpc_ok(id, json!(store.map.remove(&fid).is_some()))
+    }
+
+    /// `eth_getFilterChanges`: what happened since the last poll, then advance.
+    ///
+    /// The cursor moves only over blocks this call actually read, so a poll that stops at
+    /// the span cap resumes exactly where it left off: a caller behind a busy chain
+    /// catches up over several calls instead of losing the gap.
+    fn get_filter_changes(&self, id: Value, req: &Value) -> Value {
+        let Some(fid) = parse_filter_id(req) else {
+            return rpc_err(id, ERR_PARAMS, FILTER_ID_HEX);
+        };
+        let (_, safe) = match self.refresh() {
+            Ok(v) => v,
+            Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
+        };
+        let head = safe.number;
+        let snapshot = {
+            let mut store = self.filters.lock().expect("filter lock");
+            store.sweep();
+            let Some(f) = store.map.get_mut(&fid) else {
+                return rpc_err(id, ERR_PARAMS, FILTER_NOT_FOUND);
             };
-            let receipts = match bind {
+            f.touched = Instant::now();
+            match &f.kind {
+                FilterKind::Blocks { cursor } => Err(*cursor),
+                FilterKind::Logs {
+                    filter,
+                    to_block,
+                    cursor,
+                    ..
+                } => Ok((filter.clone(), *to_block, *cursor)),
+            }
+        };
+
+        let (filter, to_block, cursor) = match snapshot {
+            Err(from) => {
+                if from > head {
+                    return rpc_ok(id, json!([]));
+                }
+                let to = head.min(from.saturating_add(MAX_GET_LOGS_RANGE - 1));
+                let mut hashes: Vec<(u64, String)> = {
+                    let chain = self.chain.lock().expect("chain lock");
+                    chain
+                        .iter()
+                        .filter(|b| b.number >= from && b.number <= to)
+                        .map(|b| (b.number, format!("0x{}", hex::encode(b.hash))))
+                        .collect()
+                };
+                hashes.sort_by_key(|(n, _)| *n);
+                let mut store = self.filters.lock().expect("filter lock");
+                if let Some(f) = store.map.get_mut(&fid) {
+                    if let FilterKind::Blocks { cursor } = &mut f.kind {
+                        *cursor = to.saturating_add(1);
+                    }
+                }
+                return rpc_ok(
+                    id,
+                    Value::Array(hashes.into_iter().map(|(_, h)| json!(h)).collect()),
+                );
+            }
+            Ok(v) => v,
+        };
+
+        let end = to_block.unwrap_or(head).min(head);
+        if cursor > end {
+            return rpc_ok(id, json!([]));
+        }
+        let end = end.min(cursor.saturating_add(MAX_GET_LOGS_RANGE - 1));
+        let logs = match self.logs_for_span(&filter, cursor, end) {
+            Ok(v) => v,
+            Err((code, msg)) => return rpc_err(id, code, &msg),
+        };
+        let mut store = self.filters.lock().expect("filter lock");
+        if let Some(f) = store.map.get_mut(&fid) {
+            if let FilterKind::Logs { cursor: c, .. } = &mut f.kind {
+                *c = end.saturating_add(1);
+            }
+        }
+        rpc_ok(id, Value::Array(logs))
+    }
+
+    /// `eth_getFilterLogs`: everything the filter matches, cursor untouched.
+    fn get_filter_logs(&self, id: Value, req: &Value) -> Value {
+        let Some(fid) = parse_filter_id(req) else {
+            return rpc_err(id, ERR_PARAMS, FILTER_ID_HEX);
+        };
+        let (_, safe) = match self.refresh() {
+            Ok(v) => v,
+            Err(e) => return rpc_err(id, ERR_NOT_SYNCED, &format!("not_synced: {e}")),
+        };
+        let (filter, to_block, from) = {
+            let mut store = self.filters.lock().expect("filter lock");
+            store.sweep();
+            let Some(f) = store.map.get_mut(&fid) else {
+                return rpc_err(id, ERR_PARAMS, FILTER_NOT_FOUND);
+            };
+            f.touched = Instant::now();
+            match &f.kind {
+                FilterKind::Logs {
+                    filter,
+                    from_block,
+                    to_block,
+                    ..
+                } => (filter.clone(), *to_block, *from_block),
+                FilterKind::Blocks { .. } => {
+                    return rpc_err(id, ERR_PARAMS, "eth_getFilterLogs needs a log filter")
+                }
+            }
+        };
+        let end = to_block.unwrap_or(safe.number).min(safe.number);
+        if from > end {
+            return rpc_ok(id, json!([]));
+        }
+        match self.logs_for_span(&filter, from, end) {
+            Ok(v) => rpc_ok(id, Value::Array(v)),
+            Err((code, msg)) => rpc_err(id, code, &msg),
+        }
+    }
+
+    /// Run a stored filter over an explicit block span, through the `eth_getLogs` path.
+    fn logs_for_span(
+        &self,
+        filter: &serde_json::Map<String, Value>,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<Value>, (i64, String)> {
+        let span = to.saturating_sub(from).saturating_add(1);
+        if span > MAX_GET_LOGS_RANGE {
+            return Err((
+                ERR_PARAMS,
+                format!(
+                    "filter span is {span} blocks; this client keeps no log index and serves at most {MAX_GET_LOGS_RANGE}"
+                ),
+            ));
+        }
+        let mut f = filter.clone();
+        f.insert("fromBlock".into(), json!(format!("0x{from:x}")));
+        f.insert("toBlock".into(), json!(format!("0x{to:x}")));
+        let addresses = parse_log_addresses(Some(&f)).map_err(|e| (ERR_PARAMS, e))?;
+        let topics = parse_log_topics(Some(&f)).map_err(|e| (ERR_PARAMS, e))?;
+        let blocks = self
+            .resolve_get_logs_blocks(Value::Null, Some(&f))
+            .map_err(|v| {
+                let code = v["error"]["code"].as_i64().unwrap_or(ERR_PARAMS);
+                let msg = v["error"]["message"]
+                    .as_str()
+                    .unwrap_or("filter span unavailable")
+                    .to_string();
+                (code, msg)
+            })?;
+        self.collect_logs(&blocks, &addresses, &topics)
+    }
+
+    /// Matching logs over an ascending run of locally verified blocks.
+    ///
+    /// Shared by `eth_getLogs` and the filter methods so the two can never disagree about
+    /// what a filter matches, how `logIndex` is numbered, or when a block is refusable.
+    fn collect_logs(
+        &self,
+        blocks: &[VerifiedBlock],
+        addresses: &[[u8; 20]],
+        topics: &[Option<Vec<[u8; 32]>>],
+    ) -> Result<Vec<Value>, (i64, String)> {
+        let mut out = Vec::new();
+        for group in blocks.chunks(LOG_FETCH_PARALLEL) {
+            // Each block is an independent upstream round trip, so a span is latency-bound
+            // rather than CPU-bound: 128 blocks served one at a time is over two minutes.
+            // Fetching a few at once is the difference between a usable range query and a
+            // timeout. Results are consumed in block order regardless of completion order.
+            let fetched: Vec<Result<(RpcBlockHeader, ReceiptBind), (i64, String)>> =
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = group
+                        .iter()
+                        .map(|b| scope.spawn(move || self.bound_block_receipts(b)))
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| {
+                            h.join().unwrap_or_else(|_| {
+                                Err((
+                                    ERR_INTERNAL,
+                                    "internal_error: receipt fetch thread panicked".to_string(),
+                                ))
+                            })
+                        })
+                        .collect()
+                });
+            for (local, res) in group.iter().zip(fetched) {
+                let (header, bind) = res?;
+                let receipts = match bind {
                 ReceiptBind::List(list) => list,
                 // Proven to have no transactions: it contributes no logs.
                 ReceiptBind::Empty => continue,
@@ -1989,37 +2280,37 @@ impl Node {
                 // Answering without them would report "no matching logs here" for a block
                 // nobody checked — a wrong answer rather than a partial one.
                 ReceiptBind::Omitted => {
-                    return rpc_err(
-                        id,
+                    return Err((
                         ERR_PROOF_FAILED,
-                        &format!(
+                        format!(
                             "proof_verification_failed: upstream served no receipts for block {}, so its logs cannot be proven absent",
                             local.number
                         ),
-                    )
+                    ))
                 }
             };
-            // Block-wide index, restarting per block exactly as geth reports it.
-            let mut log_index: u64 = 0;
-            for (tx_i, rec) in receipts.iter().enumerate() {
-                for log in &rec.logs {
-                    if log_matches(log, &addresses, &topics) && out.len() < MAX_GET_LOGS {
-                        out.push(rpc_log_json(
-                            log,
-                            &header,
-                            rec.tx_hash,
-                            tx_i as u64,
-                            log_index,
-                        ));
+                // Block-wide index, restarting per block exactly as geth reports it.
+                let mut log_index: u64 = 0;
+                for (tx_i, rec) in receipts.iter().enumerate() {
+                    for log in &rec.logs {
+                        if log_matches(log, addresses, topics) && out.len() < MAX_GET_LOGS {
+                            out.push(rpc_log_json(
+                                log,
+                                &header,
+                                rec.tx_hash,
+                                tx_i as u64,
+                                log_index,
+                            ));
+                        }
+                        log_index = log_index.saturating_add(1);
                     }
-                    log_index = log_index.saturating_add(1);
                 }
             }
             if out.len() >= MAX_GET_LOGS {
                 break;
             }
         }
-        rpc_ok(id, Value::Array(out))
+        Ok(out)
     }
 
     /// Blocks an `eth_getLogs` filter selects, ascending, all locally verified.
@@ -2915,6 +3206,109 @@ const MAX_GET_LOGS: usize = MAX_RECEIPT_LOGS;
 /// confirmation-depth window (~112), so any range a wallet could ask for over the blocks
 /// this client can actually see is servable. Wider ranges are `-32602` and say why.
 const MAX_GET_LOGS_RANGE: u64 = 128;
+
+/// Live filters per process. Each is a few hundred bytes and an unauthenticated caller
+/// can create them, so the count is bounded and the oldest idle one is dropped when the
+/// cap is reached rather than letting a loopback client grow the map without limit.
+const FILTER_ID_HEX: &str = "filter id must be a hex quantity";
+const FILTER_NOT_FOUND: &str = "filter not found";
+const WALLET_TAG_ONLY: &str = "wallet mode only serves Safe or below (latest→Safe)";
+
+/// Blocks whose receipts are fetched concurrently when serving a log range.
+///
+/// A span is latency-bound: one upstream round trip per block, and nothing to compute in
+/// between. Kept small so a single request cannot open a burst of connections against an
+/// operator's provider.
+const LOG_FETCH_PARALLEL: usize = 4;
+
+const MAX_FILTERS: usize = 64;
+
+/// Idle time after which a filter is forgotten, matching geth's default.
+const FILTER_TTL: Duration = Duration::from_secs(300);
+
+/// What a filter id refers to.
+enum FilterKind {
+    /// A log filter. The original filter object is kept verbatim so a poll re-runs the
+    /// same validated path `eth_getLogs` takes, with only the block bounds replaced — the
+    /// two cannot drift into disagreeing about what the filter matches.
+    Logs {
+        filter: serde_json::Map<String, Value>,
+        /// Lower bound the caller asked for. Fixed: `eth_getFilterLogs` answers the whole
+        /// range every time, so it cannot read the cursor, which has moved on.
+        from_block: u64,
+        /// Upper bound the caller asked for, or `None` for an open-ended filter that
+        /// follows the head.
+        to_block: Option<u64>,
+        /// Next block `eth_getFilterChanges` reports from.
+        cursor: u64,
+    },
+    /// A block filter: hashes of blocks verified since the last poll.
+    Blocks { cursor: u64 },
+}
+
+struct StoredFilter {
+    kind: FilterKind,
+    touched: Instant,
+}
+
+/// Filter ids and their state.
+///
+/// Ids are sequential per process and never reused, so a poll against an id that has
+/// expired is a clean "filter not found" rather than someone else's results.
+#[derive(Default)]
+struct FilterStore {
+    next_id: u64,
+    map: std::collections::HashMap<u64, StoredFilter>,
+}
+
+impl FilterStore {
+    fn sweep(&mut self) {
+        self.map.retain(|_, f| f.touched.elapsed() < FILTER_TTL);
+    }
+
+    fn insert(&mut self, kind: FilterKind) -> Result<u64, String> {
+        self.sweep();
+        if self.map.len() >= MAX_FILTERS {
+            // Drop the least recently polled rather than refuse: a caller that abandoned
+            // a filter should not lock out the one that is still being used.
+            if let Some(oldest) = self
+                .map
+                .iter()
+                .min_by_key(|(_, f)| f.touched)
+                .map(|(id, _)| *id)
+            {
+                self.map.remove(&oldest);
+            }
+        }
+        if self.map.len() >= MAX_FILTERS {
+            return Err("too many filters".into());
+        }
+        self.next_id = self.next_id.saturating_add(1);
+        let id = self.next_id;
+        self.map.insert(
+            id,
+            StoredFilter {
+                kind,
+                touched: Instant::now(),
+            },
+        );
+        Ok(id)
+    }
+}
+
+/// Parse a `0x`-prefixed filter id.
+fn parse_filter_id(req: &Value) -> Option<u64> {
+    let s = req
+        .get("params")
+        .and_then(Value::as_array)
+        .and_then(|p| p.first())
+        .and_then(Value::as_str)?;
+    let hex = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))?;
+    if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(hex, 16).ok()
+}
 
 fn bind_optional_logs(
     v: Option<&Value>,
