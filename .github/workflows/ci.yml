@@ -56,6 +56,47 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # `rust-version` said 1.80 while `alloy-eips` -- pulled in by revm -- declares
+      # 1.94.1, so the manifest and CONTRIBUTING.md had both been wrong since revm
+      # landed. Nothing checked the number, so nothing said so: a reader on 1.80 got a
+      # wall of errors from crates they had never heard of instead of "this needs 1.94".
+      #
+      # Building on exactly the claimed version is the only check that cannot drift.
+      # Cargo refuses to compile a dependency whose own `rust-version` is higher than the
+      # active rustc, so this fails the moment any dependency raises its floor above ours
+      # -- which is how the claim went stale in the first place.
+      - name: Build on exactly the MSRV the manifest claims
+        run: |
+          set -euo pipefail
+          msrv=$(grep -m1 "^rust-version = " Cargo.toml | tr -d " \"" | cut -d= -f2)
+          if [ -z "${msrv}" ]; then
+            echo "::error::could not read rust-version out of Cargo.toml"
+            exit 1
+          fi
+          echo "manifest claims MSRV ${msrv}"
+          rustup toolchain install "${msrv}" --profile minimal --no-self-update
+          # `cargo +VERSION` overrides rust-toolchain.toml, which pins `stable`; without
+          # the `+` this step would silently test stable and prove nothing.
+          cargo +"${msrv}" --version
+          cargo +"${msrv}" check --workspace --all-targets --locked
+
+      - name: CONTRIBUTING.md must state the same MSRV
+        # Same reason as the test-count guard above: two places holding one number, only
+        # one of them checked, is how the number becomes wrong in the uncheckable one.
+        run: |
+          set -euo pipefail
+          msrv=$(grep -m1 "^rust-version = " Cargo.toml | tr -d " \"" | cut -d= -f2)
+          if ! grep -qF -- "MSRV is **${msrv}**" CONTRIBUTING.md; then
+            echo "::error::Cargo.toml says MSRV ${msrv}; CONTRIBUTING.md does not say so."
+            grep -n 'MSRV' CONTRIBUTING.md || true
+            exit 1
+          fi
+          echo "CONTRIBUTING.md agrees: ${msrv}"
+
   docker:
     runs-on: ubuntu-latest
     steps:

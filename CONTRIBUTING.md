@@ -10,7 +10,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 ```
 
-CI runs the same (`cargo fmt --all -- --check`). Toolchain is stable (`rust-toolchain.toml`); MSRV is **1.80**.
+CI runs the same (`cargo fmt --all -- --check`). Toolchain is stable (`rust-toolchain.toml`);
+MSRV is **1.94.1**, and CI builds on exactly that version so the number cannot drift. It is
+set by a dependency rather than by this code: `revm` requires 1.91 and `alloy-eips`, which
+`revm` pulls in, requires 1.94.1. Cargo refuses to compile them on anything older, so a
+lower number here would not be a looser requirement, only a false one.
 
 ## Secrets and disks
 

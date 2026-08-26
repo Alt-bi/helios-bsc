@@ -11,7 +11,7 @@ pub fn strip_0x(s: &str) -> &str {
 
 pub fn decode_hex(s: &str) -> Result<Vec<u8>, TypesError> {
     let raw = strip_0x(s);
-    if raw.len() % 2 != 0 {
+    if !raw.len().is_multiple_of(2) {
         return Err(TypesError::InvalidHex(format!(
             "odd-length hex ({})",
             raw.len()
