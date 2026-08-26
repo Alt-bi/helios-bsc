@@ -17,7 +17,10 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Alt-bi/helios-bsc"
 authors = ["Daniil"]
-rust-version = "1.80"
+# Set by a dependency, not by this code: `alloy-eips` (via revm) declares 1.94.1 and
+# cargo refuses to compile it on anything older. CI builds on exactly this version --
+# see the `msrv` job -- because the number was 1.80 here for as long as nothing checked.
+rust-version = "1.94.1"
 
 [workspace.dependencies]
 helios-bsc-types = { path = "crates/helios-bsc-types" }

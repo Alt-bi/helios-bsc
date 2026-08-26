@@ -465,7 +465,7 @@ mod tests {
         let h = fixture(name);
         let number = decode_u64(&h.number).unwrap();
         let extra = decode_hex(&h.extra_data).unwrap();
-        parse_extra(&extra, ExtraDataVersion::Bohr, number % 1000 == 0)
+        parse_extra(&extra, ExtraDataVersion::Bohr, number.is_multiple_of(1000))
             .unwrap()
             .attestation
     }

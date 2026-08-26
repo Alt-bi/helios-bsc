@@ -612,13 +612,13 @@ impl Snapshot {
         let next = number.saturating_add(1);
         if self.epoch_length == DEFAULT_EPOCH_LENGTH
             && time >= LORENTZ_TIME
-            && next % LORENTZ_EPOCH_LENGTH == 0
+            && next.is_multiple_of(LORENTZ_EPOCH_LENGTH)
         {
             self.epoch_length = LORENTZ_EPOCH_LENGTH;
         }
         if self.epoch_length == LORENTZ_EPOCH_LENGTH
             && time >= MAXWELL_TIME
-            && next % MAXWELL_EPOCH_LENGTH == 0
+            && next.is_multiple_of(MAXWELL_EPOCH_LENGTH)
         {
             self.epoch_length = MAXWELL_EPOCH_LENGTH;
         }

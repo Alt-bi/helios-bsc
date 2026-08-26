@@ -10,7 +10,6 @@ rust-version.workspace = true
 helios-bsc-types = { workspace = true }
 helios-bsc-config = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
 hex = { workspace = true }
 secp256k1 = { workspace = true }
 blst = { workspace = true }

@@ -117,7 +117,7 @@ fn parse_pre_luban_epoch(
     mid: &[u8],
     seal: [u8; 65],
 ) -> Result<ParsedExtra, ExtraError> {
-    if mid.len() % 20 != 0 {
+    if !mid.len().is_multiple_of(20) {
         return Err(ExtraError::InvalidEpochValidators);
     }
     let n = mid.len() / 20;
