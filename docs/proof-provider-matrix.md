@@ -128,3 +128,29 @@ python scripts/probe_eth_get_proof.py --rpc https://bsc-mainnet.public.blastapi.
 ```
 
 Mutated-proof fail case: **covered in CI** (`helios-bsc-execution` + `helios-bsc-mock` + `Node::handle` adversarial tests). Live Safe-lag proofs still depend on the provider window (Ankr ~112).
+
+## Receipts are a second capability, and no free host has both (2026-08-25)
+
+The table above measures `eth_getProof`. Since receipts began binding to
+`transactionsRoot`, a verified read of `eth_getTransactionReceipt`, `eth_getBlockReceipts`
+or `eth_getLogs` also needs `eth_getBlockReceipts` and `eth_getRawTransactionByHash` from
+the data plane. Measured on the same three keyless hosts:
+
+| Host | `eth_getProof` | `eth_getBlockReceipts` |
+|------|----------------|------------------------|
+| `bsc-mainnet.public.blastapi.io` | **OK** | `401 Unauthorized` (needs a key) |
+| `bsc-dataseed.bnbchain.org` | `limit exceeded` | **OK** |
+| `bsc-rpc.publicnode.com` | tag-only — fails at any lag | **OK** |
+
+**No free public host serves both.** The fix needs no new feature: `--backup` already
+exists as transport failover, and it covers exactly this — a call the primary refuses is
+retried on the second host. Verified live with
+`--upstream https://bsc-mainnet.public.blastapi.io --backup https://bsc-rpc.publicnode.com`:
+proofs came from the first, receipts from the second, and a full soak round reported
+`compared=454 match=454 mismatch=0`, including 432 receipt-field checks.
+
+The backup is **not** a trust oracle and this does not make it one. Whichever host answers,
+the receipts are still re-encoded to consensus RLP and bound to the sealed `receiptsRoot`,
+and the envelopes to `transactionsRoot`. Failover changes who is asked, never what is
+checked.
+
