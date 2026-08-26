@@ -110,6 +110,8 @@ Start at [docs/quickstart.md](docs/quickstart.md); what is verified is in
 | Open-port warning | **Done 2026-08-26** — raised by a question about the image. There is no RPC auth in this process by design (the geth/reth model: bind loopback, proxy for remote), but in a container the process *must* bind `0.0.0.0`, so the image's `CMD` carries `--allow-non-loopback` and the loopback `Host` check is inactive too. For image users both guards are pre-satisfied and only their own `-p 127.0.0.1:` prefix stands between them and an open endpoint. Nothing in-process can prevent that; what it can do is say so unmissably. The one-line warning became a marked block naming the concrete consequences, its phrases are pinned by a unit test, and `release.yml` runs the image's **default entrypoint** every release to prove the warning still appears. |
 | Claims that drift | **Guarded 2026-08-26** — the test count in this file was wrong twice in one day because it is hand-written and nothing checked it. CI now compares it against what `cargo test` actually ran and fails the build on a mismatch. |
 
+| Soak survives a restart | **Done 2026-08-26** — the round loop broke out of the run on the first `LocalRpcError`. Correct for a 45-minute CI gate; fatal for a month-long one, where the client will restart at least once and the run would report on its first days and stop. `--max-local-outage SECONDS` tolerates *transport* failures only — a mismatch still ends the run at once — and every outage is counted, timed and printed in the summary, so a run that limped cannot be read as a clean one. Default 0 keeps the CI behaviour exactly. [Runbook](docs/runbooks/long-soak.md). |
+
 ## What is next
 
 The MVP-1 and MVP-2 gates are closed and v0.2.0 has shipped. What is open:
