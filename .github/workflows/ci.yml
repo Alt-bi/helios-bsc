@@ -200,3 +200,17 @@ jobs:
         # checker or one-row diff catches that. This does, and it found a second one in
         # docs/README.md the moment it was written.
         run: python3 scripts/check_markdown_tables.py
+      - name: Workflow files GitHub would actually accept
+        # `release.yml` sat rejected for a day: pinning the actions left one step with
+        # two `with:` blocks, so every push logged a 0-second failed run with no jobs and
+        # the next `v*` tag would have shipped nothing. The failing runs looked like noise
+        # because that workflow is not supposed to run on a push at all. This refuses a
+        # duplicate key at any depth -- `yaml.safe_load` accepts one, which is why the
+        # obvious check would not have caught it.
+        run: python3 scripts/check_workflows.py
+      - name: The audit scope figure still matches the code
+        # The size of the trust surface is quoted where a reader cannot check it against
+        # the code, and it had drifted about 20% before anyone noticed -- a figure nobody
+        # re-measures is a figure that quietly becomes false. The band is 5% so this
+        # reports real drift rather than firing on ordinary growth.
+        run: python3 scripts/audit_scope.py --check 13600

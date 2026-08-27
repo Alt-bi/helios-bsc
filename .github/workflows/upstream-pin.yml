@@ -11,6 +11,10 @@ name: upstream-pin
 # whether it touched the Parlia files this client actually transcribes. A release that
 # leaves them byte-identical is a re-pin at leisure; one that changes them is work.
 #
+# A pre-release is reported as a notice rather than a failure. It is the earliest sight of
+# a coming fork and worth reading, but it is never a pin target, and failing on one every
+# week would train the reader to ignore the job.
+#
 # Fails the job rather than opening an issue: a failed scheduled run already mails the
 # repository owner, and keeping `contents: read` means this workflow can never write to
 # the repository it is watching.
@@ -48,45 +52,77 @@ jobs:
           fi
           echo "pinned: $pinned_tag ($pinned_commit)"
 
-          # Newest non-prerelease. Alphas carry unshipped forks and are never a pin target.
-          #
           # Deliberately one page, not `--paginate`: gh applies `--jq` to each page
           # separately, so `[...][0]` with pagination returns the first match on *every*
-          # page and `latest` comes back multi-line. The API returns newest-first, so one
-          # page of 100 is more than enough.
-          latest=$(gh api 'repos/bnb-chain/bsc/releases?per_page=100' \
-                   --jq '[.[] | select(.prerelease == false and .draft == false)][0].tag_name')
-          echo "latest release: $latest"
+          # page and the answer comes back multi-line. The API returns newest-first, so
+          # one page of 100 is more than enough.
+          newest() {  # $1: a jq predicate over one release object
+            gh api 'repos/bnb-chain/bsc/releases?per_page=100' \
+              --jq "[.[] | select(.draft == false) | select($1)][0].tag_name"
+          }
 
-          if [ "$latest" = "$pinned_tag" ]; then
+          # `prerelease` alone does not identify a pre-release here: bnb-chain sets that
+          # flag by hand and sets it inconsistently — `v1.7.0-alpha` carries it, and
+          # `v1.8.0-alpha` (2026-08-13) does not. The first real run of this watch failed
+          # on that alpha, which is precisely the weekly false alarm this job must not
+          # produce: an alarm that cries wolf gets muted, and a muted watch is worse than
+          # no watch. So the tag name is checked as well as the flag.
+          PRE='(.tag_name | test("-(alpha|beta|rc)"; "i")) or .prerelease'
+          stable=$(newest "($PRE) | not")
+          head_tag=$(newest 'true')
+          if [ -z "$stable" ] || [ -z "$head_tag" ]; then
+            echo "::error::Could not read the release list from bnb-chain/bsc."
+            exit 1
+          fi
+          echo "newest stable: $stable"
+          echo "newest of any kind: $head_tag"
+
+          # Prints the diff and leaves the changed files in $changed.
+          parlia_diff() {  # $1: tag to compare the pin against
+            local tag="$1" a b
+            changed=""
+            echo "::group::Parlia diff $pinned_tag -> $tag"
+            for f in consensus/parlia/parlia.go consensus/parlia/snapshot.go \
+                     consensus/parlia/ramanujanfork.go params/config.go; do
+              a=$(mktemp); b=$(mktemp)
+              if ! curl -sSfL -m 60 "https://raw.githubusercontent.com/bnb-chain/bsc/$pinned_commit/$f" -o "$a"; then
+                echo "could not fetch $f at the pin"; continue
+              fi
+              if ! curl -sSfL -m 60 "https://raw.githubusercontent.com/bnb-chain/bsc/$tag/$f" -o "$b"; then
+                echo "could not fetch $f at $tag"; continue
+              fi
+              if cmp -s "$a" "$b"; then
+                echo "unchanged: $f"
+              else
+                changed="$changed $f"
+                echo "CHANGED:   $f"
+                diff -u "$a" "$b" | head -60 || true
+              fi
+            done
+            echo "::endgroup::"
+          }
+
+          # A pre-release newer than every stable one is the earliest sight of a fork, and
+          # worth saying out loud — but it is not a re-pin, so it is a notice and does not
+          # fail the job. Losing that signal entirely was the other way to get this wrong.
+          if [ "$head_tag" != "$stable" ]; then
+            parlia_diff "$head_tag"
+            if [ -n "$changed" ]; then
+              echo "::notice::BSC $head_tag is a pre-release and touches files this client transcribes:$changed — a fork is being prepared. Not a re-pin target; read it before it ships."
+            else
+              echo "::notice::BSC $head_tag is a pre-release. It leaves the Parlia files this client transcribes byte-identical."
+            fi
+          fi
+
+          if [ "$stable" = "$pinned_tag" ]; then
             echo "Pin is current."
             exit 0
           fi
 
-          echo "::group::Parlia diff $pinned_tag -> $latest"
-          changed=""
-          for f in consensus/parlia/parlia.go consensus/parlia/snapshot.go \
-                   consensus/parlia/ramanujanfork.go params/config.go; do
-            a=$(mktemp); b=$(mktemp)
-            if ! curl -sSfL -m 60 "https://raw.githubusercontent.com/bnb-chain/bsc/$pinned_commit/$f" -o "$a"; then
-              echo "could not fetch $f at the pin"; continue
-            fi
-            if ! curl -sSfL -m 60 "https://raw.githubusercontent.com/bnb-chain/bsc/$latest/$f" -o "$b"; then
-              echo "could not fetch $f at $latest"; continue
-            fi
-            if cmp -s "$a" "$b"; then
-              echo "unchanged: $f"
-            else
-              changed="$changed $f"
-              echo "CHANGED:   $f"
-              diff -u "$a" "$b" | head -60 || true
-            fi
-          done
-          echo "::endgroup::"
-
+          parlia_diff "$stable"
           if [ -n "$changed" ]; then
-            echo "::error::BSC $latest changes files this client transcribes:$changed — re-read them and re-pin before the fork goes live."
+            echo "::error::BSC $stable changes files this client transcribes:$changed — re-read them and re-pin before the fork goes live."
           else
-            echo "::error::BSC $latest is out (pinned: $pinned_tag). The Parlia files this client transcribes are byte-identical, so this is a re-pin at leisure, not a rule change."
+            echo "::error::BSC $stable is out (pinned: $pinned_tag). The Parlia files this client transcribes are byte-identical, so this is a re-pin at leisure, not a rule change."
           fi
           exit 1
