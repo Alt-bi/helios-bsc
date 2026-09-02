@@ -34,6 +34,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # This job watches for the day upstream *changes* one of the files this client
+      # transcribes. It cannot notice a number that was copied wrong in the first place,
+      # because it only ever diffs upstream against upstream. This checks the other
+      # direction, against the same pin, before any of that runs.
+      - name: The fork schedule matches the release it was copied from
+        run: python3 scripts/check_fork_schedule.py
+
       - name: Compare the pin with the latest release
         env:
           GH_TOKEN: ${{ github.token }}

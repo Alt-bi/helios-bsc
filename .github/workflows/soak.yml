@@ -15,6 +15,13 @@ name: soak
 #
 # Note: GitHub disables `schedule` on repositories with no activity for 60 days. If this
 # job stops appearing, that is why — push anything, or re-enable it in the Actions tab.
+#
+# "Nightly" is best-effort, and it is worth knowing that before reading a gap as a
+# failure. GitHub queues scheduled runs and drops or delays them under load: of the eight
+# nights to 2026-09-02, **2026-08-27 produced no run at all**, 08-28 fired at 21:14 and
+# 08-26 at 05:07 instead of 03:17. Every run that did happen passed. So a missing night
+# is the platform, not the client — but it also means a claim like "N nights clean" has
+# to count runs, never days.
 
 on:
   schedule:
@@ -225,7 +232,7 @@ jobs:
 
       - name: Upload log and state
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: soak-${{ github.run_id }}
           path: |

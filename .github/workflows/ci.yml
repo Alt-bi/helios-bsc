@@ -208,6 +208,27 @@ jobs:
         # duplicate key at any depth -- `yaml.safe_load` accepts one, which is why the
         # obvious check would not have caught it.
         run: python3 scripts/check_workflows.py
+      - name: The fork schedule still matches the geth release it was copied from
+        # Every fork constant in `helios-bsc-config` was copied by hand out of geth's
+        # `params/config.go`. They decide which consensus rules apply at a header, so a
+        # mistyped digit does not crash -- it verifies a block under the wrong rules and
+        # answers confidently, which is the worst failure this codebase has. `cargo test`
+        # cannot see it: the tests assert the constants against themselves.
+        #
+        # Exit 3 is the script's "upstream was unreachable", which says nothing about
+        # this branch. A guard that goes red for someone else's outage gets muted, so it
+        # is a notice here; the weekly `upstream-pin` run, where reaching upstream is the
+        # whole job, still fails on it.
+        run: |
+          set -uo pipefail
+          python3 scripts/check_fork_schedule.py && exit 0
+          code=$?
+          if [ "$code" = "3" ]; then
+            echo "::notice::could not reach raw.githubusercontent.com to check the fork schedule; the weekly upstream-pin run checks it too"
+            exit 0
+          fi
+          exit "$code"
+
       - name: The audit scope figure still matches the code
         # The size of the trust surface is quoted where a reader cannot check it against
         # the code, and it had drifted about 20% before anyone noticed -- a figure nobody

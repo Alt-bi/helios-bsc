@@ -10,12 +10,30 @@ name: release
 # trusting things you have not checked, so its release path does not pull third-party
 # actions that could rewrite what ships. `dtolnay/rust-toolchain` is the one exception,
 # pinned to the same action `ci.yml` already uses.
+#
+# Nothing on a push runs this file, which means nothing exercises it until the tag that
+# needs it. That is not hypothetical: a duplicate `with:` block left this workflow
+# rejected by GitHub for a day in August 2026, and the next `v*` tag would have shipped
+# nothing at all. `check_workflows.py` in `ci.yml` now refuses a file GitHub would
+# reject, but a file that parses can still be a pipeline that does not work -- an action
+# that changed its inputs under a major bump is the ordinary way that happens.
+#
+# So a manual run is a **rehearsal by default**: it builds every target, uploads,
+# downloads and checksums exactly as a tag would, and publishes nothing. `dry_run`
+# defaults to true because the safe reading of "someone pressed Run on the release
+# workflow" is that they wanted to see it work, not that they meant to push images.
+# Uncheck it to publish an `edge-<sha>` image on purpose.
 
 on:
   push:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Rehearse: build, upload, download and checksum, but publish nothing"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -108,7 +126,7 @@ jobs:
           [ "${{ runner.os }}" = "Windows" ] && bin="$bin.exe"
           "$bin" info
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: helios-bsc-${{ matrix.name }}
           path: |
@@ -303,13 +321,35 @@ jobs:
           }
           echo "the image runs, and its probe fails closed, under the compose hardening"
 
+      # The one step in this job that leaves the runner. Everything above it -- build,
+      # `info`, the bind refusal, the entrypoint warning, the healthcheck, the compose
+      # hardening -- runs in a rehearsal too, so a dry run still proves the image is
+      # sound. It only stops short of publishing it.
+      #
+      # Both halves of the condition are load-bearing: on a tag `push` there is no
+      # `inputs` context at all, so `!inputs.dry_run` alone would be true only by
+      # accident of null-coercion. Saying `event_name` as well makes it true on purpose.
       - name: Push
+        if: github.event_name != 'workflow_dispatch' || !inputs.dry_run
         run: docker push "${IMAGE}:${VERSION}-${{ matrix.arch }}"
+
+      - name: Not pushing (rehearsal)
+        if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+        run: |
+          echo "Dry run: ${IMAGE}:${VERSION}-${{ matrix.arch }} was built and passed every"
+          echo "check above, and was not pushed. Re-run with dry_run unchecked to publish it."
 
   # One tag that resolves to the right architecture, assembled from the per-arch images
   # above. `docker manifest` ships with the CLI, so this needs no buildx builder.
+  #
+  # Skipped entirely in a rehearsal rather than gated step by step: `docker manifest
+  # create` reads the per-arch images back **out of the registry**, so with nothing
+  # pushed this job could only fail, and a rehearsal that always ends red teaches the
+  # reader to ignore it. `release` needs `build`, not this, so skipping it costs the
+  # rehearsal nothing.
   manifest:
     needs: image
+    if: github.event_name != 'workflow_dispatch' || !inputs.dry_run
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -349,7 +389,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true

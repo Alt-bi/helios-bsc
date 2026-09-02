@@ -20,3 +20,9 @@ helios-bsc-grant/
 
 # local agent/tooling state — never publish
 .claude/
+
+# Source of docs/assets/logo.png. The JPEG is a dark circle on a white square, and a
+# white square reads as a bright box on GitHub's dark theme, so what the README uses is
+# a PNG with the corners made transparent. Only the PNG is committed; this is the file
+# it was cut from.
+helios-bsc-logo.jpg

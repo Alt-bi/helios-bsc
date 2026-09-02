@@ -1,3 +1,5 @@
+<img src="docs/assets/logo.png" alt="" width="96" align="right">
+
 # helios-bsc
 
 **A trust-minimized light client for BNB Smart Chain.** It serves a local JSON-RPC on
