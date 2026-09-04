@@ -26,7 +26,7 @@ round: `compared=3462 match=3462 mismatch=0 skip=0`.
 | Verified reads | balances, nonces, code, storage, `eth_call`, `eth_estimateGas`, headers, receipts, logs and log filters over ranges up to 128 blocks (≤1024 matches, else refused) |
 | Read head | BLS-finalized, ~2 blocks behind the tip (falls back to ~110 without vote keys) |
 | History | ~112 blocks; not an archive node |
-| Tests | 471, plus an adversarial in-process lying upstream |
+| Tests | 472, plus an adversarial in-process lying upstream |
 | Chain | BSC mainnet, `chainId` 56, pinned to `bnb-chain/bsc` v1.7.8 |
 | Distribution | Five platform binaries with `SHA256SUMS`, and a multi-arch image at `ghcr.io/alt-bi/helios-bsc` (`linux/amd64`, `linux/arm64`) |
 
