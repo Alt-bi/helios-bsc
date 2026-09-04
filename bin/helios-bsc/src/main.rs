@@ -1715,6 +1715,34 @@ fn soak(args: SoakArgs<'_>) -> Result<()> {
         }
         break;
     }
+    // The session ends where the loop does, not at the last round's save.
+    //
+    // Every save stamps the open session at *now*, and saves happen inside a round. The
+    // loop leaves through the deadline check at the top of the next iteration, so the
+    // final `--interval` sleep falls after the last save and outside the tally. Every
+    // earlier interval is inside it, because the following round's save moved the end
+    // past it -- the last one was the only one left out. So a run that occupied its whole
+    // window recorded up to one interval short of it, and the duration gate below then
+    // failed a soak that had done everything asked of it: run 33833189270 reported
+    // `44m 56s of 45m 00s -- 4s short` under `compared=638 match=638 mismatch=0`.
+    //
+    // It only ever bit when the last round happened to end inside the final interval;
+    // a round that overran the deadline stamped past it and passed. A gate that fails
+    // one clean night in N is the kind that gets muted, which is worse than not having it.
+    //
+    // Guarded on `target_already_met` because that path opens no session, and touching
+    // there would extend the *previous* session to now and charge the soak for the hours
+    // between runs -- the overstatement `soak_state` exists to prevent.
+    if !target_already_met {
+        persist_soak(
+            state.as_mut(),
+            args.state,
+            &tot,
+            fast_compared,
+            &SoakReport::default(),
+            &done,
+        )?;
+    }
     let unique_best = done.len() as u32;
     println!(
         "# SUMMARY  compared={}  match={}  mismatch={}  skip={}  unique_best={}  at_fast_head={fast_compared}",
