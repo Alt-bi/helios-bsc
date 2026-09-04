@@ -220,6 +220,9 @@ jobs:
           elif grep -q "compared nothing" soak.log 2>/dev/null; then
             echo "::error::WALK WEDGED — the client refuses headers the chain accepts. Suspect a fork parameter; check the upstream-pin job."
             grep -E "snapshot [0-9]+|cascading|wait window" soak.log | tail -20
+          elif grep -q "Re-run with the same --state to continue" soak.log 2>/dev/null; then
+            echo "::error::RUN CUT SHORT — the soak stopped before its window closed. Nothing was found wrong; it did not run long enough to say. Re-run with the same --state."
+            grep -E "^# (SUMMARY|SOAKED)|short\. Re-run" soak.log | tail -5
           elif grep -qE "parlia_\* finality cross-check never ran" soak.log 2>/dev/null; then
             echo "::warning::The oracle stopped serving parlia_*. Not a client fault; pick another oracle."
           elif grep -q "MISMATCH" surface.log 2>/dev/null; then

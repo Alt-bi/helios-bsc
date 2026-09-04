@@ -270,6 +270,32 @@ mod tests {
         assert_eq!(s.soaked_secs(), 4_000);
     }
 
+    /// The numbers are run 33833189270's: a 45-minute window whose last round saved at
+    /// 44m 56s, four seconds before the deadline, because the closing `--interval` sleep
+    /// came after that save. Stamped there the gate says "4s short" and fails a soak that
+    /// compared 638 addresses with zero mismatches; stamped where the loop actually
+    /// stopped it says nothing, which is the whole point of closing the session on exit.
+    #[test]
+    fn a_window_is_only_met_if_the_session_closes_where_the_loop_did() {
+        let target = 2_700;
+
+        let mut at_last_round = SoakState::new(fp());
+        at_last_round.open_session(1_000);
+        at_last_round.touch_session(1_000 + 2_696);
+        assert_eq!(at_last_round.remaining_secs(target), 4);
+
+        let mut at_loop_exit = SoakState::new(fp());
+        at_loop_exit.open_session(1_000);
+        at_loop_exit.touch_session(1_000 + 2_696);
+        at_loop_exit.touch_session(1_000 + target);
+        assert_eq!(at_loop_exit.remaining_secs(target), 0);
+        assert_eq!(
+            at_loop_exit.sessions.len(),
+            1,
+            "closing must not open a session"
+        );
+    }
+
     #[test]
     fn a_missing_state_file_is_a_fresh_start() {
         let path = std::env::temp_dir().join(format!("helios_soak_absent_{}", std::process::id()));
